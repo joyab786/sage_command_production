@@ -64,7 +64,7 @@ graph TD
 
 1.  Navigate to the backend directory:
     ```bash
-    cd SageCommand_Production/backend
+    cd backend
     ```
 2.  Set up your python virtual environment and activate it:
     ```bash
@@ -94,7 +94,7 @@ graph TD
 
 1.  Navigate to the frontend directory:
     ```bash
-    cd SageCommand_Production/frontend
+    cd frontend
     ```
 2.  Install packages:
     ```bash
