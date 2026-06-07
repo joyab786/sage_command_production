@@ -1,0 +1,37 @@
+# SageCommand Production - Backend Dependencies
+# Core API Framework
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+
+# Database & ORM
+sqlalchemy>=2.0.0
+pandas>=2.2.0
+
+# LangChain + LangGraph Ecosystem
+langchain>=0.3.20
+langchain-core>=0.3.24
+langchain-community>=0.3.11
+langchain-google-genai>=2.0.7
+langgraph>=0.2.56
+langgraph-checkpoint-sqlite>=2.0.3
+
+# Web Search Tool
+langchain-tavily>=0.1.6
+tavily-python>=0.5.0
+
+# Pydantic (FastAPI dependency)
+pydantic>=2.10.0
+
+# File handling
+python-multipart>=0.0.20
+
+# Optional: PostgreSQL/MySQL support for live DB tether
+psycopg2-binary>=2.9.0
+PyMySQL>=1.1.0
+
+# HTTP
+httpx>=0.28.0
+requests>=2.32.0
+
+# Utilities
+aiofiles>=24.1.0

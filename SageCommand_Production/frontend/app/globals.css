@@ -1,0 +1,15 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  background-color: #050505;
+  color: white;
+  margin: 0;
+  overflow: hidden;
+}
+
+/* Make React Flow background blend seamlessly */
+.react-flow__bg {
+  background-color: #050505 !important;
+}
