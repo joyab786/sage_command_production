@@ -10,6 +10,21 @@
 
 ---
 
+## 📚 Enterprise Documentation Suite
+
+Full technical and operational documentation is available in the [`docs/`](./docs) directory:
+
+- 📖 **[User Manual & Guide](./docs/user_manual.md)** - Dashboard navigation and operation instructions.
+- 🏗️ **[System Architecture](./docs/architecture.md)** - Details on the LangGraph topology and WebSocket pipelines.
+- 🔌 **[API & WebSocket Docs](./docs/api_docs.md)** - REST endpoints and real-time payload schemas.
+- 🚀 **[Deployment Guide](./docs/deployment_guide.md)** - Vercel, Railway, and Docker containerization.
+- 🛠️ **[Maintenance & Troubleshooting](./docs/maintenance_guide.md)** - Managing SQLite locks and LLM failover states.
+- 📝 **[Test Reports](./docs/test_reports.md)** - Diagnostic testing summaries.
+- ✅ **[UAT Sign-off Template](./docs/uat_signoff.md)** - Approval templates for stakeholder deployment.
+- 🔄 **[Changelog](./docs/changelog.md)** - Release notes and V2.0 updates.
+
+---
+
 ## 🚀 Key Capabilities
 
 *   **⚡ Live DB Tethering & Hot-Swapping**: Instantly route Sage OS to any production cluster (PostgreSQL, MySQL, local SQLite) or compile raw CSV uploads into SQL databases on the fly without stopping the agent's execution.
