@@ -1,12 +1,15 @@
 # backend/api/routes.py
-from fastapi import APIRouter, File, UploadFile, Depends, HTTPException, status
+import os
+import uuid
+import re
+from fastapi import APIRouter, File, UploadFile, Depends, HTTPException, status, Response
 from pydantic import BaseModel
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect
 import pandas as pd
 import shutil
 
 try:
-    from services.db_service import dynamic_db, validate_db_connection_uri
+    from services.db_service import validate_db_connection_uri
     from services.connection_manager import db_manager
     from data.database_context import AccessMode, DataMode
     from services.simulator import inject_random_anomaly
@@ -18,7 +21,7 @@ try:
     from gateway.db_gateway import db_gateway, DBConnectionRequest, DBConnectionResponse
     from gateway.network_policy import DatabasePolicyBlockedError
 except ModuleNotFoundError:
-    from backend.services.db_service import dynamic_db, validate_db_connection_uri
+    from backend.services.db_service import validate_db_connection_uri
     from backend.services.connection_manager import db_manager
     from backend.data.database_context import AccessMode, DataMode
     from backend.services.simulator import inject_random_anomaly
@@ -31,6 +34,11 @@ except ModuleNotFoundError:
     from backend.gateway.network_policy import DatabasePolicyBlockedError
 
 router = APIRouter()
+
+
+class AnomalyPayload(BaseModel):
+    anomaly_type: str = "OVERHEAT"
+
 
 class LiveDBConnection(BaseModel):
     connection_string: str
@@ -52,16 +60,23 @@ async def trigger_manual_anomaly(identity: Identity = Depends(require_role("mana
 @router.post("/connect-live-db")
 async def connect_live_db(
     payload: LiveDBConnection,
+    response: Response,
     identity: Identity = Depends(require_role("manager"))
 ):
-    """Takes a live database URI, validates scheme and network policy, redacts credentials, and registers session connection via Gateway (Requires Manager role)."""
+    """
+    [DEPRECATED] Connects live database URI via V3 Gateway.
+    Migrate to POST /api/v3/database/connections.
+    Does NOT mutate global dynamic_db.
+    """
+    response.headers["X-Deprecated"] = "true"
+    response.headers["Warning"] = "299 - 'Deprecated endpoint: use /api/v3/database/connections instead.'"
+
     allowed, _ = rate_limiter.is_allowed(identity.user_id)
     if not allowed:
         log_security_event("RATE_LIMIT_TRIGGERED", {"user_id": identity.user_id, "endpoint": "/connect-live-db"}, severity="WARNING")
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Rate limit exceeded.")
 
     try:
-        # Determine database type from scheme
         safe_info = parse_safe_connection_info(payload.connection_string)
         
         req = DBConnectionRequest(
@@ -74,13 +89,15 @@ async def connect_live_db(
         
         resp = db_gateway.create_connection(req, identity=identity)
         
-        # Sync adapter for V2/V3 compatibility
-        new_engine = create_engine(
-            payload.connection_string,
-            connect_args={"connect_timeout": SAGE_DB_CONNECTION_TIMEOUT} if "sqlite" not in payload.connection_string else {"check_same_thread": False}
+        # Discover tables safely through Gateway without touching process-global state
+        schema_info = db_gateway.discover_schema(
+            tenant_id=identity.tenant_id,
+            workspace_id=identity.workspace_id,
+            session_id=identity.session_id,
+            connection_id=resp.connection_id,
+            identity=identity
         )
-        dynamic_db.update_engine_safely(new_engine, raw_uri=payload.connection_string)
-        table_names = dynamic_db.db.get_usable_table_names() if dynamic_db.db else []
+        table_names = [t["table_name"] for t in schema_info.get("tables", [])]
 
         return {
             "status": "success",
@@ -100,23 +117,35 @@ async def connect_live_db(
 
 @router.post("/upload-db")
 async def upload_database(
+    response: Response,
     file: UploadFile = File(...),
     identity: Identity = Depends(require_role("manager"))
 ):
-    """Receives a CSV/SQLite file, verifies schema, compiles to SQL, and mounts session-scoped engine via Gateway (Requires Manager role)."""
+    """
+    [DEPRECATED] Receives a CSV/SQLite file and mounts session-scoped database via Gateway.
+    Uploaded files are strictly isolated per tenant/session, eliminating shared global dynamic_datacore.sqlite.
+    """
+    response.headers["X-Deprecated"] = "true"
+    response.headers["Warning"] = "299 - 'Deprecated endpoint: upload is isolated per tenant/session.'"
+
     allowed, _ = rate_limiter.is_allowed(identity.user_id)
     if not allowed:
         log_security_event("RATE_LIMIT_TRIGGERED", {"user_id": identity.user_id, "endpoint": "/upload-db"}, severity="WARNING")
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Rate limit exceeded.")
 
     try:
-        file_location = DEFAULT_DB_PATH
-        
+        # Isolate upload storage per tenant and session to prevent global datacore collisions and path traversal
+        safe_tenant = re.sub(r"[^\w\-]", "_", identity.tenant_id)
+        safe_session = re.sub(r"[^\w\-]", "_", identity.session_id)
+        upload_dir = os.path.join("uploads", safe_tenant, safe_session)
+        os.makedirs(upload_dir, exist_ok=True)
+
         # Handle CSV Files
         if file.filename.endswith(".csv"):
+            table_name = re.sub(r"[^\w_]", "_", file.filename.rsplit('.', 1)[0]).lower()
+            file_location = os.path.join(upload_dir, f"{table_name}_{uuid.uuid4().hex[:8]}.sqlite").replace("\\", "/")
+
             df = pd.read_csv(file.file)
-            table_name = file.filename.rsplit('.', 1)[0].replace(" ", "_").replace("-", "_").lower()
-            
             new_engine = create_engine(f"sqlite:///{file_location}", connect_args={"check_same_thread": False})
             df.to_sql(table_name, con=new_engine, if_exists="replace", index=False)
             
@@ -128,16 +157,15 @@ async def upload_database(
                 connection_id="sqlite_main"
             )
             db_gateway.create_connection(req, identity=identity)
-            dynamic_db.update_engine(new_engine)
             log_security_event("DATABASE_CONNECTION_SUCCEEDED", {"user_id": identity.user_id, "action": "csv_upload", "table": table_name})
-            return {"status": "success", "message": f"CSV compiled to SQL. Table '{table_name}' mounted successfully."}
+            return {"status": "success", "message": f"CSV compiled to SQL. Table '{table_name}' mounted successfully.", "file_location": file_location}
 
         # Handle SQLite/DB Files
         elif file.filename.endswith((".sqlite", ".db")):
+            file_location = os.path.join(upload_dir, f"datacore_{uuid.uuid4().hex[:8]}.sqlite").replace("\\", "/")
             with open(file_location, "wb") as buffer:
                 shutil.copyfileobj(file.file, buffer)
             
-            new_engine = create_engine(f"sqlite:///{file_location}", connect_args={"check_same_thread": False})
             req = DBConnectionRequest(
                 database_type="SQLITE",
                 connection_string=f"sqlite:///{file_location}",
@@ -146,9 +174,8 @@ async def upload_database(
                 connection_id="sqlite_main"
             )
             db_gateway.create_connection(req, identity=identity)
-            dynamic_db.update_engine(new_engine)
             log_security_event("DATABASE_CONNECTION_SUCCEEDED", {"user_id": identity.user_id, "action": "sqlite_upload", "file": file.filename})
-            return {"status": "success", "message": f"Datacore {file.filename} mounted successfully."}
+            return {"status": "success", "message": f"Datacore {file.filename} mounted successfully.", "file_location": file_location}
             
         else:
             return {"status": "error", "message": "Unsupported file format. Please upload .csv, .db, or .sqlite"}

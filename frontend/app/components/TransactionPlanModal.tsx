@@ -1,7 +1,7 @@
 "use client";
 import React, { useState, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Layers, ShieldCheck, Clock, AlertTriangle, RefreshCw, X, CheckCircle, FileText } from "lucide-react";
+import { Layers, ShieldCheck, Clock, AlertTriangle, RefreshCw, X, CheckCircle, FileText, Play, RotateCcw } from "lucide-react";
 
 interface TransactionItem {
   transaction_id: string;
@@ -50,6 +50,9 @@ export default function TransactionPlanModal({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selectedTx, setSelectedTx] = useState<TransactionItem | null>(null);
+  const [isExecuting, setIsExecuting] = useState(false);
+  const [isRollingBack, setIsRollingBack] = useState(false);
+  const [executionMessage, setExecutionMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
 
   const fetchTransactions = async () => {
     setLoading(true);
@@ -75,6 +78,72 @@ export default function TransactionPlanModal({
       setError(err instanceof Error ? err.message : "Failed to load transactions");
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleExecute = async (txId: string) => {
+    setIsExecuting(true);
+    setExecutionMessage(null);
+    try {
+      const res = await fetch(`http://localhost:8000/api/v3/transactions/${txId}/execute`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+          "X-Tenant-ID": "tenant_default",
+        },
+        body: JSON.stringify({ transaction_id: txId, dry_run: false }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        const msg = data.detail?.message || data.error?.message || `Execution failed with HTTP ${res.status}`;
+        throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+      }
+      setExecutionMessage({
+        type: "success",
+        text: `Execution Succeeded! ID: ${data.result?.execution_id || "exec_done"} (${data.result?.affected_rows ?? 0} rows affected)`
+      });
+      fetchTransactions();
+    } catch (err: unknown) {
+      setExecutionMessage({
+        type: "error",
+        text: err instanceof Error ? err.message : "Execution failed"
+      });
+    } finally {
+      setIsExecuting(false);
+    }
+  };
+
+  const handleRollback = async (txId: string) => {
+    setIsRollingBack(true);
+    setExecutionMessage(null);
+    try {
+      const res = await fetch(`http://localhost:8000/api/v3/transactions/${txId}/rollback`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+          "X-Tenant-ID": "tenant_default",
+        },
+        body: JSON.stringify({ reason: "Operator requested rollback via UI" }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        const msg = data.detail?.message || data.error?.message || `Rollback failed with HTTP ${res.status}`;
+        throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+      }
+      setExecutionMessage({
+        type: "success",
+        text: `Rollback Completed! Status: ${data.result?.status || "ROLLED_BACK"}`
+      });
+      fetchTransactions();
+    } catch (err: unknown) {
+      setExecutionMessage({
+        type: "error",
+        text: err instanceof Error ? err.message : "Rollback failed"
+      });
+    } finally {
+      setIsRollingBack(false);
     }
   };
 
@@ -105,14 +174,14 @@ export default function TransactionPlanModal({
               <div>
                 <div className="flex items-center gap-2">
                   <h2 className="font-mono text-sm font-bold uppercase tracking-wider text-cyan-400">
-                    Transaction & Rollback Cortex // V3.0
+                    Execution Gateway & Rollback Cortex // V3.0
                   </h2>
-                  <span className="px-2 py-0.5 bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 text-[10px] font-mono rounded">
-                    PASSIVE SAFETY LAYER
+                  <span className="px-2 py-0.5 bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-[10px] font-mono rounded">
+                    GATEWAY ACTIVE
                   </span>
                 </div>
                 <p className="text-xs text-gray-500 font-mono">
-                  Deterministic transaction plans, invariant boundaries, and rollback capabilities
+                  Deterministic transaction execution, invariant boundaries, and rollback capabilities
                 </p>
               </div>
             </div>
@@ -137,14 +206,14 @@ export default function TransactionPlanModal({
           </div>
 
           {/* Safety Notice Banner */}
-          <div className="bg-amber-950/20 border-b border-amber-500/20 px-6 py-2 flex items-center justify-between text-[11px] font-mono text-amber-400/90">
+          <div className="bg-cyan-950/20 border-b border-cyan-500/20 px-6 py-2 flex items-center justify-between text-[11px] font-mono text-cyan-400/90">
             <div className="flex items-center gap-2">
-              <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+              <ShieldCheck className="w-4 h-4 text-cyan-400 shrink-0" />
               <span>
-                Safety Invariant: Transaction planning is non-operational (side_effects=False). Execution is deferred to the Execution Gateway.
+                Execution Boundary: Multi-gate server-authoritative validation active. Zero unparameterized SQL writes.
               </span>
             </div>
-            <span className="text-[10px] text-amber-500/60 uppercase">EXECUTION DISABLED</span>
+            <span className="text-[10px] text-cyan-400/80 uppercase">GATEWAY ENFORCED</span>
           </div>
 
           {/* Body */}
@@ -284,6 +353,49 @@ export default function TransactionPlanModal({
                         <span className="text-purple-300">{selectedTx.plan.rollback_plan.risk_level}</span>
                       </div>
                     </div>
+                  </div>
+
+                  {/* Execution Message Banner */}
+                  {executionMessage && (
+                    <div
+                      className={`p-3 rounded border font-mono text-xs flex items-center gap-2 ${
+                        executionMessage.type === "success"
+                          ? "bg-emerald-950/30 border-emerald-500/30 text-emerald-400"
+                          : "bg-red-950/30 border-red-500/30 text-red-400"
+                      }`}
+                    >
+                      {executionMessage.type === "success" ? (
+                        <CheckCircle className="w-4 h-4 shrink-0" />
+                      ) : (
+                        <AlertTriangle className="w-4 h-4 shrink-0" />
+                      )}
+                      <span>{executionMessage.text}</span>
+                    </div>
+                  )}
+
+                  {/* Execution Gateway Actions */}
+                  <div className="pt-2 border-t border-white/10 flex items-center gap-3 font-mono">
+                    <button
+                      type="button"
+                      disabled={isExecuting || isRollingBack || selectedTx.status === "COMMITTED" || selectedTx.status === "EXECUTING"}
+                      onClick={() => handleExecute(selectedTx.transaction_id)}
+                      className="flex-1 py-2 px-4 bg-cyan-600 hover:bg-cyan-500 disabled:bg-gray-800 disabled:text-gray-500 text-black font-bold rounded transition-colors text-xs flex items-center justify-center gap-2"
+                    >
+                      <Play className={`w-3.5 h-3.5 ${isExecuting ? "animate-spin" : ""}`} />
+                      <span>{isExecuting ? "Executing Plan..." : "Execute Plan via Gateway"}</span>
+                    </button>
+
+                    {(selectedTx.status === "COMMITTED" || selectedTx.status === "FAILED") && (
+                      <button
+                        type="button"
+                        disabled={isRollingBack || isExecuting}
+                        onClick={() => handleRollback(selectedTx.transaction_id)}
+                        className="py-2 px-4 bg-purple-600/20 hover:bg-purple-600/30 border border-purple-500/40 text-purple-300 font-bold rounded transition-colors text-xs flex items-center gap-2"
+                      >
+                        <RotateCcw className={`w-3.5 h-3.5 ${isRollingBack ? "animate-spin" : ""}`} />
+                        <span>{isRollingBack ? "Rolling back..." : "Rollback Plan"}</span>
+                      </button>
+                    )}
                   </div>
                 </>
               ) : (

@@ -1,4 +1,6 @@
 # backend/tools/db_tools.py
+from contextvars import ContextVar
+from typing import Dict, Any, Optional
 from langchain_core.tools import tool
 
 try:
@@ -10,6 +12,24 @@ except ModuleNotFoundError:
     from backend.core.auth import Identity
     from backend.governance.guardrails import validate_sql_query
 
+_session_context_var: ContextVar[Optional[Dict[str, str]]] = ContextVar("session_context", default=None)
+
+
+def set_active_session_context(tenant_id: str, workspace_id: str, session_id: str, connection_id: str = "sqlite_main"):
+    """Binds trusted server session context for tool execution."""
+    _session_context_var.set({
+        "tenant_id": tenant_id,
+        "workspace_id": workspace_id,
+        "session_id": session_id,
+        "connection_id": connection_id
+    })
+
+
+def get_active_session_context() -> Optional[Dict[str, str]]:
+    """Retrieves active trusted session context."""
+    return _session_context_var.get()
+
+
 @tool
 def list_database_tables(
     tenant_id: str = "tenant_default",
@@ -18,8 +38,15 @@ def list_database_tables(
     connection_id: str = "sqlite_main"
 ) -> str:
     """Always use this tool first to see what tables are available in the database for the active session context."""
+    active_ctx = get_active_session_context()
+    if active_ctx:
+        tenant_id = active_ctx.get("tenant_id", tenant_id)
+        workspace_id = active_ctx.get("workspace_id", workspace_id)
+        session_id = active_ctx.get("session_id", session_id)
+        connection_id = active_ctx.get("connection_id", connection_id)
+
     try:
-        identity = Identity(user_id="agent_db_tool", tenant_id=tenant_id, session_id=session_id)
+        identity = Identity(user_id="agent_db_tool", tenant_id=tenant_id, session_id=session_id, is_server_authoritative=True)
         schema_info = db_gateway.discover_schema(
             tenant_id=tenant_id,
             workspace_id=workspace_id,
@@ -33,6 +60,7 @@ def list_database_tables(
     except Exception as e:
         return f"Error listing database tables: {str(e)}"
 
+
 @tool
 def query_database(
     query: str,
@@ -41,12 +69,19 @@ def query_database(
     session_id: str = "session_default",
     connection_id: str = "sqlite_main"
 ) -> str:
-    """Execute a SQL query against the database for the given session context and return results."""
-    # Execute SQL Validator check (raises PermissionError on violation)
+    """Execute a strictly read-only SQL query against the database for the authorized session context and return results."""
+    # Execute SQL Validator check (raises PermissionError on any mutation or chaining attempt)
     validate_sql_query(query)
     
+    active_ctx = get_active_session_context()
+    if active_ctx:
+        tenant_id = active_ctx.get("tenant_id", tenant_id)
+        workspace_id = active_ctx.get("workspace_id", workspace_id)
+        session_id = active_ctx.get("session_id", session_id)
+        connection_id = active_ctx.get("connection_id", connection_id)
+
     try:
-        identity = Identity(user_id="agent_db_tool", tenant_id=tenant_id, session_id=session_id)
+        identity = Identity(user_id="agent_db_tool", tenant_id=tenant_id, session_id=session_id, is_server_authoritative=True)
         _, _, _, query_tool = db_gateway.get_connection(
             tenant_id=tenant_id,
             workspace_id=workspace_id,
@@ -59,6 +94,7 @@ def query_database(
         return query_tool.invoke(query)
     except Exception as e:
         return f"Database query failed: {str(e)}"
+
 
 
 import json

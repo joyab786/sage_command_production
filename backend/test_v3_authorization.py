@@ -353,11 +353,11 @@ class TestV3AuthorizationArchitecture(unittest.TestCase):
     # =====================================================================
 
     def test_action_execute_endpoint_strictly_returns_405(self):
-        """Verifies that POST /api/v3/actions/{id}/execute returns 405 Method Not Allowed."""
+        """Verifies that POST /api/v3/actions/{id}/execute is routed to Execution Gateway (404 on missing action)."""
         headers = self._auth_headers()
         res = self.client.post("/api/v3/actions/act_test_01/execute", headers=headers)
-        self.assertEqual(res.status_code, 405)
-        self.assertIn("EXECUTION_GATEWAY_NOT_IMPLEMENTED", res.text)
+        self.assertEqual(res.status_code, 404)
+        self.assertIn("ACTION_NOT_FOUND", res.text)
 
     # =====================================================================
     # 8. REST ENDPOINTS (/api/v3/authorization/*)

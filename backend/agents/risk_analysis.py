@@ -5,11 +5,13 @@ from pydantic import BaseModel, Field
 try:
     from core.state import SageOSState, IndustrialStage
     from core.llm import safe_llm_invoke
-    from services.db_service import dynamic_db
+    from core.auth import Identity
+    from gateway.db_gateway import db_gateway
 except (ImportError, ModuleNotFoundError):
     from backend.core.state import SageOSState, IndustrialStage
     from backend.core.llm import safe_llm_invoke
-    from backend.services.db_service import dynamic_db
+    from backend.core.auth import Identity
+    from backend.gateway.db_gateway import db_gateway
 
 
 class AffectedSystem(BaseModel):
@@ -33,7 +35,24 @@ def risk_agent_node(state: SageOSState) -> Dict[str, Any]:
     """PREDICT & ANALYZE STAGE: Blast Radius Risk Analysis Agent."""
     print(" [Risk Agent] Computing Blast Radius Analysis...")
     anomaly = state.get("anomaly_details", {})
-    schema_info = dynamic_db.db.get_table_info() if (dynamic_db and dynamic_db.db) else "No active database loaded."
+    
+    tenant_id = state.get("tenant_id") or "tenant_default"
+    workspace_id = state.get("workspace_id") or "workspace_default"
+    session_id = state.get("session_id") or "session_default"
+    connection_id = state.get("connection_id") or "sqlite_main"
+    
+    try:
+        identity = Identity(user_id="agent_risk", tenant_id=tenant_id, session_id=session_id, is_server_authoritative=True)
+        schema_info = db_gateway.get_schema_context_for_llm(
+            tenant_id=tenant_id,
+            workspace_id=workspace_id,
+            session_id=session_id,
+            connection_id=connection_id,
+            identity=identity
+        )
+    except Exception:
+        schema_info = "No active database loaded."
+
     
     prompt = f"""You are the Risk Analysis Agent in SageCommand OS.
 Perform a structured 'Blast Radius Analysis' for the detected operational anomaly based on the database schema.

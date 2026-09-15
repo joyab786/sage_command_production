@@ -424,11 +424,11 @@ class TestV3Transactions(unittest.TestCase):
         )
         self.assertEqual(res_forbid.status_code, 403)
 
-    def test_14_execution_boundary_remains_strictly_405(self):
+    def test_14_execution_and_rollback_endpoints_gated_by_execution_gateway(self):
         """
-        CRITICAL ARCHITECTURAL SAFETY INVARIANT:
+        V3 EXECUTION GATEWAY BOUNDARY:
         POST /actions/{id}/execute, POST /transactions/{id}/execute, and POST /transactions/{id}/rollback
-        MUST strictly return 405 Method Not Allowed.
+        are enabled and routed through Execution Gateway (returning 404 on non-existent targets rather than 405).
         """
         headers = self._auth_headers()
         tx_id = "tx_dummy_01"
@@ -436,15 +436,15 @@ class TestV3Transactions(unittest.TestCase):
 
         # Action execute
         res_act_exec = self.client.post(f"/api/v3/actions/{act_id}/execute", headers=headers)
-        self.assertEqual(res_act_exec.status_code, 405, "Action execution MUST remain 405 Method Not Allowed")
+        self.assertEqual(res_act_exec.status_code, 404, "Action execution is handled by Execution Gateway (404 on missing action)")
 
         # Transaction execute
         res_tx_exec = self.client.post(f"/api/v3/transactions/{tx_id}/execute", headers=headers)
-        self.assertEqual(res_tx_exec.status_code, 405, "Transaction execution MUST be 405 Method Not Allowed")
+        self.assertEqual(res_tx_exec.status_code, 404, "Transaction execution is handled by Execution Gateway (404 on missing tx)")
 
         # Rollback execute
         res_rb_exec = self.client.post(f"/api/v3/transactions/{tx_id}/rollback", headers=headers)
-        self.assertEqual(res_rb_exec.status_code, 405, "Direct rollback execution MUST be 405 Method Not Allowed")
+        self.assertEqual(res_rb_exec.status_code, 404, "Rollback is handled by Execution Gateway (404 on missing tx)")
 
 
 if __name__ == "__main__":

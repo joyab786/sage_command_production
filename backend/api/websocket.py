@@ -12,6 +12,10 @@ try:
     from graph.builder import sage_app
     from governance.rbac import is_high_risk_action
     from services.connection_manager import db_manager
+    from services.execution_gateway import execution_gateway
+    from data.schemas.execution_contract import ExecutionRequest
+    from services.action_store import action_store
+    from data.schemas.action_contract import ActionStatus
 except (ImportError, ModuleNotFoundError):
     from backend.core.config import SAGE_AUTH_ENABLED, IS_PRODUCTION, SAGE_MAX_REQUEST_SIZE, DEFAULT_DB_PATH
     from backend.core.auth import get_auth_provider, Identity
@@ -20,6 +24,10 @@ except (ImportError, ModuleNotFoundError):
     from backend.graph.builder import sage_app
     from backend.governance.rbac import is_high_risk_action
     from backend.services.connection_manager import db_manager
+    from backend.services.execution_gateway import execution_gateway
+    from backend.data.schemas.execution_contract import ExecutionRequest
+    from backend.services.action_store import action_store
+    from backend.data.schemas.action_contract import ActionStatus
 
 router = APIRouter()
 
@@ -334,11 +342,30 @@ async def websocket_endpoint(websocket: WebSocket):
                 user_role = payload.get("user_role", identity.roles[0] if identity.roles else "operator").lower()
                 scan_config = {"configurable": {"thread_id": f"scan-{thread_id}"}}
                 
-                # Retrieve current state snapshot to inspect pending action risk level
+                # Retrieve current state snapshot to inspect pending action and session context
                 state_snapshot = await asyncio.to_thread(_get_state, scan_config)
                 final_state = state_snapshot.values if state_snapshot else {}
                 eval_payload = final_state.get("utility_evaluation", {})
+                proposed_action = final_state.get("proposed_action") or {}
                 
+                action_tenant = proposed_action.get("tenant_id") or final_state.get("tenant_id") or identity.tenant_id
+                action_session = proposed_action.get("session_id") or final_state.get("session_id") or identity.session_id
+
+                # Session & Tenant Matching Security Guardrail
+                if identity.tenant_id != action_tenant or identity.session_id != action_session:
+                    log_security_event("WEBSOCKET_APPROVAL_DENIED", {
+                        "user_id": identity.user_id,
+                        "reason": "Tenant or Session mismatch during approval attempt",
+                        "identity_tenant": identity.tenant_id,
+                        "action_tenant": action_tenant
+                    }, severity="WARNING")
+                    await websocket.send_text(json.dumps({
+                        "type": "unauthorized",
+                        "message": "[GOVERNANCE DENIED] > Session or tenant mismatch. Cross-session approval rejected.",
+                        "status": "DENIED"
+                    }))
+                    continue
+
                 high_risk = is_high_risk_action(eval_payload)
                 
                 # RBAC Clearance Validation: Check identity roles and requested role for high-risk approval
@@ -351,26 +378,90 @@ async def websocket_endpoint(websocket: WebSocket):
                     print(f" [RBAC Denied] Identity '{identity.user_id}' with roles {identity.roles} attempted approval on high-risk action: {eval_payload.get('action')}")
                     await websocket.send_text(json.dumps({
                         "type": "unauthorized",
-                        "message": "[RBAC DENIED] > Authorization rejected. High-risk database operations require Manager role clearance.",
+                        "message": "[RBAC DENIED] > Authorization rejected. High-risk operations require Manager role clearance.",
                         "required_role": "manager",
-                        "current_role": user_role
+                        "current_role": user_role,
+                        "status": "DENIED"
                     }))
                     await websocket.send_text(json.dumps({
                         "type": "log",
                         "message": f"[SECURITY WARNING] > Blocked approval attempt by role '{user_role.upper()}'. Manager role required."
                     }))
-                else:
-                    await websocket.send_text(json.dumps({"type": "log", "message": f"[AGENT] > Authorized by {user_role.upper()}. Resuming execution pipeline..."}))
-                    await websocket.send_text(json.dumps({"type": "node_active", "node": "execution"}))
+                    continue
+
+                # Execution Gateway Integration: If action_id exists in proposed_action or action_store
+                target_action_id = proposed_action.get("action_id")
+                if target_action_id:
                     try:
-                        # Resume the LangGraph agent past the interrupt point
-                        result = await asyncio.to_thread(_invoke_graph, None, scan_config)
-                        
-                        await websocket.send_text(json.dumps({"type": "status", "status": "ONLINE"}))
-                        await websocket.send_text(json.dumps({"type": "log", "message": "[SUCCESS] > Execution committed to database."}))
-                    except Exception as e:
-                        await websocket.send_text(json.dumps({"type": "status", "status": "ONLINE"}))
-                        await websocket.send_text(json.dumps({"type": "log", "message": f"[ERROR] > Execution failed: {sanitize_log_message(str(e))}"}))
+                        act = action_store.get_by_id(target_action_id, identity.tenant_id)
+                        if act and act.status != ActionStatus.APPROVED:
+                            action_store.update_status(target_action_id, identity.tenant_id, ActionStatus.APPROVED)
+                    except Exception:
+                        pass
+
+                log_security_event("WEBSOCKET_APPROVAL_REGISTERED", {
+                    "user_id": identity.user_id,
+                    "action_id": target_action_id or "act_unspecified",
+                    "status": "APPROVED"
+                }, severity="INFO")
+
+                await websocket.send_text(json.dumps({
+                    "type": "log",
+                    "message": f"[GOVERNANCE] > Authorized by {user_role.upper()}. Resuming agent graph verification stage..."
+                }))
+                await websocket.send_text(json.dumps({"type": "node_active", "node": "execution"}))
+                
+                try:
+                    # Resume LangGraph agent through execution boundary guard
+                    result = await asyncio.to_thread(_invoke_graph, None, scan_config)
+                    
+                    await websocket.send_text(json.dumps({"type": "status", "status": "ONLINE"}))
+                    await websocket.send_text(json.dumps({
+                        "type": "log",
+                        "message": "[GOVERNANCE] > Action approved and verified by Execution Gateway."
+                    }))
+                except Exception as e:
+                    await websocket.send_text(json.dumps({"type": "status", "status": "ONLINE"}))
+                    await websocket.send_text(json.dumps({"type": "log", "message": f"[ERROR] > Pipeline resumption error: {sanitize_log_message(str(e))}"}))
+
+            elif command == "execute":
+                target_action_id = payload.get("action_id")
+                target_tx_id = payload.get("transaction_id")
+                try:
+                    if target_tx_id:
+                        res = await asyncio.to_thread(
+                            execution_gateway.execute_transaction,
+                            target_tx_id,
+                            identity,
+                            ExecutionRequest(transaction_id=target_tx_id, dry_run=payload.get("dry_run", False))
+                        )
+                    elif target_action_id:
+                        res = await asyncio.to_thread(
+                            execution_gateway.execute_action,
+                            target_action_id,
+                            identity,
+                            ExecutionRequest(action_id=target_action_id, dry_run=payload.get("dry_run", False))
+                        )
+                    else:
+                        await websocket.send_text(json.dumps({
+                            "type": "error",
+                            "message": "Neither action_id nor transaction_id specified for execution."
+                        }))
+                        continue
+
+                    await websocket.send_text(json.dumps({
+                        "type": "execution_result",
+                        "payload": res.model_dump()
+                    }))
+                    await websocket.send_text(json.dumps({
+                        "type": "log",
+                        "message": f"[EXECUTION GATEWAY] > Execution {res.execution_id} succeeded with {res.affected_rows} rows affected."
+                    }))
+                except Exception as e:
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "message": f"[EXECUTION FAILED] > {sanitize_log_message(str(e))}"
+                    }))
 
             elif command == "get_history":
                 try:
@@ -401,19 +492,19 @@ async def websocket_endpoint(websocket: WebSocket):
                         "message": f"[ERROR] > Failed to fetch checkpoint history: {sanitize_log_message(str(e))}"
                     }))
 
-            elif command == "rollback":
+            elif command in ("revert_checkpoint", "rollback"):
                 target_checkpoint_id = payload.get("checkpoint_id")
                 if not target_checkpoint_id:
                     await websocket.send_text(json.dumps({
                         "type": "log",
-                        "message": "[ERROR] > No checkpoint_id provided for rollback."
+                        "message": "[ERROR] > No checkpoint_id provided for state reversion."
                     }))
                 else:
                     try:
                         scan_config = {"configurable": {"thread_id": f"scan-{thread_id}", "checkpoint_id": target_checkpoint_id}}
                         await websocket.send_text(json.dumps({
                             "type": "log",
-                            "message": f"[SYSTEM] > Reverting graph state to checkpoint '{target_checkpoint_id[:8]}...'..."
+                            "message": f"[SYSTEM] > Reverting agent state snapshot to checkpoint '{target_checkpoint_id[:8]}...' (LangGraph checkpoint state reversion only; industrial database rollback remains governed by Transaction Architecture)."
                         }))
 
                         result = await asyncio.to_thread(_invoke_graph, None, scan_config)
@@ -424,10 +515,10 @@ async def websocket_endpoint(websocket: WebSocket):
                         }))
                         await websocket.send_text(json.dumps({
                             "type": "log",
-                            "message": f"[SUCCESS] > State successfully reverted to checkpoint {target_checkpoint_id[:8]}."
+                            "message": f"[SUCCESS] > State snapshot successfully reverted to checkpoint {target_checkpoint_id[:8]}."
                         }))
                     except Exception as e:
-                        print(f" Rollback error: {e}")
+                        print(f" Checkpoint reversion error: {e}")
                         await websocket.send_text(json.dumps({
                             "type": "log",
                             "message": f"[ERROR] > Reversion to checkpoint failed: {sanitize_log_message(str(e))}"

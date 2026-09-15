@@ -69,12 +69,15 @@ CANONICAL_PERMISSIONS: List[Permission] = [
     Permission(permission_id="action.simulate", resource="action", action="simulate", description="Request deterministic simulation preview of action"),
     Permission(permission_id="action.cancel", resource="action", action="cancel", description="Cancel pending action proposal"),
     Permission(permission_id="action.approve", resource="action", action="approve", description="Approve action awaiting human verification", is_sensitive=True),
+    Permission(permission_id="action.execute", resource="action", action="execute", description="Execute approved or authorized operational action", is_sensitive=True),
     
     # Transaction & Rollback Architecture
     Permission(permission_id="transaction.plan", resource="transaction", action="plan", description="Propose and create transaction plan from action"),
     Permission(permission_id="transaction.read", resource="transaction", action="read", description="View transaction plan and status"),
     Permission(permission_id="transaction.validate", resource="transaction", action="validate", description="Trigger validation or revalidation on transaction plan"),
     Permission(permission_id="transaction.cancel", resource="transaction", action="cancel", description="Cancel planned transaction before execution"),
+    Permission(permission_id="transaction.execute", resource="transaction", action="execute", description="Execute approved multi-action transaction plan", is_sensitive=True),
+    Permission(permission_id="transaction.rollback", resource="transaction", action="rollback", description="Rollback executed multi-action transaction plan", is_sensitive=True),
     
     # Operational Domain Controls
     Permission(permission_id="production.propose", resource="production", action="propose", description="Propose changes to production schedule or line rates"),
@@ -152,9 +155,12 @@ SYSTEM_ROLES: List[Role] = [
         role_id="OPERATOR",
         name="Operator",
         scope_type=RoleScopeType.PLANT,
-        permissions=["action.create", "action.cancel", "production.propose", "machine.status.read", "transaction.plan", "transaction.cancel"],
+        permissions=[
+            "action.create", "action.cancel", "production.propose", "machine.status.read",
+            "transaction.plan", "transaction.cancel", "action.execute", "transaction.execute"
+        ],
         inherits_from=["ANALYST"],
-        description="Line operator authorized to propose structured operational actions on assigned plant lines.",
+        description="Line operator authorized to propose and execute structured operational actions on assigned plant lines.",
         is_system_role=True
     ),
     Role(
@@ -179,18 +185,18 @@ SYSTEM_ROLES: List[Role] = [
         role_id="SAFETY_MANAGER",
         name="Safety Manager",
         scope_type=RoleScopeType.SYSTEM,
-        permissions=["safety.hold", "emergency.declare", "audit.read"],
+        permissions=["safety.hold", "emergency.declare", "audit.read", "transaction.rollback"],
         inherits_from=["VIEWER"],
-        description="Safety officer with immediate authority to declare safety holds and emergency stops.",
+        description="Safety officer with immediate authority to declare safety holds, emergency stops, and emergency rollback.",
         is_system_role=True
     ),
     Role(
         role_id="PLANT_MANAGER",
         name="Plant Manager",
         scope_type=RoleScopeType.PLANT,
-        permissions=["action.approve", "production.schedule"],
+        permissions=["action.approve", "production.schedule", "transaction.rollback"],
         inherits_from=["OPERATOR", "SAFETY_MANAGER", "SUPPLY_CHAIN_MANAGER"],
-        description="Senior plant authority responsible for approving high-risk actions and production schedules.",
+        description="Senior plant authority responsible for approving high-risk actions, production schedules, and transaction rollbacks.",
         is_system_role=True
     ),
     Role(

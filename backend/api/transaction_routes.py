@@ -20,7 +20,14 @@ try:
         TransactionRevalidateResponse,
         TransactionCancelResponse
     )
+    from data.schemas.execution_contract import (
+        ExecutionRequest,
+        RollbackRequest,
+        TransactionExecuteResponse,
+        TransactionRollbackResponse
+    )
     from services.transaction_service import transaction_service, TransactionService
+    from services.execution_gateway import execution_gateway, ExecutionGatewayException
 except ModuleNotFoundError:
     from backend.core.auth import Identity, get_current_identity, require_permission
     from backend.data.schemas.transaction_contract import (
@@ -32,7 +39,14 @@ except ModuleNotFoundError:
         TransactionRevalidateResponse,
         TransactionCancelResponse
     )
+    from backend.data.schemas.execution_contract import (
+        ExecutionRequest,
+        RollbackRequest,
+        TransactionExecuteResponse,
+        TransactionRollbackResponse
+    )
     from backend.services.transaction_service import transaction_service, TransactionService
+    from backend.services.execution_gateway import execution_gateway, ExecutionGatewayException
 
 router = APIRouter(prefix="/api/v3/transactions", tags=["V3 Transactions"])
 
@@ -211,30 +225,91 @@ def cancel_transaction(
 
 
 # =====================================================================
-# MANDATORY SAFETY EXECUTION & ROLLBACK BOUNDARY (STRICTLY 405)
+# V3 EXECUTION GATEWAY BOUNDARY (EXECUTE & ROLLBACK)
 # =====================================================================
 
-@router.post("/{transaction_id}/execute", include_in_schema=True)
-def execute_transaction_boundary(transaction_id: str):
+@router.post(
+    "/{transaction_id}/execute",
+    response_model=TransactionExecuteResponse,
+    summary="Execute Transaction Plan",
+    dependencies=[Depends(require_permission("transaction.execute"))]
+)
+def execute_transaction_endpoint(
+    transaction_id: str,
+    payload: Optional[ExecutionRequest] = None,
+    identity: Identity = Depends(get_current_identity)
+):
     """
-    CRITICAL ARCHITECTURAL SAFETY BOUNDARY:
-    Operational transaction execution is strictly prohibited under Prompt 09.
-    Real-world side effects are deferred to the future Execution Gateway.
+    Executes a multi-action transaction plan through the deterministic V3 Execution Gateway.
+    Enforces multi-gate authorization, hash/TTL verification, concurrency lock, and atomic database commits.
     """
-    raise HTTPException(
-        status_code=status.HTTP_405_METHOD_NOT_ALLOWED,
-        detail="EXECUTION_GATEWAY_NOT_IMPLEMENTED: Transaction execution is disabled in Prompt 09. Operational execution is deferred to the Execution Gateway."
-    )
+    req_id = f"req_{uuid.uuid4().hex[:8]}"
+    try:
+        result = execution_gateway.execute_transaction(
+            transaction_id=transaction_id,
+            identity=identity,
+            request=payload
+        )
+        return TransactionExecuteResponse(
+            success=True,
+            request_id=req_id,
+            result=result
+        )
+    except ExecutionGatewayException as ex:
+        raise HTTPException(
+            status_code=ex.status_code,
+            detail={
+                "code": ex.code,
+                "message": ex.message,
+                "details": ex.details
+            }
+        )
+    except Exception as ex:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Transaction execution failed: {str(ex)}"
+        )
 
 
-@router.post("/{transaction_id}/rollback", include_in_schema=True)
-def rollback_transaction_boundary(transaction_id: str):
+@router.post(
+    "/{transaction_id}/rollback",
+    response_model=TransactionRollbackResponse,
+    summary="Rollback Committed or Failed Transaction",
+    dependencies=[Depends(require_permission("transaction.rollback"))]
+)
+def rollback_transaction_endpoint(
+    transaction_id: str,
+    payload: Optional[RollbackRequest] = None,
+    identity: Identity = Depends(get_current_identity)
+):
     """
-    CRITICAL ARCHITECTURAL SAFETY BOUNDARY:
-    Autonomous rollback execution is strictly prohibited under Prompt 09.
-    Rollback capability analysis is supported; autonomous rollback execution is deferred.
+    Executes deterministic rollback on a transaction through the V3 Execution Gateway.
+    Enforces transaction.rollback permission, state validation, and compensating operations.
     """
-    raise HTTPException(
-        status_code=status.HTTP_405_METHOD_NOT_ALLOWED,
-        detail="ROLLBACK_GATEWAY_NOT_IMPLEMENTED: Autonomous rollback execution is disabled in Prompt 09. Direct execution of rollback is deferred to the Execution Gateway."
-    )
+    req_id = f"req_{uuid.uuid4().hex[:8]}"
+    try:
+        result = execution_gateway.rollback_transaction(
+            transaction_id=transaction_id,
+            identity=identity,
+            request=payload
+        )
+        return TransactionRollbackResponse(
+            success=True,
+            request_id=req_id,
+            result=result
+        )
+    except ExecutionGatewayException as ex:
+        raise HTTPException(
+            status_code=ex.status_code,
+            detail={
+                "code": ex.code,
+                "message": ex.message,
+                "details": ex.details
+            }
+        )
+    except Exception as ex:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Transaction rollback failed: {str(ex)}"
+        )
+

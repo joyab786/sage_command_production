@@ -100,19 +100,52 @@ class TransactionStateMachine:
         ],
         TransactionStatus.READY: [
             TransactionStatus.AWAITING_EXECUTION,
+            TransactionStatus.EXECUTING,
             TransactionStatus.VALIDATING,
             TransactionStatus.CANCELLED,
-            TransactionStatus.EXPIRED
+            TransactionStatus.EXPIRED,
+            TransactionStatus.FAILED
         ],
         TransactionStatus.AWAITING_EXECUTION: [
+            TransactionStatus.EXECUTING,
             TransactionStatus.VALIDATING,
             TransactionStatus.CANCELLED,
-            TransactionStatus.EXPIRED
-            # Note: EXECUTING transition deferred to future Execution Gateway
+            TransactionStatus.EXPIRED,
+            TransactionStatus.FAILED
+        ],
+        TransactionStatus.EXECUTING: [
+            TransactionStatus.COMMITTING,
+            TransactionStatus.COMMITTED,
+            TransactionStatus.FAILED,
+            TransactionStatus.ROLLBACK_PENDING,
+            TransactionStatus.ROLLING_BACK
+        ],
+        TransactionStatus.COMMITTING: [
+            TransactionStatus.COMMITTED,
+            TransactionStatus.FAILED,
+            TransactionStatus.ROLLBACK_PENDING,
+            TransactionStatus.ROLLING_BACK
+        ],
+        TransactionStatus.COMMITTED: [
+            TransactionStatus.ROLLBACK_PENDING,
+            TransactionStatus.ROLLING_BACK
+        ],
+        TransactionStatus.ROLLBACK_PENDING: [
+            TransactionStatus.ROLLING_BACK,
+            TransactionStatus.ROLLBACK_FAILED,
+            TransactionStatus.ROLLED_BACK
+        ],
+        TransactionStatus.ROLLING_BACK: [
+            TransactionStatus.ROLLED_BACK,
+            TransactionStatus.ROLLBACK_FAILED
         ],
         TransactionStatus.FAILED: [
-            TransactionStatus.CANCELLED
+            TransactionStatus.CANCELLED,
+            TransactionStatus.ROLLBACK_PENDING,
+            TransactionStatus.ROLLING_BACK
         ],
+        TransactionStatus.ROLLED_BACK: [],
+        TransactionStatus.ROLLBACK_FAILED: [],
         TransactionStatus.CANCELLED: [],
         TransactionStatus.EXPIRED: []
     }

@@ -421,12 +421,11 @@ class TestV3ActionAPI(unittest.TestCase):
     # =====================================================================
 
     def test_14_execution_boundary_endpoint_is_strictly_disallowed(self):
-        """CRITICAL: Verifies POST /api/v3/actions/{id}/execute returns 405 Method Not Allowed."""
+        """CRITICAL: Verifies POST /api/v3/actions/{id}/execute is handled by Execution Gateway (404 on missing, not arbitrary 405)."""
         resp = self.client.post("/api/v3/actions/act_test_dummy/execute", headers=self._auth_headers())
-        self.assertEqual(resp.status_code, 405)
+        self.assertEqual(resp.status_code, 404)
         err = resp.json()["error"]
-        self.assertEqual(err["code"], "EXECUTION_GATEWAY_NOT_IMPLEMENTED")
-        self.assertIn("subsequent phases", err["message"])
+        self.assertEqual(err["code"], "ACTION_NOT_FOUND")
 
     # =====================================================================
     # 7. AGENT TOOLS INTEGRATION

@@ -10,7 +10,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 try:
-    from core.config import SAGE_ALLOWED_ORIGINS
+    from core.config import SAGE_ALLOWED_ORIGINS, IS_PRODUCTION
     from governance.middleware import (
         SecurityHeadersMiddleware,
         RequestSizeLimiterMiddleware,
@@ -26,7 +26,7 @@ try:
     from api.audit_routes import router as audit_router
     from api.transaction_routes import router as transaction_router
 except (ImportError, ModuleNotFoundError):
-    from backend.core.config import SAGE_ALLOWED_ORIGINS
+    from backend.core.config import SAGE_ALLOWED_ORIGINS, IS_PRODUCTION
     from backend.governance.middleware import (
         SecurityHeadersMiddleware,
         RequestSizeLimiterMiddleware,
@@ -51,15 +51,28 @@ app.add_exception_handler(Exception, safe_production_exception_handler)
 app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(RequestSizeLimiterMiddleware)
 
-# CORS Configuration
-origins = SAGE_ALLOWED_ORIGINS if isinstance(SAGE_ALLOWED_ORIGINS, list) else [SAGE_ALLOWED_ORIGINS]
+# CORS Configuration Hardening
+# Production must NOT use allow_origins=["*"] together with allow_credentials=True.
+raw_origins = SAGE_ALLOWED_ORIGINS if isinstance(SAGE_ALLOWED_ORIGINS, list) else [SAGE_ALLOWED_ORIGINS]
+filtered_origins = [o.strip() for o in raw_origins if o and o.strip() != "*"]
+
+if IS_PRODUCTION:
+    # Fail safely: require explicit production origins; never allow wildcard with credentials
+    cors_origins = filtered_origins
+    allow_creds = True if cors_origins else False
+else:
+    # Development: permit explicit dev origins (default to localhost:3000 / 127.0.0.1:3000)
+    cors_origins = filtered_origins if filtered_origins else ["http://localhost:3000", "http://127.0.0.1:3000"]
+    allow_creds = True
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins if origins else ["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=cors_origins,
+    allow_credentials=allow_creds,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
     allow_headers=["*"],
 )
+
 
 # --- STARTUP LIFECYCLE HOOK & ANOMALY TRIGGER ---
 @app.on_event("startup")

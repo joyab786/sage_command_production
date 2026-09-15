@@ -279,33 +279,48 @@ export default function ObsidianCommandCenter() {
     setIsLinking(true);
     setLogs((p) => [
       ...p,
-      "[SYSTEM] > Establishing secure tunnel to live database...",
+      "[SYSTEM] > Establishing secure tunnel via V3 Database Connection Gateway...",
     ]);
     try {
-      const response = await fetch("http://localhost:8000/connect-live-db", {
+      const dbType = liveDbUri.startsWith("postgres")
+        ? "POSTGRESQL"
+        : liveDbUri.startsWith("mysql")
+        ? "MYSQL"
+        : "SQLITE";
+
+      const response = await fetch("http://localhost:8000/api/v3/database/connections", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ connection_string: liveDbUri }),
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": "Bearer manager_token",
+        },
+        body: JSON.stringify({
+          database_type: dbType,
+          connection_string: liveDbUri,
+          access_mode: "READ_ONLY",
+          data_mode: "REAL",
+        }),
       });
       const data = await response.json();
-      if (data.status === "success") {
+      if (response.ok && data.success) {
         setActiveDbName(
           "LIVE: " +
             (liveDbUri.split("@")[1]?.split("/")[0] || "Remote Node")
         );
-        setLogs((p) => [...p, `[SUCCESS] > ${data.message}`]);
+        setLogs((p) => [...p, `[SUCCESS] > V3 Gateway tether established safely. Connection ID: ${data.connection?.connection_id}`]);
         setShowLiveDbModal(false);
         setLiveDbUri("");
         if (ws?.readyState === WebSocket.OPEN) {
           ws.send(
             JSON.stringify({
               command: "chat",
-              text: "I just connected a live database. Please map the schema and tell me what tables we have.",
+              text: "I just connected a live database via V3 Gateway. Please map the schema and tell me what tables we have.",
             })
           );
         }
       } else {
-        setLogs((p) => [...p, `[ERROR] > ${data.message}`]);
+        const errMsg = data.error?.message || data.message || "Connection failed";
+        setLogs((p) => [...p, `[ERROR] > ${errMsg}`]);
       }
     } catch {
       setLogs((p) => [

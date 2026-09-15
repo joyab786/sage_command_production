@@ -24,19 +24,40 @@ except ModuleNotFoundError:
 
 # Guarded Action Lifecycle State Transition Matrix (Constraint AM)
 VALID_TRANSITIONS: Dict[ActionStatus, Set[ActionStatus]] = {
-    ActionStatus.PROPOSED: {ActionStatus.VALIDATING, ActionStatus.REJECTED, ActionStatus.CANCELLED},
-    ActionStatus.VALIDATING: {ActionStatus.POLICY_REVIEW, ActionStatus.REJECTED, ActionStatus.CANCELLED},
-    ActionStatus.POLICY_REVIEW: {ActionStatus.AWAITING_APPROVAL, ActionStatus.APPROVED, ActionStatus.REJECTED, ActionStatus.CANCELLED},
-    ActionStatus.AWAITING_APPROVAL: {ActionStatus.APPROVED, ActionStatus.REJECTED, ActionStatus.CANCELLED},
-    # Future execution states (strictly not entered in Prompt 05)
-    ActionStatus.APPROVED: {ActionStatus.CANCELLED},
-    ActionStatus.EXECUTING: {ActionStatus.SUCCEEDED, ActionStatus.FAILED},
-    ActionStatus.SUCCEEDED: set(),
-    ActionStatus.FAILED: {ActionStatus.ROLLED_BACK},
+    ActionStatus.PROPOSED: {
+        ActionStatus.VALIDATING, ActionStatus.READY, ActionStatus.AWAITING_APPROVAL,
+        ActionStatus.APPROVED, ActionStatus.EXECUTING, ActionStatus.REJECTED, ActionStatus.CANCELLED, ActionStatus.STALE
+    },
+    ActionStatus.VALIDATING: {
+        ActionStatus.POLICY_REVIEW, ActionStatus.READY, ActionStatus.REJECTED, ActionStatus.CANCELLED, ActionStatus.STALE
+    },
+    ActionStatus.POLICY_REVIEW: {
+        ActionStatus.AWAITING_APPROVAL, ActionStatus.READY, ActionStatus.APPROVED, ActionStatus.REJECTED, ActionStatus.CANCELLED, ActionStatus.STALE
+    },
+    ActionStatus.AWAITING_APPROVAL: {
+        ActionStatus.APPROVED, ActionStatus.REJECTED, ActionStatus.CANCELLED, ActionStatus.STALE
+    },
+    ActionStatus.APPROVED: {
+        ActionStatus.READY, ActionStatus.EXECUTING, ActionStatus.SUCCEEDED, ActionStatus.CANCELLED, ActionStatus.STALE
+    },
+    ActionStatus.READY: {
+        ActionStatus.EXECUTING, ActionStatus.SUCCEEDED, ActionStatus.CANCELLED, ActionStatus.STALE
+    },
+    ActionStatus.EXECUTING: {
+        ActionStatus.SUCCEEDED, ActionStatus.FAILED
+    },
+    ActionStatus.SUCCEEDED: {
+        ActionStatus.ROLLED_BACK, ActionStatus.ROLLBACK_FAILED
+    },
+    ActionStatus.FAILED: {
+        ActionStatus.ROLLED_BACK, ActionStatus.ROLLBACK_FAILED
+    },
     ActionStatus.ROLLED_BACK: set(),
+    ActionStatus.ROLLBACK_FAILED: set(),
     ActionStatus.REJECTED: set(),
     ActionStatus.CANCELLED: set(),
     ActionStatus.EXPIRED: set(),
+    ActionStatus.STALE: set(),
 }
 
 

@@ -43,6 +43,12 @@ try:
     from services.authorization_service import authorization_service
     from data.schemas.ledger_contract import LedgerActor, ActorType, EventCategory, EventType
     from services.audit_ledger import audit_ledger
+    from data.schemas.execution_contract import (
+        ExecutionRequest,
+        ExecutionResult,
+        ActionExecuteResponse,
+    )
+    from services.execution_gateway import execution_gateway, ExecutionGatewayException
 except ModuleNotFoundError:
     from backend.core.auth import Identity, get_current_identity
     from backend.governance.rate_limiter import rate_limiter
@@ -73,6 +79,12 @@ except ModuleNotFoundError:
     from backend.services.authorization_service import authorization_service
     from backend.data.schemas.ledger_contract import LedgerActor, ActorType, EventCategory, EventType
     from backend.services.audit_ledger import audit_ledger
+    from backend.data.schemas.execution_contract import (
+        ExecutionRequest,
+        ExecutionResult,
+        ActionExecuteResponse,
+    )
+    from backend.services.execution_gateway import execution_gateway, ExecutionGatewayException
 
 router = APIRouter(prefix="/api/v3/actions", tags=["Structured Action API"])
 
@@ -616,25 +628,113 @@ async def cancel_action_endpoint(
 
 
 # =====================================================================
-# 7. CRITICAL SCOPE BOUNDARY (POST /{action_id}/execute is DISALLOWED)
+# 7. APPROVE ACTION (POST /{action_id}/approve)
+# =====================================================================
+
+@router.post(
+    "/{action_id}/approve",
+    response_model=ActionDetailResponse,
+    summary="Approve Structured Action",
+    description="Grants explicit human approval to an action awaiting review, enforcing separation of duties."
+)
+async def approve_action(
+    action_id: str,
+    x_request_id: Optional[str] = Header(None, alias="X-Request-ID"),
+    identity: Identity = Depends(get_current_identity)
+):
+    req_id = extract_request_id(x_request_id)
+    action = action_store.get_by_id(action_id, identity.tenant_id)
+    if not action:
+        return action_error_response(404, ActionErrorCode.ACTION_NOT_FOUND, f"Action '{action_id}' not found.", req_id)
+
+    # ABAC Authorization Check: action.approve with Separation of Duties
+    authz_scope = AuthorizationScope(
+        tenant_id=identity.tenant_id,
+        workspace_id=action.workspace_id,
+        session_id=identity.session_id,
+        plant_id=getattr(action.target, "plant_id", None)
+    )
+    authz_ctx = AuthorizationContext(
+        identity=identity.to_user_identity(),
+        required_permission="action.approve",
+        scope=authz_scope,
+        action_id=action.action_id,
+        action_proposer_id=action.requested_by
+    )
+    decision = authorization_service.evaluate(authz_ctx)
+    if decision.effect == AuthzDecisionEffect.DENY:
+        return action_error_response(403, "AUTHORIZATION_DENIED", decision.reason, req_id)
+
+    if action.status not in (ActionStatus.AWAITING_APPROVAL, ActionStatus.POLICY_REVIEW, ActionStatus.PROPOSED, ActionStatus.READY):
+        return action_error_response(
+            400,
+            ActionErrorCode.ACTION_IMMUTABLE,
+            f"Action '{action_id}' cannot be approved in status '{action.status.value}'.",
+            req_id
+        )
+
+    updated = action_store.update_status(action_id, identity.tenant_id, ActionStatus.APPROVED)
+    log_security_event(
+        "ACTION_APPROVED",
+        {"user_id": identity.user_id, "action_id": action_id, "tenant_id": identity.tenant_id},
+        severity="INFO"
+    )
+
+    target_action = updated or action
+    return ActionDetailResponse(
+        success=True,
+        request_id=req_id,
+        action=target_action,
+        preview=target_action.generate_human_preview()
+    )
+
+
+# =====================================================================
+# 8. EXECUTION GATEWAY BOUNDARY (POST /{action_id}/execute)
 # =====================================================================
 
 @router.post(
     "/{action_id}/execute",
-    include_in_schema=False
+    response_model=ActionExecuteResponse,
+    summary="Execute Structured Action",
+    description="Multi-gate deterministic execution of a structured action through the V3 Execution Gateway."
 )
-async def execute_action_boundary(
+async def execute_action(
     action_id: str,
-    x_request_id: Optional[str] = Header(None, alias="X-Request-ID")
+    request: Optional[ExecutionRequest] = None,
+    x_request_id: Optional[str] = Header(None, alias="X-Request-ID"),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
+    identity: Identity = Depends(get_current_identity)
 ):
-    """
-    STRICT BOUNDARY: Action execution is not permitted in Prompt 05.
-    Action creation is NOT action execution.
-    """
     req_id = extract_request_id(x_request_id)
-    return action_error_response(
-        status_code=405,
-        code="EXECUTION_GATEWAY_NOT_IMPLEMENTED",
-        message="Action execution is strictly reserved for subsequent phases (Prompt 06 Policy Enforcement Engine and Execution Gateway). Action creation is NOT action execution.",
-        request_id=req_id
-    )
+    exec_req = request or ExecutionRequest(action_id=action_id)
+    if idempotency_key and not exec_req.idempotency_key:
+        exec_req.idempotency_key = idempotency_key
+
+    try:
+        result = execution_gateway.execute_action(
+            action_id=action_id,
+            identity=identity,
+            request=exec_req
+        )
+        return ActionExecuteResponse(
+            success=True,
+            request_id=req_id,
+            result=result
+        )
+    except ExecutionGatewayException as ex:
+        return action_error_response(
+            status_code=ex.status_code,
+            code=ex.code,
+            message=ex.message,
+            request_id=req_id,
+            details=[ex.details] if ex.details else []
+        )
+    except Exception as ex:
+        return action_error_response(
+            status_code=500,
+            code="INTERNAL_EXECUTION_ERROR",
+            message=str(ex),
+            request_id=req_id
+        )
+

@@ -456,10 +456,10 @@ class TestV3PolicyEnforcementEngine(unittest.TestCase):
 
     def test_17_llm_cannot_spoof_policy_allow_or_bypass_execution(self):
         """Verify client or LLM cannot spoof policy approval or bypass to execution."""
-        # 1. Verify /actions/{id}/execute is strictly blocked (Prompt 05 boundary preserved)
+        # 1. Verify unapproved action execution is rejected by Execution Gateway
         act = self._create_sample_action()
         resp_exec = self.client.post(f"/api/v3/actions/{act.action_id}/execute", headers=self.auth_headers_mgr)
-        self.assertEqual(resp_exec.status_code, 405)
+        self.assertIn(resp_exec.status_code, (400, 403))
 
         # 2. Verify an action denied by policy cannot be executed or forced to ALLOW
         act_shutdown = self._create_sample_action(resource_id="SHUTDOWN_MACHINE_01")

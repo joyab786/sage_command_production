@@ -23,6 +23,8 @@ SAGE_AUTH_PROVIDER = os.getenv("SAGE_AUTH_PROVIDER", "development" if not IS_PRO
 SAGE_AUTH_ISSUER = os.getenv("SAGE_AUTH_ISSUER", "https://auth.sagecommand.io")
 SAGE_AUTH_AUDIENCE = os.getenv("SAGE_AUTH_AUDIENCE", "sagecommand_api")
 SAGE_SECRET_KEY = os.getenv("SAGE_SECRET_KEY", "sagecommand_default_dev_secret_key_change_in_production")
+raw_jwt_algs = os.getenv("SAGE_JWT_ALGORITHMS", "HS256,RS256")
+SAGE_JWT_ALGORITHMS = [a.strip() for a in raw_jwt_algs.split(",") if a.strip()]
 
 # --- REQUEST & RESOURCE BOUNDARIES ---
 SAGE_MAX_REQUEST_SIZE = int(os.getenv("SAGE_MAX_REQUEST_SIZE", 10 * 1024 * 1024))  # 10 MB default limit
