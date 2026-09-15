@@ -1,7 +1,7 @@
 "use client";
 import React from "react";
 import { motion } from "framer-motion";
-import { Activity, Terminal, Database, Search, FileText, Layers } from "lucide-react";
+import { Activity, Terminal, Database, Search, FileText, Layers, Network } from "lucide-react";
 
 interface OmniHeaderProps {
   systemStatus: string;
@@ -19,6 +19,7 @@ interface OmniHeaderProps {
   onAuditLedgerClick?: () => void;
   onTransactionsClick?: () => void;
   onOntologyClick?: () => void;
+  onKnowledgeGraphClick?: () => void;
   onHardwareVisionClick: () => void;
   onCoreScanClick: () => void;
   onRoleChange: (role: "operator" | "manager") => void;
@@ -40,6 +41,7 @@ export default function OmniHeader({
   onAuditLedgerClick,
   onTransactionsClick,
   onOntologyClick,
+  onKnowledgeGraphClick,
   onHardwareVisionClick,
   onCoreScanClick,
   onRoleChange,
@@ -152,6 +154,16 @@ export default function OmniHeader({
           className="border-blue-500/30 bg-blue-500/10 text-blue-400 hover:bg-blue-500/20"
           icon={<Layers className="w-3 h-3 text-blue-400" />}
           label="Ontology"
+        />
+
+        {/* Knowledge Graph */}
+        <HeaderButton
+          onClick={onKnowledgeGraphClick || (() => {})}
+          active={false}
+          activeClass=""
+          className="border-cyan-500/30 bg-cyan-500/10 text-cyan-400 hover:bg-cyan-500/20"
+          icon={<Network className="w-3 h-3 text-cyan-400" />}
+          label="Graph"
         />
 
         {/* Hardware Vision */}

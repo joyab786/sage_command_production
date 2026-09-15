@@ -14,6 +14,7 @@ import SecurityAlertModal from "./components/SecurityAlertModal";
 import DecisionTimeline from "./components/DecisionTimeline";
 import TransactionPlanModal from "./components/TransactionPlanModal";
 import OntologyModal from "./components/OntologyModal";
+import KnowledgeGraphModal from "./components/KnowledgeGraphModal";
 
 export default function ObsidianCommandCenter() {
   // --- CORE STATE ---
@@ -47,6 +48,9 @@ export default function ObsidianCommandCenter() {
 
   // --- INDUSTRIAL ONTOLOGY STATE ---
   const [showOntologyModal, setShowOntologyModal] = useState(false);
+
+  // --- OPERATIONAL KNOWLEDGE GRAPH STATE ---
+  const [showKnowledgeGraphModal, setShowKnowledgeGraphModal] = useState(false);
 
   // --- SECURITY INTRUSION ALERT STATE ---
   const [securityAlert, setSecurityAlert] = useState<{
@@ -365,6 +369,7 @@ export default function ObsidianCommandCenter() {
         onAuditLedgerClick={() => setShowAuditModal(true)}
         onTransactionsClick={() => setShowTxModal(true)}
         onOntologyClick={() => setShowOntologyModal(true)}
+        onKnowledgeGraphClick={() => setShowKnowledgeGraphModal(true)}
         onHardwareVisionClick={() => imageInputRef.current?.click()}
         onCoreScanClick={triggerScan}
         onRoleChange={setUserRole}
@@ -459,6 +464,12 @@ export default function ObsidianCommandCenter() {
       <OntologyModal
         isOpen={showOntologyModal}
         onClose={() => setShowOntologyModal(false)}
+        token="manager_token"
+      />
+
+      <KnowledgeGraphModal
+        isOpen={showKnowledgeGraphModal}
+        onClose={() => setShowKnowledgeGraphModal(false)}
         token="manager_token"
       />
     </div>
