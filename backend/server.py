@@ -25,6 +25,7 @@ try:
     from api.authorization_routes import router as authorization_router
     from api.audit_routes import router as audit_router
     from api.transaction_routes import router as transaction_router
+    from api.ontology_routes import router as ontology_router
 except (ImportError, ModuleNotFoundError):
     from backend.core.config import SAGE_ALLOWED_ORIGINS, IS_PRODUCTION
     from backend.governance.middleware import (
@@ -41,6 +42,7 @@ except (ImportError, ModuleNotFoundError):
     from backend.api.authorization_routes import router as authorization_router
     from backend.api.audit_routes import router as audit_router
     from backend.api.transaction_routes import router as transaction_router
+    from backend.api.ontology_routes import router as ontology_router
 
 app = FastAPI(title="SageCommand V3 Industrial Operations AI OS")
 
@@ -90,9 +92,9 @@ app.include_router(policy_router)
 app.include_router(authorization_router)
 app.include_router(audit_router)
 app.include_router(transaction_router)
+app.include_router(ontology_router)
 
 # BOOT SEQUENCE
 if __name__ == "__main__":
     print(" Firing up the SageCommand V3 server...")
     uvicorn.run(app, host="127.0.0.1", port=8000)
-

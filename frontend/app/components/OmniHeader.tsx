@@ -18,6 +18,7 @@ interface OmniHeaderProps {
   onTimeTravelClick: () => void;
   onAuditLedgerClick?: () => void;
   onTransactionsClick?: () => void;
+  onOntologyClick?: () => void;
   onHardwareVisionClick: () => void;
   onCoreScanClick: () => void;
   onRoleChange: (role: "operator" | "manager") => void;
@@ -38,6 +39,7 @@ export default function OmniHeader({
   onTimeTravelClick,
   onAuditLedgerClick,
   onTransactionsClick,
+  onOntologyClick,
   onHardwareVisionClick,
   onCoreScanClick,
   onRoleChange,
@@ -140,6 +142,16 @@ export default function OmniHeader({
           className="border-cyan-500/30 bg-cyan-500/10 text-cyan-400 hover:bg-cyan-500/20"
           icon={<Layers className="w-3 h-3 text-cyan-400" />}
           label="Transactions"
+        />
+
+        {/* Ontology */}
+        <HeaderButton
+          onClick={onOntologyClick || (() => {})}
+          active={false}
+          activeClass=""
+          className="border-blue-500/30 bg-blue-500/10 text-blue-400 hover:bg-blue-500/20"
+          icon={<Layers className="w-3 h-3 text-blue-400" />}
+          label="Ontology"
         />
 
         {/* Hardware Vision */}

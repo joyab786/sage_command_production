@@ -101,6 +101,10 @@ CANONICAL_PERMISSIONS: List[Permission] = [
     Permission(permission_id="report.generate", resource="report", action="generate", description="Generate executive operational and compliance reports"),
     Permission(permission_id="enterprise.view", resource="enterprise", action="view", description="Enterprise-wide cross-plant operational visibility"),
     
+    # Industrial Ontology Architecture (Prompt 11)
+    Permission(permission_id="ontology.read", resource="ontology", action="read", description="View canonical entities, relationships, external IDs, and taxonomy"),
+    Permission(permission_id="ontology.manage", resource="ontology", action="manage", description="Create, update, and manage canonical entities, relationships, and external mappings", is_sensitive=True),
+
     # System Administration (Strictly Non-Operational)
     Permission(permission_id="user.manage", resource="user", action="manage", description="Create, update, or suspend user identities", is_sensitive=True),
     Permission(permission_id="system.config", resource="system", action="config", description="Configure platform infrastructure and endpoints", is_sensitive=True),
@@ -137,7 +141,7 @@ SYSTEM_ROLES: List[Role] = [
         role_id="VIEWER",
         name="Viewer",
         scope_type=RoleScopeType.SYSTEM,
-        permissions=["telemetry.read", "database.read", "action.read", "policy.read", "transaction.read"],
+        permissions=["telemetry.read", "database.read", "action.read", "policy.read", "transaction.read", "ontology.read"],
         inherits_from=[],
         description="Read-only observer access to telemetry, action states, and policy rules.",
         is_system_role=True
@@ -194,7 +198,7 @@ SYSTEM_ROLES: List[Role] = [
         role_id="PLANT_MANAGER",
         name="Plant Manager",
         scope_type=RoleScopeType.PLANT,
-        permissions=["action.approve", "production.schedule", "transaction.rollback"],
+        permissions=["action.approve", "production.schedule", "transaction.rollback", "ontology.manage"],
         inherits_from=["OPERATOR", "SAFETY_MANAGER", "SUPPLY_CHAIN_MANAGER"],
         description="Senior plant authority responsible for approving high-risk actions, production schedules, and transaction rollbacks.",
         is_system_role=True
@@ -214,7 +218,7 @@ SYSTEM_ROLES: List[Role] = [
         scope_type=RoleScopeType.SYSTEM,
         permissions=[
             "user.manage", "system.config", "tenant.admin", "role.assign",
-            "database.connection.create", "database.connection.admin"
+            "database.connection.create", "database.connection.admin", "ontology.manage"
         ],
         inherits_from=["VIEWER"],
         description="Platform administrator. Strictly non-operational; cannot propose or approve factory actions.",

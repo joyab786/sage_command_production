@@ -13,6 +13,7 @@ import TimelineModal from "./components/TimelineModal";
 import SecurityAlertModal from "./components/SecurityAlertModal";
 import DecisionTimeline from "./components/DecisionTimeline";
 import TransactionPlanModal from "./components/TransactionPlanModal";
+import OntologyModal from "./components/OntologyModal";
 
 export default function ObsidianCommandCenter() {
   // --- CORE STATE ---
@@ -43,6 +44,9 @@ export default function ObsidianCommandCenter() {
 
   // --- TRANSACTION PLAN STATE ---
   const [showTxModal, setShowTxModal] = useState(false);
+
+  // --- INDUSTRIAL ONTOLOGY STATE ---
+  const [showOntologyModal, setShowOntologyModal] = useState(false);
 
   // --- SECURITY INTRUSION ALERT STATE ---
   const [securityAlert, setSecurityAlert] = useState<{
@@ -360,6 +364,7 @@ export default function ObsidianCommandCenter() {
         onTimeTravelClick={fetchCheckpointHistory}
         onAuditLedgerClick={() => setShowAuditModal(true)}
         onTransactionsClick={() => setShowTxModal(true)}
+        onOntologyClick={() => setShowOntologyModal(true)}
         onHardwareVisionClick={() => imageInputRef.current?.click()}
         onCoreScanClick={triggerScan}
         onRoleChange={setUserRole}
@@ -448,6 +453,12 @@ export default function ObsidianCommandCenter() {
       <TransactionPlanModal
         isOpen={showTxModal}
         onClose={() => setShowTxModal(false)}
+        token="manager_token"
+      />
+
+      <OntologyModal
+        isOpen={showOntologyModal}
+        onClose={() => setShowOntologyModal(false)}
         token="manager_token"
       />
     </div>
