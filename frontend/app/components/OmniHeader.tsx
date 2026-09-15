@@ -22,6 +22,7 @@ interface OmniHeaderProps {
   onKnowledgeGraphClick?: () => void;
   onDigitalTwinClick?: () => void;
   onDataQualityClick?: () => void;
+  onAnomalyClick?: () => void;
   onHardwareVisionClick: () => void;
   onCoreScanClick: () => void;
   onRoleChange: (role: "operator" | "manager") => void;
@@ -46,6 +47,7 @@ export default function OmniHeader({
   onKnowledgeGraphClick,
   onDigitalTwinClick,
   onDataQualityClick,
+  onAnomalyClick,
   onHardwareVisionClick,
   onCoreScanClick,
   onRoleChange,
