@@ -16,6 +16,7 @@ import TransactionPlanModal from "./components/TransactionPlanModal";
 import OntologyModal from "./components/OntologyModal";
 import KnowledgeGraphModal from "./components/KnowledgeGraphModal";
 import DigitalTwinModal from "./components/DigitalTwinModal";
+import DataQualityModal from "./components/DataQualityModal";
 
 export default function ObsidianCommandCenter() {
   // --- CORE STATE ---
@@ -55,6 +56,9 @@ export default function ObsidianCommandCenter() {
 
   // --- DIGITAL TWIN STATE ---
   const [showTwinModal, setShowTwinModal] = useState(false);
+
+  // --- DATA QUALITY STATE ---
+  const [showDataQualityModal, setShowDataQualityModal] = useState(false);
 
   // --- SECURITY INTRUSION ALERT STATE ---
   const [securityAlert, setSecurityAlert] = useState<{
@@ -375,6 +379,7 @@ export default function ObsidianCommandCenter() {
         onOntologyClick={() => setShowOntologyModal(true)}
         onKnowledgeGraphClick={() => setShowKnowledgeGraphModal(true)}
         onDigitalTwinClick={() => setShowTwinModal(true)}
+        onDataQualityClick={() => setShowDataQualityModal(true)}
         onHardwareVisionClick={() => imageInputRef.current?.click()}
         onCoreScanClick={triggerScan}
         onRoleChange={setUserRole}
@@ -481,6 +486,11 @@ export default function ObsidianCommandCenter() {
       <DigitalTwinModal
         isOpen={showTwinModal}
         onClose={() => setShowTwinModal(false)}
+      />
+
+      <DataQualityModal
+        isOpen={showDataQualityModal}
+        onClose={() => setShowDataQualityModal(false)}
       />
     </div>
   );

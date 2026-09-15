@@ -1,7 +1,7 @@
 "use client";
 import React from "react";
 import { motion } from "framer-motion";
-import { Activity, Terminal, Database, Search, FileText, Layers, Network, Box } from "lucide-react";
+import { Activity, Terminal, Database, Search, FileText, Layers, Network, Box, ShieldAlert } from "lucide-react";
 
 interface OmniHeaderProps {
   systemStatus: string;
@@ -21,6 +21,7 @@ interface OmniHeaderProps {
   onOntologyClick?: () => void;
   onKnowledgeGraphClick?: () => void;
   onDigitalTwinClick?: () => void;
+  onDataQualityClick?: () => void;
   onHardwareVisionClick: () => void;
   onCoreScanClick: () => void;
   onRoleChange: (role: "operator" | "manager") => void;
@@ -44,6 +45,7 @@ export default function OmniHeader({
   onOntologyClick,
   onKnowledgeGraphClick,
   onDigitalTwinClick,
+  onDataQualityClick,
   onHardwareVisionClick,
   onCoreScanClick,
   onRoleChange,
@@ -176,6 +178,16 @@ export default function OmniHeader({
           className="border-indigo-500/30 bg-indigo-500/10 text-indigo-400 hover:bg-indigo-500/20"
           icon={<Box className="w-3 h-3 text-indigo-400" />}
           label="Twin"
+        />
+
+        {/* Data Quality */}
+        <HeaderButton
+          onClick={onDataQualityClick || (() => {})}
+          active={false}
+          activeClass=""
+          className="border-emerald-500/30 bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20"
+          icon={<ShieldAlert className="w-3 h-3 text-emerald-400" />}
+          label="Quality"
         />
 
         {/* Hardware Vision */}

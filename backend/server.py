@@ -28,6 +28,7 @@ try:
     from api.ontology_routes import router as ontology_router
     from api.knowledge_graph_routes import router as knowledge_graph_router
     from api.digital_twin_routes import router as digital_twin_router
+    from api.data_quality_routes import router as data_quality_router
 except (ImportError, ModuleNotFoundError):
     from backend.core.config import SAGE_ALLOWED_ORIGINS, IS_PRODUCTION
     from backend.governance.middleware import (
@@ -47,6 +48,7 @@ except (ImportError, ModuleNotFoundError):
     from backend.api.ontology_routes import router as ontology_router
     from backend.api.knowledge_graph_routes import router as knowledge_graph_router
     from backend.api.digital_twin_routes import router as digital_twin_router
+    from backend.api.data_quality_routes import router as data_quality_router
 
 app = FastAPI(title="SageCommand V3 Industrial Operations AI OS")
 
@@ -99,6 +101,7 @@ app.include_router(transaction_router)
 app.include_router(ontology_router)
 app.include_router(knowledge_graph_router)
 app.include_router(digital_twin_router)
+app.include_router(data_quality_router)
 
 # BOOT SEQUENCE
 if __name__ == "__main__":
