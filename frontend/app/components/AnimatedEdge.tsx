@@ -24,7 +24,6 @@ export default function AnimatedEdge({
 
   const isActive = data?.isActive || false;
   const edgeColor = isActive ? "#22d3ee" : "#1a1a2e";
-  const glowOpacity = isActive ? 0.6 : 0;
 
   return (
     <>

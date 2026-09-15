@@ -47,9 +47,13 @@ export default function CopilotPanel({
         <motion.span
           animate={{ opacity: [0.7, 1, 0.7] }}
           transition={{ duration: 2, repeat: Infinity }}
-          className="text-[9px] font-mono bg-purple-500/10 text-purple-400 px-2 py-0.5 rounded border border-purple-500/20"
+          className={`text-[9px] font-mono px-2 py-0.5 rounded border ${
+            isConnected
+              ? "bg-purple-500/10 text-purple-400 border-purple-500/20"
+              : "bg-red-500/10 text-red-400 border-red-500/20"
+          }`}
         >
-          LIVE TETHER
+          {isConnected ? "LIVE TETHER" : "DISCONNECTED"}
         </motion.span>
       </div>
 

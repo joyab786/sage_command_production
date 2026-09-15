@@ -6,9 +6,42 @@ import BlastRadiusDisplay from "./BlastRadiusDisplay";
 
 interface ExecutionFeedProps {
   logs: string[];
-  guardrailPayload: any;
-  blastRadiusData: any;
-  visionFinding: any;
+  guardrailPayload: {
+    action?: string;
+    justification?: string;
+    proposed_action?: {
+      action_id?: string;
+      action_type?: string;
+      version?: string;
+      target?: { resource_type?: string; resource_id?: string; plant_id?: string };
+      parameters?: Record<string, unknown>;
+      system_risk_level?: string;
+      requires_approval?: boolean;
+      estimated_cost?: { value?: number; currency?: string };
+      estimated_duration_minutes?: number;
+    };
+    policy_decision?: {
+      decision_id?: string;
+      decision?: string;
+      policy_id?: string;
+      policy_version?: string;
+      reason_codes?: string[];
+      explanation?: string;
+      requires_approval?: boolean;
+      approval_requirement?: {
+        required_role?: string;
+        approval_type?: string;
+        reason?: string;
+      };
+    };
+  } | null;
+  blastRadiusData: Record<string, unknown> | null;
+  visionFinding: {
+    part_identified?: string;
+    damage_assessment?: string;
+    recommended_action?: string;
+    severity?: string;
+  } | null;
   userRole: "operator" | "manager";
   onApprove: () => void;
   onAbort: () => void;
@@ -154,18 +187,121 @@ export default function ExecutionFeed({
                     </span>
                   )}
                 </div>
-                <div className="bg-black/50 p-3 rounded border border-red-500/10 my-3">
-                  <p className="text-gray-500 text-[10px] uppercase mb-1">
-                    Proposed AI Action:
-                  </p>
-                  <p className="text-white text-sm mb-2">
-                    {">"} {guardrailPayload.action}
-                  </p>
-                  <p className="text-gray-500 text-[10px] uppercase mb-1">
-                    AI Logic Justification:
-                  </p>
-                  <p className="text-gray-400">{guardrailPayload.justification}</p>
-                </div>
+                {guardrailPayload.proposed_action ? (
+                  <div className="bg-black/60 p-3 rounded-lg border border-cyan-500/20 my-3 flex flex-col gap-2">
+                    <div className="flex items-center justify-between border-b border-white/5 pb-2">
+                      <div className="flex items-center gap-2">
+                        <span className="px-2 py-0.5 bg-cyan-500/10 text-cyan-400 border border-cyan-500/30 text-[9px] font-bold uppercase rounded">
+                          {guardrailPayload.proposed_action.action_type || "STRUCTURED_ACTION"}
+                        </span>
+                        <span className="text-gray-500 text-[9px]">
+                          ID: {guardrailPayload.proposed_action.action_id}
+                        </span>
+                      </div>
+                      <span
+                        className={`px-2 py-0.5 text-[9px] font-bold uppercase rounded border ${
+                          guardrailPayload.proposed_action.system_risk_level === "CRITICAL" ||
+                          guardrailPayload.proposed_action.system_risk_level === "HIGH"
+                            ? "bg-red-500/20 text-red-400 border-red-500/40"
+                            : guardrailPayload.proposed_action.system_risk_level === "MEDIUM"
+                            ? "bg-amber-500/20 text-amber-400 border-amber-500/40"
+                            : "bg-emerald-500/20 text-emerald-400 border-emerald-500/40"
+                        }`}
+                      >
+                        RISK: {guardrailPayload.proposed_action.system_risk_level || "EVALUATING"}
+                      </span>
+                    </div>
+
+                    <div>
+                      <p className="text-gray-500 text-[10px] uppercase">Target Resource:</p>
+                      <p className="text-white text-xs font-semibold">
+                        {guardrailPayload.proposed_action.target?.resource_type} [
+                        {guardrailPayload.proposed_action.target?.resource_id}] @{" "}
+                        {guardrailPayload.proposed_action.target?.plant_id || "plant_001"}
+                      </p>
+                    </div>
+
+                    <div>
+                      <p className="text-gray-500 text-[10px] uppercase">Reasoning / Summary:</p>
+                      <p className="text-gray-300 text-xs">{guardrailPayload.action}</p>
+                    </div>
+
+                    {guardrailPayload.proposed_action.parameters && (
+                      <div className="bg-zinc-900/60 p-2 rounded border border-white/5 text-[10px]">
+                        <span className="text-gray-500 uppercase block mb-1">Validated Parameters:</span>
+                        <div className="grid grid-cols-2 gap-x-4 gap-y-1">
+                          {Object.entries(guardrailPayload.proposed_action.parameters).map(([k, v]) => (
+                            <div key={k} className="flex justify-between">
+                              <span className="text-gray-400">{k}:</span>
+                              <span className="text-cyan-300 font-medium">{String(v)}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {guardrailPayload.proposed_action.estimated_cost?.value !== undefined && (
+                      <div className="flex justify-between text-[10px] pt-1 border-t border-white/5">
+                        <span className="text-gray-400 uppercase">Estimated Financial Impact:</span>
+                        <span className="text-emerald-400 font-bold">
+                          ${guardrailPayload.proposed_action.estimated_cost.value.toLocaleString()}{" "}
+                          {guardrailPayload.proposed_action.estimated_cost.currency || "USD"}
+                        </span>
+                      </div>
+                    )}
+
+                    {/* Policy Engine Evaluation Banner */}
+                    {guardrailPayload.policy_decision && (
+                      <div className={`p-2.5 rounded-lg border text-[10px] flex flex-col gap-1 mt-1 ${
+                        guardrailPayload.policy_decision.decision === "ALLOW"
+                          ? "bg-emerald-950/30 border-emerald-500/30 text-emerald-300"
+                          : guardrailPayload.policy_decision.decision === "DENY"
+                          ? "bg-red-950/40 border-red-500/40 text-red-300"
+                          : guardrailPayload.policy_decision.decision === "REQUIRE_APPROVAL"
+                          ? "bg-amber-950/30 border-amber-500/30 text-amber-300"
+                          : "bg-purple-950/30 border-purple-500/30 text-purple-300"
+                      }`}>
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-1.5 font-bold uppercase tracking-wider">
+                            <span>🛡️ Policy Decision:</span>
+                            <span className={`px-1.5 py-0.5 rounded text-[9px] font-extrabold border ${
+                              guardrailPayload.policy_decision.decision === "ALLOW"
+                                ? "bg-emerald-500/20 text-emerald-400 border-emerald-500/50"
+                                : guardrailPayload.policy_decision.decision === "DENY"
+                                ? "bg-red-500/20 text-red-400 border-red-500/50"
+                                : guardrailPayload.policy_decision.decision === "REQUIRE_APPROVAL"
+                                ? "bg-amber-500/20 text-amber-400 border-amber-500/50"
+                                : "bg-purple-500/20 text-purple-400 border-purple-500/50"
+                            }`}>
+                              {guardrailPayload.policy_decision.decision}
+                            </span>
+                          </div>
+                          {guardrailPayload.policy_decision.policy_id && (
+                            <span className="text-[9px] text-gray-400 font-mono">
+                              {guardrailPayload.policy_decision.policy_id} (v{guardrailPayload.policy_decision.policy_version || "1.0"})
+                            </span>
+                          )}
+                        </div>
+                        <p className="text-gray-200 text-xs">
+                          {guardrailPayload.policy_decision.explanation}
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div className="bg-black/50 p-3 rounded border border-red-500/10 my-3">
+                    <p className="text-gray-500 text-[10px] uppercase mb-1">
+                      Proposed AI Action:
+                    </p>
+                    <p className="text-white text-sm mb-2">
+                      {">"} {guardrailPayload.action}
+                    </p>
+                    <p className="text-gray-500 text-[10px] uppercase mb-1">
+                      AI Logic Justification:
+                    </p>
+                    <p className="text-gray-400">{guardrailPayload.justification}</p>
+                  </div>
+                )}
                 <div className="flex gap-3 mt-4 items-center">
                   <motion.button
                     type="button"

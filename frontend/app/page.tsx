@@ -11,6 +11,8 @@ import ExecutionFeed from "./components/ExecutionFeed";
 import LiveDbModal from "./components/LiveDbModal";
 import TimelineModal from "./components/TimelineModal";
 import SecurityAlertModal from "./components/SecurityAlertModal";
+import DecisionTimeline from "./components/DecisionTimeline";
+import TransactionPlanModal from "./components/TransactionPlanModal";
 
 export default function ObsidianCommandCenter() {
   // --- CORE STATE ---
@@ -18,7 +20,7 @@ export default function ObsidianCommandCenter() {
   const [systemStatus, setSystemStatus] = useState("DORMANT");
   const [chatInput, setChatInput] = useState("");
   const [chatLog, setChatLog] = useState<{ role: string; content: string }[]>([]);
-  const [guardrailPayload, setGuardrailPayload] = useState<any>(null);
+  const [guardrailPayload, setGuardrailPayload] = useState<{ action?: string; justification?: string } | null>(null);
   const [logs, setLogs] = useState<string[]>(["[SYSTEM] > Neural Tether Initializing..."]);
   const [activeNode, setActiveNode] = useState<string | null>(null);
 
@@ -34,7 +36,13 @@ export default function ObsidianCommandCenter() {
 
   // --- TIME TRAVEL STATE ---
   const [showTimelineModal, setShowTimelineModal] = useState(false);
-  const [checkpointHistory, setCheckpointHistory] = useState<any[]>([]);
+  const [checkpointHistory, setCheckpointHistory] = useState<Array<{ checkpoint_id: string; created_at?: string; step?: number }>>([]);
+
+  // --- AUDIT LEDGER STATE ---
+  const [showAuditModal, setShowAuditModal] = useState(false);
+
+  // --- TRANSACTION PLAN STATE ---
+  const [showTxModal, setShowTxModal] = useState(false);
 
   // --- SECURITY INTRUSION ALERT STATE ---
   const [securityAlert, setSecurityAlert] = useState<{
@@ -43,11 +51,11 @@ export default function ObsidianCommandCenter() {
   } | null>(null);
 
   // --- BLAST RADIUS & RBAC STATE ---
-  const [blastRadiusData, setBlastRadiusData] = useState<any>(null);
+  const [blastRadiusData, setBlastRadiusData] = useState<Record<string, unknown> | null>(null);
   const [userRole, setUserRole] = useState<"operator" | "manager">("operator");
 
   // --- MULTI-MODAL VISION STATE ---
-  const [visionFinding, setVisionFinding] = useState<any>(null);
+  const [visionFinding, setVisionFinding] = useState<{ part_identified?: string; damage_assessment?: string; recommended_action?: string; severity?: string } | null>(null);
   const [isAnalyzingImage, setIsAnalyzingImage] = useState(false);
   const imageInputRef = useRef<HTMLInputElement>(null);
 
@@ -335,6 +343,8 @@ export default function ObsidianCommandCenter() {
         onMountFileClick={() => fileInputRef.current?.click()}
         onLiveUplinkClick={() => setShowLiveDbModal(true)}
         onTimeTravelClick={fetchCheckpointHistory}
+        onAuditLedgerClick={() => setShowAuditModal(true)}
+        onTransactionsClick={() => setShowTxModal(true)}
         onHardwareVisionClick={() => imageInputRef.current?.click()}
         onCoreScanClick={triggerScan}
         onRoleChange={setUserRole}
@@ -412,6 +422,18 @@ export default function ObsidianCommandCenter() {
           setSecurityAlert(null);
           setSystemStatus("ONLINE");
         }}
+      />
+
+      <DecisionTimeline
+        isOpen={showAuditModal}
+        onClose={() => setShowAuditModal(false)}
+        token="manager_token"
+      />
+
+      <TransactionPlanModal
+        isOpen={showTxModal}
+        onClose={() => setShowTxModal(false)}
+        token="manager_token"
       />
     </div>
   );

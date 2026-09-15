@@ -1,7 +1,7 @@
 "use client";
 import React from "react";
 import { motion } from "framer-motion";
-import { Activity, Terminal, Database, Search } from "lucide-react";
+import { Activity, Terminal, Database, Search, FileText, Layers } from "lucide-react";
 
 interface OmniHeaderProps {
   systemStatus: string;
@@ -16,6 +16,8 @@ interface OmniHeaderProps {
   onMountFileClick: () => void;
   onLiveUplinkClick: () => void;
   onTimeTravelClick: () => void;
+  onAuditLedgerClick?: () => void;
+  onTransactionsClick?: () => void;
   onHardwareVisionClick: () => void;
   onCoreScanClick: () => void;
   onRoleChange: (role: "operator" | "manager") => void;
@@ -34,6 +36,8 @@ export default function OmniHeader({
   onMountFileClick,
   onLiveUplinkClick,
   onTimeTravelClick,
+  onAuditLedgerClick,
+  onTransactionsClick,
   onHardwareVisionClick,
   onCoreScanClick,
   onRoleChange,
@@ -116,6 +120,26 @@ export default function OmniHeader({
           className="border-cyan-500/30 bg-cyan-500/10 text-cyan-400 hover:bg-cyan-500/20"
           icon={<Terminal className="w-3 h-3 text-cyan-400" />}
           label="Time Travel"
+        />
+
+        {/* Audit Ledger */}
+        <HeaderButton
+          onClick={onAuditLedgerClick || (() => {})}
+          active={false}
+          activeClass=""
+          className="border-emerald-500/30 bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20"
+          icon={<FileText className="w-3 h-3 text-emerald-400" />}
+          label="Audit Ledger"
+        />
+
+        {/* Transactions */}
+        <HeaderButton
+          onClick={onTransactionsClick || (() => {})}
+          active={false}
+          activeClass=""
+          className="border-cyan-500/30 bg-cyan-500/10 text-cyan-400 hover:bg-cyan-500/20"
+          icon={<Layers className="w-3 h-3 text-cyan-400" />}
+          label="Transactions"
         />
 
         {/* Hardware Vision */}

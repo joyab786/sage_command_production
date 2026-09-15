@@ -12,7 +12,7 @@ interface MetricData {
 
 interface MetricsRowProps {
   systemStatus: string;
-  guardrailPayload: any;
+  guardrailPayload: { action?: string; justification?: string } | null;
 }
 
 const container = {
