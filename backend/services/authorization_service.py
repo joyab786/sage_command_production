@@ -109,6 +109,11 @@ CANONICAL_PERMISSIONS: List[Permission] = [
     Permission(permission_id="knowledge_graph.read", resource="knowledge_graph", action="read", description="View operational knowledge graph facts, context, neighbors, history, and traversals"),
     Permission(permission_id="knowledge_graph.manage", resource="knowledge_graph", action="manage", description="Create, update, ingest, and manage operational knowledge graph facts and edges", is_sensitive=True),
 
+    # Digital Twin Architecture (Prompt 13)
+    Permission(permission_id="digital_twin.read", resource="digital_twin", action="read", description="View Digital Twin entity state, history, snapshots, and scenarios"),
+    Permission(permission_id="digital_twin.manage", resource="digital_twin", action="manage", description="Ingest state, create snapshots, and manage Digital Twin entities", is_sensitive=True),
+    Permission(permission_id="digital_twin.scenario", resource="digital_twin", action="scenario", description="Create and manage simulation scenarios"),
+
     # System Administration (Strictly Non-Operational)
     Permission(permission_id="user.manage", resource="user", action="manage", description="Create, update, or suspend user identities", is_sensitive=True),
     Permission(permission_id="system.config", resource="system", action="config", description="Configure platform infrastructure and endpoints", is_sensitive=True),
@@ -145,7 +150,7 @@ SYSTEM_ROLES: List[Role] = [
         role_id="VIEWER",
         name="Viewer",
         scope_type=RoleScopeType.SYSTEM,
-        permissions=["telemetry.read", "database.read", "action.read", "policy.read", "transaction.read", "ontology.read", "knowledge_graph.read"],
+        permissions=["telemetry.read", "database.read", "action.read", "policy.read", "transaction.read", "ontology.read", "knowledge_graph.read", "digital_twin.read"],
         inherits_from=[],
         description="Read-only observer access to telemetry, action states, and policy rules.",
         is_system_role=True
@@ -154,7 +159,7 @@ SYSTEM_ROLES: List[Role] = [
         role_id="ANALYST",
         name="Analyst",
         scope_type=RoleScopeType.SYSTEM,
-        permissions=["sql.analyze", "action.simulate", "transaction.validate"],
+        permissions=["sql.analyze", "action.simulate", "transaction.validate", "digital_twin.scenario"],
         inherits_from=["VIEWER"],
         description="Analytical access including query analysis, simulation preview, and data exploration.",
         is_system_role=True
@@ -202,7 +207,7 @@ SYSTEM_ROLES: List[Role] = [
         role_id="PLANT_MANAGER",
         name="Plant Manager",
         scope_type=RoleScopeType.PLANT,
-        permissions=["action.approve", "production.schedule", "transaction.rollback", "ontology.manage", "knowledge_graph.manage"],
+        permissions=["action.approve", "production.schedule", "transaction.rollback", "ontology.manage", "knowledge_graph.manage", "digital_twin.manage"],
         inherits_from=["OPERATOR", "SAFETY_MANAGER", "SUPPLY_CHAIN_MANAGER"],
         description="Senior plant authority responsible for approving high-risk actions, production schedules, and transaction rollbacks.",
         is_system_role=True
@@ -222,7 +227,7 @@ SYSTEM_ROLES: List[Role] = [
         scope_type=RoleScopeType.SYSTEM,
         permissions=[
             "user.manage", "system.config", "tenant.admin", "role.assign",
-            "database.connection.create", "database.connection.admin", "ontology.manage", "knowledge_graph.manage"
+            "database.connection.create", "database.connection.admin", "ontology.manage", "knowledge_graph.manage", "digital_twin.manage"
         ],
         inherits_from=["VIEWER"],
         description="Platform administrator. Strictly non-operational; cannot propose or approve factory actions.",
