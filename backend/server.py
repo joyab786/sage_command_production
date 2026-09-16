@@ -31,6 +31,8 @@ try:
     from api.data_quality_routes import router as data_quality_router
     from api.anomaly_routes import router as anomaly_router
     from api.event_routes import router as event_router
+    from api.event_bus_routes import router as event_bus_router
+    from services.event_bus import get_event_bus
 except (ImportError, ModuleNotFoundError):
     from backend.core.config import SAGE_ALLOWED_ORIGINS, IS_PRODUCTION
     from backend.governance.middleware import (
@@ -53,6 +55,8 @@ except (ImportError, ModuleNotFoundError):
     from backend.api.data_quality_routes import router as data_quality_router
     from backend.api.anomaly_routes import router as anomaly_router
     from backend.api.event_routes import router as event_router
+    from backend.api.event_bus_routes import router as event_bus_router
+    from backend.services.event_bus import get_event_bus
 
 app = FastAPI(title="SageCommand V3 Industrial Operations AI OS")
 
@@ -86,12 +90,22 @@ app.add_middleware(
 )
 
 
-# --- STARTUP LIFECYCLE HOOK & ANOMALY TRIGGER ---
+# --- STARTUP/SHUTDOWN LIFECYCLE HOOKS ---
 @app.on_event("startup")
 async def startup_event():
-    """Launches the background event-driven factory anomaly generator loop."""
+    """Launches the background event-driven factory anomaly generator loop and internal event bus."""
+    print(" [Server Startup] Launching Internal Event Bus workers...")
+    event_bus = get_event_bus()
+    event_bus.start()
     print(" [Server Startup] Launching Factory Simulator background anomaly generator...")
     asyncio.create_task(run_factory_simulation_loop(interval_seconds=40))
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Gracefully shuts down background services."""
+    print(" [Server Shutdown] Stopping Internal Event Bus workers...")
+    event_bus = get_event_bus()
+    await event_bus.stop()
 
 # Include API Routers
 app.include_router(api_router)
@@ -108,6 +122,7 @@ app.include_router(digital_twin_router)
 app.include_router(data_quality_router)
 app.include_router(anomaly_router)
 app.include_router(event_router)
+app.include_router(event_bus_router)
 
 # BOOT SEQUENCE
 if __name__ == "__main__":

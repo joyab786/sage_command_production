@@ -1,89 +1,94 @@
 # backend/api/event_routes.py
-from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from typing import List
+from fastapi import APIRouter, Depends, HTTPException, status
+import sqlite3
 
 try:
     from data.schemas.event_contract import CanonicalEvent
-    from services.event_repository import event_repository
+    from services.event_repository import EventRepository
+    from services.event_bus import get_event_bus, EventBus
     from core.auth import Identity, require_permission
 except (ImportError, ModuleNotFoundError):
     from backend.data.schemas.event_contract import CanonicalEvent
-    from backend.services.event_repository import event_repository
+    from backend.services.event_repository import EventRepository
+    from backend.services.event_bus import get_event_bus, EventBus
     from backend.core.auth import Identity, require_permission
 
-router = APIRouter(prefix="/api/v3/events", tags=["Event Model"])
+router = APIRouter(prefix="/api/v3/events", tags=["events"])
 
-@router.post("/", response_model=CanonicalEvent)
+# Dependency
+def get_event_repo() -> EventRepository:
+    return EventRepository()
+
+@router.post("", response_model=CanonicalEvent, status_code=status.HTTP_201_CREATED)
 async def record_event(
     event: CanonicalEvent,
-    identity: Identity = Depends(require_permission("events.record"))
+    identity: Identity = Depends(require_permission("events.record")),
+    repo: EventRepository = Depends(get_event_repo),
+    bus: EventBus = Depends(get_event_bus)
 ):
     """
-    Record an immutable event.
-    Enforces tenant isolation by overriding the tenant_id with the authoritative context.
+    Records an immutable canonical event.
+    Automatically enforces tenant isolation based on the authenticated identity.
+    After persisting the canonical record, the event is safely dispatched to the internal Event Bus.
     """
-    # Authoritative tenant isolation override
-    event.tenant_id = identity.tenant_id
-    
-    # Compute deterministic fingerprint
-    event.apply_fingerprint()
-    
+    if event.tenant_id != identity.tenant_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Cannot record event for a different tenant."
+        )
+
+    # Compute deterministic fingerprint if missing
+    if not event.event_fingerprint:
+        event.apply_fingerprint()
+
     try:
-        recorded = event_repository.record_event(event)
-        return recorded
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        saved_event = repo.record_event(event)
+        # Dispatch asynchronously to the event bus
+        await bus.publish(saved_event)
+        return saved_event
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Duplicate event fingerprint.")
 
-@router.get("/", response_model=List[CanonicalEvent], dependencies=[Depends(require_permission("events.read"))])
+@router.get("", response_model=List[CanonicalEvent], dependencies=[Depends(require_permission("events.read"))])
 async def list_events(
-    limit: int = Query(50, ge=1, le=500),
-    offset: int = Query(0, ge=0),
-    category: Optional[str] = None,
-    event_type: Optional[str] = None,
-    severity: Optional[str] = None,
-    workspace_id: Optional[str] = None,
-    plant_id: Optional[str] = None,
-    identity: Identity = Depends(require_permission("events.read"))
+    limit: int = 50,
+    offset: int = 0,
+    category: str = None,
+    event_type: str = None,
+    severity: str = None,
+    workspace_id: str = None,
+    plant_id: str = None,
+    identity: Identity = Depends(require_permission("events.read")),
+    repo: EventRepository = Depends(get_event_repo)
 ):
-    """List events with bounded queries and strict tenant isolation."""
     filters = {}
-    if category:
-        filters["category"] = category
-    if event_type:
-        filters["event_type"] = event_type
-    if severity:
-        filters["severity"] = severity
-    if workspace_id:
-        filters["workspace_id"] = workspace_id
-    if plant_id:
-        filters["plant_id"] = plant_id
+    if category: filters["category"] = category
+    if event_type: filters["event_type"] = event_type
+    if severity: filters["severity"] = severity
+    if workspace_id: filters["workspace_id"] = workspace_id
+    if plant_id: filters["plant_id"] = plant_id
 
-    events = event_repository.list_events(
-        tenant_id=identity.tenant_id,
-        limit=limit,
-        offset=offset,
-        filters=filters
-    )
-    return events
+    return repo.list_events(tenant_id=identity.tenant_id, limit=limit, offset=offset, filters=filters)
 
-@router.get("/{event_id}", response_model=CanonicalEvent)
-async def get_event(
-    event_id: str,
-    identity: Identity = Depends(require_permission("events.read"))
-):
-    """Retrieve a single event by ID, bounded by tenant."""
-    event = event_repository.get_event(identity.tenant_id, event_id)
-    if not event:
-        raise HTTPException(status_code=404, detail="Event not found")
-    return event
-
-@router.get("/fingerprint/{fingerprint}", response_model=CanonicalEvent)
+@router.get("/fingerprint/{fingerprint}", response_model=CanonicalEvent, dependencies=[Depends(require_permission("events.read"))])
 async def get_event_by_fingerprint(
     fingerprint: str,
-    identity: Identity = Depends(require_permission("events.read"))
+    identity: Identity = Depends(require_permission("events.read")),
+    repo: EventRepository = Depends(get_event_repo)
 ):
-    """Retrieve a single event by deterministic fingerprint, bounded by tenant."""
-    event = event_repository.get_event_by_fingerprint(identity.tenant_id, fingerprint)
+    event = repo.get_event_by_fingerprint(tenant_id=identity.tenant_id, fingerprint=fingerprint)
     if not event:
-        raise HTTPException(status_code=404, detail="Event not found")
+        raise HTTPException(status_code=404, detail="Event not found.")
+    return event
+
+@router.get("/{event_id}", response_model=CanonicalEvent, dependencies=[Depends(require_permission("events.read"))])
+async def get_event(
+    event_id: str,
+    identity: Identity = Depends(require_permission("events.read")),
+    repo: EventRepository = Depends(get_event_repo)
+):
+    event = repo.get_event(tenant_id=identity.tenant_id, event_id=event_id)
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found.")
     return event
