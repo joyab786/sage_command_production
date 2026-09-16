@@ -3,8 +3,6 @@
 import React, { useState, useEffect } from "react";
 import { format } from "date-fns";
 import { fetchSage } from "../../lib/api";
-import { ScrollArea } from "../ui/scroll-area";
-import { Badge } from "../ui/badge";
 
 export function EventBusModal({ onClose }: { onClose: () => void }) {
   const [status, setStatus] = useState<any>(null);
@@ -58,9 +56,9 @@ export function EventBusModal({ onClose }: { onClose: () => void }) {
           <div className="grid grid-cols-4 gap-4">
             <div className="bg-sage-800 p-4 rounded-lg border border-sage-700 flex flex-col items-center justify-center">
               <span className="text-sage-400 text-xs uppercase tracking-wider mb-1">Bus Status</span>
-              <Badge variant={status?.running ? "success" : "destructive"}>
+              <span className={`px-2 py-1 rounded text-xs font-bold uppercase tracking-wider ${status?.running ? "bg-green-900 text-green-300" : "bg-red-900 text-red-300"}`}>
                 {status?.running ? "ACTIVE" : "OFFLINE"}
-              </Badge>
+              </span>
             </div>
             <div className="bg-sage-800 p-4 rounded-lg border border-sage-700 flex flex-col items-center justify-center">
               <span className="text-sage-400 text-xs uppercase tracking-wider mb-1">Queue Size</span>
@@ -80,9 +78,9 @@ export function EventBusModal({ onClose }: { onClose: () => void }) {
             {/* Subscriptions */}
             <div className="bg-sage-800/50 rounded-lg border border-sage-700 p-4">
               <h3 className="text-lg font-semibold text-white mb-4 flex items-center gap-2">
-                Active Subscriptions <Badge variant="secondary">{subscriptions.length}</Badge>
+                Active Subscriptions <span className="px-2 py-1 bg-sage-700 text-white text-xs rounded">{subscriptions.length}</span>
               </h3>
-              <ScrollArea className="h-64 rounded-md border border-sage-700 bg-sage-900/50 p-2">
+              <div className="h-64 overflow-y-auto rounded-md border border-sage-700 bg-sage-900/50 p-2 scrollbar-thin">
                 {subscriptions.map(sub => (
                   <div key={sub.subscription_id} className="p-3 mb-2 rounded border border-sage-700 bg-sage-800 text-sm font-mono">
                     <div className="flex justify-between text-xs text-sage-400 mb-2">
@@ -92,7 +90,7 @@ export function EventBusModal({ onClose }: { onClose: () => void }) {
                     <div className="truncate text-sage-300">{sub.subscription_id}</div>
                   </div>
                 ))}
-              </ScrollArea>
+              </div>
             </div>
 
             {/* Recent Deliveries */}
@@ -100,14 +98,14 @@ export function EventBusModal({ onClose }: { onClose: () => void }) {
               <h3 className="text-lg font-semibold text-white mb-4 flex items-center gap-2">
                 Recent Deliveries
               </h3>
-              <ScrollArea className="h-64 rounded-md border border-sage-700 bg-sage-900/50 p-2">
+              <div className="h-64 overflow-y-auto rounded-md border border-sage-700 bg-sage-900/50 p-2 scrollbar-thin">
                 {deliveries.map(del => (
                   <div key={del.delivery_id} className="p-3 mb-2 rounded border border-sage-700 bg-sage-800 text-sm font-mono">
                     <div className="flex justify-between text-xs mb-1">
                       <span className="text-sage-400 truncate w-32">{del.event_id}</span>
-                      <Badge variant={del.status === 'SUCCESS' ? 'success' : del.status === 'FAILED' ? 'destructive' : 'warning'}>
+                      <span className={`px-2 py-0.5 rounded text-xs font-medium ${del.status === 'SUCCESS' ? 'bg-green-900 text-green-300' : del.status === 'FAILED' ? 'bg-red-900 text-red-300' : 'bg-yellow-900 text-yellow-300'}`}>
                         {del.status}
-                      </Badge>
+                      </span>
                     </div>
                     <div className="text-xs text-sage-500 flex justify-between">
                       <span>Att: {del.attempts}/{del.max_attempts}</span>
@@ -115,7 +113,7 @@ export function EventBusModal({ onClose }: { onClose: () => void }) {
                     </div>
                   </div>
                 ))}
-              </ScrollArea>
+              </div>
             </div>
           </div>
         </div>
