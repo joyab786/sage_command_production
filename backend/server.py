@@ -30,6 +30,7 @@ try:
     from api.digital_twin_routes import router as digital_twin_router
     from api.data_quality_routes import router as data_quality_router
     from api.anomaly_routes import router as anomaly_router
+    from api.event_routes import router as event_router
 except (ImportError, ModuleNotFoundError):
     from backend.core.config import SAGE_ALLOWED_ORIGINS, IS_PRODUCTION
     from backend.governance.middleware import (
@@ -51,6 +52,7 @@ except (ImportError, ModuleNotFoundError):
     from backend.api.digital_twin_routes import router as digital_twin_router
     from backend.api.data_quality_routes import router as data_quality_router
     from backend.api.anomaly_routes import router as anomaly_router
+    from backend.api.event_routes import router as event_router
 
 app = FastAPI(title="SageCommand V3 Industrial Operations AI OS")
 
@@ -105,6 +107,7 @@ app.include_router(knowledge_graph_router)
 app.include_router(digital_twin_router)
 app.include_router(data_quality_router)
 app.include_router(anomaly_router)
+app.include_router(event_router)
 
 # BOOT SEQUENCE
 if __name__ == "__main__":
