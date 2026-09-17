@@ -18,6 +18,7 @@ import KnowledgeGraphModal from "./components/KnowledgeGraphModal";
 import DigitalTwinModal from "./components/DigitalTwinModal";
 import DataQualityModal from "./components/DataQualityModal";
 import AnomalyModal from "./components/AnomalyModal";
+import { RCAModal } from "./components/RCAModal";
 
 export default function ObsidianCommandCenter() {
   // --- CORE STATE ---
@@ -63,6 +64,9 @@ export default function ObsidianCommandCenter() {
 
   // --- ANOMALY DETECTION STATE ---
   const [showAnomalyModal, setShowAnomalyModal] = useState(false);
+
+  // --- ROOT CAUSE ANALYSIS STATE ---
+  const [showRcaModal, setShowRcaModal] = useState(false);
 
   // --- SECURITY INTRUSION ALERT STATE ---
   const [securityAlert, setSecurityAlert] = useState<{
@@ -385,6 +389,7 @@ export default function ObsidianCommandCenter() {
         onDigitalTwinClick={() => setShowTwinModal(true)}
         onDataQualityClick={() => setShowDataQualityModal(true)}
         onAnomalyClick={() => setShowAnomalyModal(true)}
+        onRcaClick={() => setShowRcaModal(true)}
         onHardwareVisionClick={() => imageInputRef.current?.click()}
         onCoreScanClick={triggerScan}
         onRoleChange={setUserRole}
@@ -502,6 +507,10 @@ export default function ObsidianCommandCenter() {
         isOpen={showAnomalyModal}
         onClose={() => setShowAnomalyModal(false)}
       />
+
+      {showRcaModal && (
+        <RCAModal onClose={() => setShowRcaModal(false)} />
+      )}
     </div>
   );
 }

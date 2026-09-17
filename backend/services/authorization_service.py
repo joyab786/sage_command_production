@@ -130,6 +130,11 @@ CANONICAL_PERMISSIONS: List[Permission] = [
     Permission(permission_id="incidents.notes.write", resource="incidents", action="notes.write", description="Add operator notes to incidents"),
     Permission(permission_id="incidents.admin", resource="incidents", action="admin", description="Full administrative authority over incidents", is_sensitive=True),
 
+    # Root-Cause Analysis Foundation (Prompt 19)
+    Permission(permission_id="rca.read", resource="rca", action="read", description="View Root-Cause Analysis candidates, evidence, and deterministic reasoning traces"),
+    Permission(permission_id="rca.analyze", resource="rca", action="analyze", description="Trigger deterministic Root-Cause Analysis for an incident"),
+    Permission(permission_id="rca.admin", resource="rca", action="admin", description="Full administrative authority over RCA rules and settings", is_sensitive=True),
+
     # System Administration (Strictly Non-Operational)
     Permission(permission_id="user.manage", resource="user", action="manage", description="Create, update, or suspend user identities", is_sensitive=True),
     Permission(permission_id="system.config", resource="system", action="config", description="Configure platform infrastructure and endpoints", is_sensitive=True),
@@ -166,7 +171,7 @@ SYSTEM_ROLES: List[Role] = [
         role_id="VIEWER",
         name="Viewer",
         scope_type=RoleScopeType.SYSTEM,
-        permissions=["telemetry.read", "database.read", "action.read", "policy.read", "transaction.read", "ontology.read", "knowledge_graph.read", "digital_twin.read", "data_quality.read", "incidents.read"],
+        permissions=["telemetry.read", "database.read", "action.read", "policy.read", "transaction.read", "ontology.read", "knowledge_graph.read", "digital_twin.read", "data_quality.read", "incidents.read", "rca.read"],
         inherits_from=[],
         description="Read-only observer access to telemetry, action states, and policy rules.",
         is_system_role=True
@@ -188,7 +193,7 @@ SYSTEM_ROLES: List[Role] = [
             "action.create", "action.cancel", "production.propose", "machine.status.read",
             "transaction.plan", "transaction.cancel", "action.execute", "transaction.execute",
             "incidents.create", "incidents.acknowledge", "incidents.transition", "incidents.update",
-            "incidents.assign", "incidents.evidence.write", "incidents.notes.write"
+            "incidents.assign", "incidents.evidence.write", "incidents.notes.write", "rca.analyze"
         ],
         inherits_from=["ANALYST"],
         description="Line operator authorized to propose and execute structured operational actions on assigned plant lines.",
@@ -225,7 +230,7 @@ SYSTEM_ROLES: List[Role] = [
         role_id="PLANT_MANAGER",
         name="Plant Manager",
         scope_type=RoleScopeType.PLANT,
-        permissions=["action.approve", "production.schedule", "transaction.rollback", "ontology.manage", "knowledge_graph.manage", "digital_twin.manage", "data_quality.manage", "incidents.admin"],
+        permissions=["action.approve", "production.schedule", "transaction.rollback", "ontology.manage", "knowledge_graph.manage", "digital_twin.manage", "data_quality.manage", "incidents.admin", "rca.admin"],
         inherits_from=["OPERATOR", "SAFETY_MANAGER", "SUPPLY_CHAIN_MANAGER"],
         description="Senior plant authority responsible for approving high-risk actions, production schedules, and transaction rollbacks.",
         is_system_role=True
@@ -245,7 +250,7 @@ SYSTEM_ROLES: List[Role] = [
         scope_type=RoleScopeType.SYSTEM,
         permissions=[
             "user.manage", "system.config", "tenant.admin", "role.assign",
-            "database.connection.create", "database.connection.admin", "ontology.manage", "knowledge_graph.manage", "digital_twin.manage", "data_quality.manage", "incidents.admin"
+            "database.connection.create", "database.connection.admin", "ontology.manage", "knowledge_graph.manage", "digital_twin.manage", "data_quality.manage", "incidents.admin", "rca.admin"
         ],
         inherits_from=["VIEWER"],
         description="Platform administrator. Strictly non-operational; cannot propose or approve factory actions.",

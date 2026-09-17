@@ -23,6 +23,7 @@ interface OmniHeaderProps {
   onDigitalTwinClick?: () => void;
   onDataQualityClick?: () => void;
   onAnomalyClick?: () => void;
+  onRcaClick?: () => void;
   onHardwareVisionClick: () => void;
   onCoreScanClick: () => void;
   onRoleChange: (role: "operator" | "manager") => void;
@@ -48,6 +49,7 @@ export default function OmniHeader({
   onDigitalTwinClick,
   onDataQualityClick,
   onAnomalyClick,
+  onRcaClick,
   onHardwareVisionClick,
   onCoreScanClick,
   onRoleChange,
@@ -190,6 +192,16 @@ export default function OmniHeader({
           className="border-emerald-500/30 bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20"
           icon={<ShieldAlert className="w-3 h-3 text-emerald-400" />}
           label="Quality"
+        />
+
+        {/* RCA */}
+        <HeaderButton
+          onClick={onRcaClick || (() => {})}
+          active={false}
+          activeClass=""
+          className="border-purple-500/30 bg-purple-500/10 text-purple-400 hover:bg-purple-500/20"
+          icon={<Search className="w-3 h-3 text-purple-400" />}
+          label="RCA"
         />
 
         {/* Hardware Vision */}
