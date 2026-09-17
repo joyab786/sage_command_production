@@ -1,12 +1,37 @@
-export async function fetchSage(endpoint: string) {
-  const token = localStorage.getItem("sage_token") || "manager_token";
+export async function fetchSage(endpoint: string, options: RequestInit = {}) {
+  const token = (typeof window !== "undefined" && localStorage.getItem("sage_token")) || "manager_token";
+  const defaultHeaders: Record<string, string> = {
+    "Authorization": `Bearer ${token}`,
+  };
+  if (options.body && typeof options.body === "string") {
+    defaultHeaders["Content-Type"] = "application/json";
+  }
+
   const res = await fetch(`http://localhost:8000${endpoint}`, {
+    ...options,
     headers: {
-      "Authorization": `Bearer ${token}`
-    }
+      ...defaultHeaders,
+      ...((options.headers as Record<string, string>) || {}),
+    },
   });
+
   if (!res.ok) {
-    throw new Error(`API error: ${res.status}`);
+    let errorMsg = `API error: ${res.status}`;
+    try {
+      const errorJson = await res.json();
+      if (errorJson?.detail) {
+        if (typeof errorJson.detail === "string") {
+          errorMsg = errorJson.detail;
+        } else if (errorJson.detail.message) {
+          errorMsg = errorJson.detail.message;
+        } else {
+          errorMsg = JSON.stringify(errorJson.detail);
+        }
+      }
+    } catch {
+      // ignore json parse error
+    }
+    throw new Error(errorMsg);
   }
   return res.json();
 }

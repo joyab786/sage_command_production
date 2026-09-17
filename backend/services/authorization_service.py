@@ -119,6 +119,17 @@ CANONICAL_PERMISSIONS: List[Permission] = [
     Permission(permission_id="data_quality.assess", resource="data_quality", action="assess", description="Trigger deterministic data quality assessments"),
     Permission(permission_id="data_quality.manage", resource="data_quality", action="manage", description="Create and manage data quality rules", is_sensitive=True),
 
+    # Incident Management Architecture (Prompt 18)
+    Permission(permission_id="incidents.read", resource="incidents", action="read", description="View operational incidents, timelines, evidence, and notes"),
+    Permission(permission_id="incidents.create", resource="incidents", action="create", description="Create new operational incident records"),
+    Permission(permission_id="incidents.update", resource="incidents", action="update", description="Update incident metadata (severity, priority) and associate events"),
+    Permission(permission_id="incidents.assign", resource="incidents", action="assign", description="Assign or reassign incident owners and teams"),
+    Permission(permission_id="incidents.acknowledge", resource="incidents", action="acknowledge", description="Acknowledge operational incidents"),
+    Permission(permission_id="incidents.transition", resource="incidents", action="transition", description="Transition incident lifecycle states"),
+    Permission(permission_id="incidents.evidence.write", resource="incidents", action="evidence.write", description="Attach evidence references to incidents"),
+    Permission(permission_id="incidents.notes.write", resource="incidents", action="notes.write", description="Add operator notes to incidents"),
+    Permission(permission_id="incidents.admin", resource="incidents", action="admin", description="Full administrative authority over incidents", is_sensitive=True),
+
     # System Administration (Strictly Non-Operational)
     Permission(permission_id="user.manage", resource="user", action="manage", description="Create, update, or suspend user identities", is_sensitive=True),
     Permission(permission_id="system.config", resource="system", action="config", description="Configure platform infrastructure and endpoints", is_sensitive=True),
@@ -155,7 +166,7 @@ SYSTEM_ROLES: List[Role] = [
         role_id="VIEWER",
         name="Viewer",
         scope_type=RoleScopeType.SYSTEM,
-        permissions=["telemetry.read", "database.read", "action.read", "policy.read", "transaction.read", "ontology.read", "knowledge_graph.read", "digital_twin.read", "data_quality.read"],
+        permissions=["telemetry.read", "database.read", "action.read", "policy.read", "transaction.read", "ontology.read", "knowledge_graph.read", "digital_twin.read", "data_quality.read", "incidents.read"],
         inherits_from=[],
         description="Read-only observer access to telemetry, action states, and policy rules.",
         is_system_role=True
@@ -175,7 +186,9 @@ SYSTEM_ROLES: List[Role] = [
         scope_type=RoleScopeType.PLANT,
         permissions=[
             "action.create", "action.cancel", "production.propose", "machine.status.read",
-            "transaction.plan", "transaction.cancel", "action.execute", "transaction.execute"
+            "transaction.plan", "transaction.cancel", "action.execute", "transaction.execute",
+            "incidents.create", "incidents.acknowledge", "incidents.transition", "incidents.update",
+            "incidents.assign", "incidents.evidence.write", "incidents.notes.write"
         ],
         inherits_from=["ANALYST"],
         description="Line operator authorized to propose and execute structured operational actions on assigned plant lines.",
@@ -212,7 +225,7 @@ SYSTEM_ROLES: List[Role] = [
         role_id="PLANT_MANAGER",
         name="Plant Manager",
         scope_type=RoleScopeType.PLANT,
-        permissions=["action.approve", "production.schedule", "transaction.rollback", "ontology.manage", "knowledge_graph.manage", "digital_twin.manage", "data_quality.manage"],
+        permissions=["action.approve", "production.schedule", "transaction.rollback", "ontology.manage", "knowledge_graph.manage", "digital_twin.manage", "data_quality.manage", "incidents.admin"],
         inherits_from=["OPERATOR", "SAFETY_MANAGER", "SUPPLY_CHAIN_MANAGER"],
         description="Senior plant authority responsible for approving high-risk actions, production schedules, and transaction rollbacks.",
         is_system_role=True
@@ -232,7 +245,7 @@ SYSTEM_ROLES: List[Role] = [
         scope_type=RoleScopeType.SYSTEM,
         permissions=[
             "user.manage", "system.config", "tenant.admin", "role.assign",
-            "database.connection.create", "database.connection.admin", "ontology.manage", "knowledge_graph.manage", "digital_twin.manage", "data_quality.manage"
+            "database.connection.create", "database.connection.admin", "ontology.manage", "knowledge_graph.manage", "digital_twin.manage", "data_quality.manage", "incidents.admin"
         ],
         inherits_from=["VIEWER"],
         description="Platform administrator. Strictly non-operational; cannot propose or approve factory actions.",
@@ -242,7 +255,7 @@ SYSTEM_ROLES: List[Role] = [
         role_id="SECURITY_ADMIN",
         name="Security Administrator",
         scope_type=RoleScopeType.SYSTEM,
-        permissions=["policy.manage", "security.audit", "role.manage", "audit.read", "data_quality.manage"],
+        permissions=["policy.manage", "security.audit", "role.manage", "audit.read", "data_quality.manage", "incidents.admin"],
         inherits_from=["VIEWER"],
         description="Security and governance officer responsible for policy rules and authorization role definitions.",
         is_system_role=True

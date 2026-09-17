@@ -1,50 +1,179 @@
-# SageCommand V3 — Incident Management Foundation
+# SageCommand V3 — Incident Management Foundation (Prompt 18)
 
-## Overview
-The Incident Management subsystem in SageCommand V3 provides an immutable, tenant-isolated record of operational and security cases. It establishes the "source of truth" for what happened, when it happened, and who was involved, explicitly decoupled from the physical execution systems that might automate remediation.
+## 1. Overview & Core Philosophy
 
-## Core Principles
-1. **Tenant Isolation**: Complete logical separation of incident data. Every operation requires a valid `tenant_id`.
-2. **Strict Separation of Duties**: Incident Management tracks state, evidence, and timelines. It **does not** perform root-cause analysis (owned by Prompt 19) or trigger physical execution/remediation (owned by Execution Gateway).
-3. **Immutability & Provenance**: Incidents have an append-only timeline. Transitions, notes, and evidence are strictly tracked by user/actor.
-4. **Deterministic Identity**: Deduplication keys ensure idempotent creation of incidents from external triggers.
+The **SageCommand V3 Incident Management subsystem** provides an authoritative, structured, and tenant-isolated operational case tracking foundation. It represents an operational situation requiring tracking, human ownership, investigation, communication, or resolution.
 
-## Architecture
+> [!IMPORTANT]
+> **Core Architectural Boundary**:
+> Prompt 18 provides incident tracking and lifecycle management. It does **not** determine root cause and does **not** execute physical remediation.
+> - **Prompt 19** owns the future **Root-Cause Analysis (RCA)** engine.
+> - **Deterministic Execution Gateway & Action API** own physical operational write boundaries and safety checks.
+> - Incident Management is strictly an operational tracking and lifecycle domain.
 
-### 1. Data Contracts
-Located in `backend/data/schemas/incident_contract.py`:
-- `IncidentContract`: The core domain model.
-- `IncidentLifecycle`: State machine (`OPEN`, `ACKNOWLEDGED`, `INVESTIGATING`, `MITIGATED`, `RESOLVED`, `CLOSED`).
-- `IncidentTimelineEntry`: Immutable ledger of all state changes, evidence, and notes.
+---
 
-### 2. Incident Repository
-Located in `backend/services/incident_repository.py`:
-- Backed by SQLite (`SAGE_INCIDENT_DB_PATH`) using WAL mode for concurrency.
-- Enforces optimistic concurrency control using a `version` integer to prevent lost updates during simultaneous triage.
+## 2. Incident vs. Event Model
 
-### 3. Incident Service
-Located in `backend/services/incident_service.py`:
-- Encapsulates business logic, state transitions, and timeline generation.
-- Enforces strict validations (e.g., cannot transition from `OPEN` straight to `RESOLVED` without appropriate steps, or cannot alter incidents belonging to another tenant).
+A fundamental invariant of SageCommand V3 is the separation between Events and Incidents:
 
-### 4. API Endpoints
-Located in `backend/api/incident_routes.py`:
-- `POST /api/v3/incidents`: Create a new incident.
-- `GET /api/v3/incidents`: List incidents (with tenant-scoped authorization).
-- `GET /api/v3/incidents/{id}`: Retrieve full incident details including the timeline.
-- `PATCH /api/v3/incidents/{id}/lifecycle`: Advance the incident state.
-- `POST /api/v3/incidents/{id}/notes`: Add a note.
-- `POST /api/v3/incidents/{id}/evidence`: Attach evidence or associate related events.
+| Attribute | Canonical Event (Prompt 16) | Operational Incident (Prompt 18) |
+| :--- | :--- | :--- |
+| **Concept** | Something that happened, was observed, detected, or recorded at a specific instant. | An operational situation tracked over time requiring investigation, ownership, and triage. |
+| **Mutability** | **Immutable**: Never updated or deleted after persistence. | **Mutable Case Record**: Lifecycle transitions, metadata updates, and ownership assignments mutate current record state while recording append-only history. |
+| **Cardinality** | Atomic single telemetry point, threshold breach, or message. | References one or multiple canonical events, anomalies, and operational evidence records. |
+| **Identity** | Deterministic cryptographic SHA-256 fingerprint from immutable event fields. | Unique incident ID (`inc_...`) with optional deterministic deduplication key fingerprint. |
 
-## Integration with ABAC
-The API endpoints are secured by the core ABAC system, utilizing permissions like:
-- `incidents.create`
-- `incidents.read`
-- `incidents.transition`
-- `incidents.update`
+---
 
-## Concurrency
-Optimistic locking ensures that if two operators attempt to acknowledge or transition an incident simultaneously, only one succeeds, and the other receives a 409 Conflict.
+## 3. Canonical Incident Contract
 
-## UI Component
-A diagnostic React component `IncidentModal.tsx` is provided in the frontend to inspect incident timelines and current state.
+Defined in `backend/data/schemas/incident_contract.py`:
+
+- **Identity**:
+  - `incident_id`: Unique deterministic ID (`inc_<hex>`).
+  - `incident_fingerprint`: Deduplication SHA-256 hash based on `tenant_id | category | deduplication_key`.
+  - `schema_version`: Constant `"3.0"`.
+- **Scope**:
+  - `tenant_id`: Mandatory tenant isolation boundary.
+  - `workspace_id`: Optional workspace boundary.
+  - `plant_id`: Optional plant site boundary.
+- **Classification & Assessment**:
+  - `category`: `OPERATIONAL`, `SAFETY`, `QUALITY`, `MAINTENANCE`, `PRODUCTION`, `INVENTORY`, `SECURITY`, `INFRASTRUCTURE`, `SYSTEM`, `OTHER`.
+  - `severity`: Describes operational impact (`INFO`, `LOW`, `MEDIUM`, `HIGH`, `CRITICAL`).
+  - `priority`: Describes handling attention order (`LOW`, `NORMAL`, `HIGH`, `URGENT`).
+- **Timestamps**:
+  - `detected_at`: Timestamp when the condition was observed.
+  - `opened_at`: Timestamp when the incident was created.
+  - `acknowledged_at`: Timestamp when an operator acknowledged the incident.
+  - `resolved_at`: Timestamp when lifecycle reached `RESOLVED`.
+  - `closed_at`: Timestamp when lifecycle reached `CLOSED`.
+  - `updated_at`: Timestamp of most recent mutation.
+- **Ownership**:
+  - `assigned_user`: Individual owner identity.
+  - `assigned_team`: Department or response team identity.
+  - `acknowledged_by`: Authenticated identity that acknowledged the incident.
+- **Concurrency**:
+  - `version`: Monotonically increasing integer for optimistic concurrency protection.
+
+---
+
+## 4. Deterministic Lifecycle State Machine
+
+Valid lifecycle states: `OPEN`, `ACKNOWLEDGED`, `INVESTIGATING`, `MITIGATED`, `RESOLVED`, `CLOSED`, `REOPENED`, `CANCELLED`.
+
+```
+          ┌─────────────┐
+          │    OPEN     │
+          └──────┬──────┘
+                 │
+       ┌─────────┴─────────┐
+       ▼                   ▼
+┌──────────────┐    ┌─────────────┐
+│ ACKNOWLEDGED │    │  CANCELLED  │ (Terminal)
+└──────┬───────┘    └─────────────┘
+       │
+       ▼
+┌──────────────┐
+│INVESTIGATING │
+└──────┬───────┘
+       │
+       ▼
+┌──────────────┐
+│  MITIGATED   │
+└──────┬───────┘
+       │
+       ▼
+┌──────────────┐         ┌──────────┐
+│   RESOLVED   │ ◄─────► │ REOPENED │
+└──────┬───────┘         └──────────┘
+       │
+       ▼
+┌──────────────┐
+│    CLOSED    │
+└──────────────┘
+```
+
+- Invalid transitions (such as direct `OPEN -> RESOLVED`) are strictly rejected with HTTP 400.
+- `RESOLVED` and `CLOSED` incidents may transition to `REOPENED` if operational issues recur.
+
+---
+
+## 5. Audit History & Deterministic Timeline
+
+1. **Append-Only History (`incident_history`)**:
+   Every state transition preserves:
+   - `incident_id`
+   - `previous_state`
+   - `new_state`
+   - `actor`
+   - `timestamp`
+   - `reason`
+2. **Deterministic Timeline (`incident_timeline`)**:
+   Captures all incident activities in sequence:
+   - `CREATED`, `EVENT_ASSOCIATED`, `EVIDENCE_ADDED`, `LIFECYCLE_TRANSITION`, `ASSIGNMENT_CHANGED`, `SEVERITY_CHANGED`, `PRIORITY_CHANGED`, `NOTE_ADDED`.
+   - Deterministic sorting: ordered by `timestamp ASC`, with `entry_id ASC` as the tie-breaker.
+
+---
+
+## 6. Associations & References
+
+- **Canonical Events (`incident_events`)**:
+  - Mapped via `incident_id` and `event_id` with relationship labels: `TRIGGER`, `SUPPORTING`, `RELATED`, `FOLLOW_UP`, `RESOLUTION`.
+  - Associations are idempotent; duplicate attempts do not corrupt state.
+  - **Cross-tenant event associations are strictly blocked**.
+- **Evidence References (`incident_evidence`)**:
+  - Supported evidence types: `EVENT`, `ANOMALY`, `TWIN_STATE`, `KNOWLEDGE_GRAPH`, `DATA_QUALITY`, `OPERATOR_NOTE`, `EXTERNAL_REFERENCE`.
+  - Cross-tenant references in metadata are validated and rejected.
+  - Payloads are bounded to a maximum of 32KB JSON metadata.
+- **Operator Notes (`incident_notes`)**:
+  - Bounded to 4096 characters per note.
+  - Authentic author attribution from authenticated identity context.
+
+---
+
+## 7. Security, RBAC, and ABAC Integration
+
+### Canonical Permissions
+Registered in `authorization_service.py`:
+- `incidents.read`: View incidents, timelines, evidence, and notes.
+- `incidents.create`: Create new incident records.
+- `incidents.update`: Modify severity, priority, or associate events.
+- `incidents.assign`: Assign or reassign incident owners and teams.
+- `incidents.acknowledge`: Dedicated permission to acknowledge incidents.
+- `incidents.transition`: Transition incident lifecycle states.
+- `incidents.evidence.write`: Attach evidence references.
+- `incidents.notes.write`: Add operator notes.
+- `incidents.admin`: Administrative authority over incident configuration.
+
+### System Roles
+- `VIEWER`: Granted `incidents.read`.
+- `OPERATOR`: Granted `incidents.create`, `incidents.acknowledge`, `incidents.transition`, `incidents.update`, `incidents.assign`, `incidents.evidence.write`, `incidents.notes.write`.
+- `PLANT_MANAGER`, `ADMINISTRATOR`, `SECURITY_ADMIN`: Granted `incidents.admin`.
+
+### Multi-Tenant Isolation
+All repository queries and service methods require `tenant_id`. Cross-tenant retrieval, modification, event association, or evidence attachment fails closed with HTTP 404 or ValueError.
+
+---
+
+## 8. Controlled Frontend Incident Management UI
+
+The frontend component `frontend/app/components/IncidentModal.tsx` provides a controlled, interactive incident management workspace:
+- **Acknowledge Incident**: One-click acknowledgement button for `OPEN` incidents.
+- **Lifecycle Transition**: Contextual dropdown displaying only valid transitions from the current state with reason input.
+- **Ownership Assignment**: Inline user and team assignment controls.
+- **Severity & Priority Adjustments**: Selectors to update operational assessment.
+- **Operator Notes Ledger**: Threaded notes feed with character-counter form.
+- **Event Linker**: Interface to associate canonical Prompt 16 events.
+- **Evidence Reference Attacher**: Interface to link anomalies, twin states, and external references.
+- **Incident Creator**: Controlled dialog to register new operational cases.
+
+### Strict Execution Isolation Guardrails
+The UI explicitly does **NOT** expose:
+- Action API execution
+- Execution Gateway controls
+- Physical machine, PLC, or actuator controls
+- Rollback mechanisms
+- Autonomous remediation buttons
+- Root-cause analysis or causal inference algorithms
+- Blast-radius intelligence calculations

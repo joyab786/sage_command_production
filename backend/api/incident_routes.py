@@ -14,7 +14,12 @@ router = APIRouter(prefix="/api/v3/incidents", tags=["V3 Incidents"])
 
 # Use a singleton pattern similar to other domains, or initialize directly for the router
 repo = IncidentRepository()
-service = IncidentService(repo)
+try:
+    from services.event_repository import EventRepository
+    event_repo = EventRepository()
+except Exception:
+    event_repo = None
+service = IncidentService(repo, event_repository=event_repo)
 
 class CreateIncidentRequest(BaseModel):
     category: IncidentCategory
@@ -29,6 +34,10 @@ class CreateIncidentRequest(BaseModel):
 class TransitionRequest(BaseModel):
     new_state: IncidentLifecycle
     reason: str = ""
+    expected_version: Optional[int] = None
+
+class AcknowledgeRequest(BaseModel):
+    reason: str = "Incident Acknowledged by Operator"
 
 class UpdateMetadataRequest(BaseModel):
     severity: Optional[IncidentSeverity] = None
@@ -71,8 +80,7 @@ def create_incident(request: CreateIncidentRequest, identity: Identity = Depends
 
 @router.get("", response_model=List[IncidentContract], dependencies=[Depends(require_permission("incidents.read"))])
 def list_incidents(identity: Identity = Depends(require_permission("incidents.read")), limit: int = 100):
-    if limit > 500:
-        limit = 500
+    limit = min(max(1, limit), 500)
     return service.list_incidents(identity.tenant_id, limit)
 
 @router.get("/{incident_id}", response_model=Dict[str, Any], dependencies=[Depends(require_permission("incidents.read"))])
@@ -82,6 +90,21 @@ def get_incident_details(incident_id: str, identity: Identity = Depends(require_
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
+@router.post("/{incident_id}/acknowledge", response_model=IncidentContract, dependencies=[Depends(require_permission("incidents.acknowledge"))])
+def acknowledge_incident(incident_id: str, request: Optional[AcknowledgeRequest] = None, identity: Identity = Depends(require_permission("incidents.acknowledge"))):
+    reason = request.reason if request and request.reason else "Incident Acknowledged by Operator"
+    try:
+        return service.acknowledge_incident(
+            incident_id=incident_id,
+            tenant_id=identity.tenant_id,
+            actor=identity.user_id,
+            reason=reason
+        )
+    except ValueError as e:
+        if "not found" in str(e).lower():
+            raise HTTPException(status_code=404, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e))
+
 @router.patch("/{incident_id}/lifecycle", response_model=IncidentContract, dependencies=[Depends(require_permission("incidents.transition"))])
 def transition_lifecycle(incident_id: str, request: TransitionRequest, identity: Identity = Depends(require_permission("incidents.transition"))):
     try:
@@ -90,11 +113,14 @@ def transition_lifecycle(incident_id: str, request: TransitionRequest, identity:
             tenant_id=identity.tenant_id,
             new_state=request.new_state,
             actor=identity.user_id,
-            reason=request.reason
+            reason=request.reason,
+            expected_version=request.expected_version
         )
     except ValueError as e:
         if "not found" in str(e).lower():
             raise HTTPException(status_code=404, detail=str(e))
+        if "concurrency" in str(e).lower():
+            raise HTTPException(status_code=409, detail=str(e))
         raise HTTPException(status_code=400, detail=str(e))
 
 @router.patch("/{incident_id}/metadata", response_model=IncidentContract, dependencies=[Depends(require_permission("incidents.update"))])

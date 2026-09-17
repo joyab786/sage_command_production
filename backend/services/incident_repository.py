@@ -260,10 +260,11 @@ class IncidentRepository:
                 else:
                     raise
 
-    def get_event_associations(self, incident_id: str) -> List[IncidentEventAssociation]:
+    def get_event_associations(self, incident_id: str, limit: int = 100) -> List[IncidentEventAssociation]:
+        limit = min(max(1, limit), 500)
         with self._get_conn() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT * FROM incident_events WHERE incident_id = ?", (incident_id,))
+            cur.execute("SELECT * FROM incident_events WHERE incident_id = ? ORDER BY added_at ASC, event_id ASC LIMIT ?", (incident_id, limit))
             return [IncidentEventAssociation(
                 incident_id=r["incident_id"],
                 event_id=r["event_id"],
@@ -284,10 +285,11 @@ class IncidentRepository:
             ))
             conn.commit()
 
-    def get_evidence(self, incident_id: str) -> List[IncidentEvidence]:
+    def get_evidence(self, incident_id: str, limit: int = 100) -> List[IncidentEvidence]:
+        limit = min(max(1, limit), 500)
         with self._get_conn() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT * FROM incident_evidence WHERE incident_id = ? ORDER BY timestamp DESC", (incident_id,))
+            cur.execute("SELECT * FROM incident_evidence WHERE incident_id = ? ORDER BY timestamp DESC, evidence_id ASC LIMIT ?", (incident_id, limit))
             return [IncidentEvidence(
                 evidence_id=r["evidence_id"],
                 incident_id=r["incident_id"],
@@ -310,10 +312,11 @@ class IncidentRepository:
             ))
             conn.commit()
 
-    def get_notes(self, incident_id: str) -> List[IncidentNote]:
+    def get_notes(self, incident_id: str, limit: int = 100) -> List[IncidentNote]:
+        limit = min(max(1, limit), 500)
         with self._get_conn() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT * FROM incident_notes WHERE incident_id = ? ORDER BY timestamp ASC", (incident_id,))
+            cur.execute("SELECT * FROM incident_notes WHERE incident_id = ? ORDER BY timestamp ASC, note_id ASC LIMIT ?", (incident_id, limit))
             return [IncidentNote(
                 note_id=r["note_id"],
                 incident_id=r["incident_id"],
@@ -334,10 +337,11 @@ class IncidentRepository:
             ))
             conn.commit()
 
-    def get_timeline(self, incident_id: str) -> List[IncidentTimelineEntry]:
+    def get_timeline(self, incident_id: str, limit: int = 100) -> List[IncidentTimelineEntry]:
+        limit = min(max(1, limit), 500)
         with self._get_conn() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT * FROM incident_timeline WHERE incident_id = ? ORDER BY timestamp ASC", (incident_id,))
+            cur.execute("SELECT * FROM incident_timeline WHERE incident_id = ? ORDER BY timestamp ASC, entry_id ASC LIMIT ?", (incident_id, limit))
             return [IncidentTimelineEntry(
                 entry_id=r["entry_id"],
                 incident_id=r["incident_id"],

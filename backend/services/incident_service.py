@@ -30,8 +30,9 @@ class IncidentService:
     Enforces lifecycle transitions, ownership, tenant isolation.
     CRITICAL: Does NOT contain or import Execution System or physical remediation adapters.
     """
-    def __init__(self, repository: IncidentRepository):
+    def __init__(self, repository: IncidentRepository, event_repository=None):
         self.repo = repository
+        self.event_repo = event_repository
 
     def _ensure_tenant_access(self, incident_id: str, tenant_id: str) -> IncidentContract:
         incident = self.repo.get_incident(incident_id, tenant_id)
@@ -95,9 +96,22 @@ class IncidentService:
         
         return saved
 
-    def transition_lifecycle(self, incident_id: str, tenant_id: str, new_state: IncidentLifecycle, actor: str, reason: str = "") -> IncidentContract:
+    def acknowledge_incident(self, incident_id: str, tenant_id: str, actor: str, reason: str = "Incident Acknowledged by Operator") -> IncidentContract:
+        """Dedicated acknowledgement method enforcing authorized acknowledgement identity."""
+        return self.transition_lifecycle(
+            incident_id=incident_id,
+            tenant_id=tenant_id,
+            new_state=IncidentLifecycle.ACKNOWLEDGED,
+            actor=actor,
+            reason=reason
+        )
+
+    def transition_lifecycle(self, incident_id: str, tenant_id: str, new_state: IncidentLifecycle, actor: str, reason: str = "", expected_version: Optional[int] = None) -> IncidentContract:
         incident = self._ensure_tenant_access(incident_id, tenant_id)
         
+        if expected_version is not None and incident.version != expected_version:
+            raise ValueError(f"Concurrency conflict: Incident {incident_id} version {incident.version} does not match expected {expected_version}")
+
         if new_state not in VALID_TRANSITIONS.get(incident.status, []):
             raise ValueError(f"Invalid transition from {incident.status} to {new_state}")
             
@@ -194,6 +208,17 @@ class IncidentService:
     def associate_event(self, incident_id: str, tenant_id: str, event_id: str, actor: str, relationship: EventRelationshipType = EventRelationshipType.RELATED):
         self._ensure_tenant_access(incident_id, tenant_id)
         
+        if self.event_repo:
+            from contextlib import closing
+            try:
+                with closing(self.event_repo._get_conn()) as conn:
+                    row = conn.execute("SELECT tenant_id FROM events WHERE event_id = ?", (event_id,)).fetchone()
+                    if row and row["tenant_id"] != tenant_id:
+                        raise ValueError(f"Cross-tenant event association blocked: event {event_id} belongs to tenant {row['tenant_id']}")
+            except Exception as e:
+                if "Cross-tenant" in str(e):
+                    raise
+        
         assoc = IncidentEventAssociation(
             incident_id=incident_id,
             event_id=event_id,
@@ -212,12 +237,21 @@ class IncidentService:
     def add_evidence(self, incident_id: str, tenant_id: str, evidence_type: EvidenceType, source_id: str, actor: str, metadata: Dict[str, Any] = None):
         self._ensure_tenant_access(incident_id, tenant_id)
         
+        meta = metadata or {}
+        import json
+        meta_str = json.dumps(meta)
+        if len(meta_str) > 32768:
+            raise ValueError("Evidence metadata exceeds maximum size limit (32KB)")
+
+        if meta.get("tenant_id") and meta["tenant_id"] != tenant_id:
+            raise ValueError(f"Cross-tenant {evidence_type.value} reference blocked: reference belongs to tenant {meta['tenant_id']}")
+
         evidence = IncidentEvidence(
             incident_id=incident_id,
             evidence_type=evidence_type,
             source_id=source_id,
             actor=actor,
-            metadata=metadata or {}
+            metadata=meta
         )
         self.repo.add_evidence(evidence)
         
@@ -231,10 +265,15 @@ class IncidentService:
     def add_note(self, incident_id: str, tenant_id: str, text: str, actor: str):
         self._ensure_tenant_access(incident_id, tenant_id)
         
+        if not text or not text.strip():
+            raise ValueError("Note text cannot be empty")
+        if len(text) > 4096:
+            raise ValueError("Note text exceeds maximum length of 4096 characters")
+
         note = IncidentNote(
             incident_id=incident_id,
             author=actor,
-            text=text
+            text=text.strip()
         )
         self.repo.add_note(note)
         
@@ -245,15 +284,17 @@ class IncidentService:
             metadata={"note_id": note.note_id}
         ))
 
-    def get_incident_details(self, incident_id: str, tenant_id: str) -> Dict[str, Any]:
+    def get_incident_details(self, incident_id: str, tenant_id: str, limit_timeline: int = 100) -> Dict[str, Any]:
         incident = self._ensure_tenant_access(incident_id, tenant_id)
+        limit_timeline = min(max(1, limit_timeline), 500)
         return {
             "incident": incident,
             "events": self.repo.get_event_associations(incident_id),
             "evidence": self.repo.get_evidence(incident_id),
             "notes": self.repo.get_notes(incident_id),
-            "timeline": self.repo.get_timeline(incident_id)
+            "timeline": self.repo.get_timeline(incident_id, limit=limit_timeline)
         }
 
     def list_incidents(self, tenant_id: str, limit: int = 100) -> List[IncidentContract]:
+        limit = min(max(1, limit), 500)
         return self.repo.list_incidents(tenant_id, limit)
