@@ -36,6 +36,7 @@ try:
     from api.rca_routes import router as rca_router
     from api.blast_radius_routes import router as blast_radius_router
     from api.predictive_maintenance_routes import router as predictive_maintenance_router
+    from api.demand_forecasting_routes import router as demand_forecasting_router
     from services.event_bus import get_event_bus
 except (ImportError, ModuleNotFoundError):
     from backend.core.config import SAGE_ALLOWED_ORIGINS, IS_PRODUCTION
@@ -64,6 +65,7 @@ except (ImportError, ModuleNotFoundError):
     from backend.api.rca_routes import router as rca_router
     from backend.api.blast_radius_routes import router as blast_radius_router
     from backend.api.predictive_maintenance_routes import router as predictive_maintenance_router
+    from backend.api.demand_forecasting_routes import router as demand_forecasting_router
     from backend.services.event_bus import get_event_bus
 
 app = FastAPI(title="SageCommand V3 Industrial Operations AI OS")
@@ -135,6 +137,7 @@ app.include_router(incident_router)
 app.include_router(rca_router)
 app.include_router(blast_radius_router)
 app.include_router(predictive_maintenance_router)
+app.include_router(demand_forecasting_router)
 
 # BOOT SEQUENCE
 if __name__ == "__main__":
