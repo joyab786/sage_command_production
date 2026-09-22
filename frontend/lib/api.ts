@@ -47,3 +47,15 @@ export async function analyzeBlastRadius(sourceEntityId: string) {
 export async function getBlastRadiusAnalysis(analysisId: string) {
   return fetchSage(`/v3/blast-radius/${analysisId}`);
 }
+
+// --- PREDICTIVE MAINTENANCE API ---
+export async function analyzePredictiveMaintenance(assetId: string, horizon: string = "P7D") {
+  return fetchSage("/v3/predictive-maintenance/analyze", {
+    method: "POST",
+    body: JSON.stringify({ asset_id: assetId, prediction_horizon: horizon }),
+  });
+}
+
+export async function getPredictiveMaintenanceAssessment(assessmentId: string) {
+  return fetchSage(`/v3/predictive-maintenance/assessment/${assessmentId}`);
+}
