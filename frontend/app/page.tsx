@@ -19,6 +19,7 @@ import DigitalTwinModal from "./components/DigitalTwinModal";
 import DataQualityModal from "./components/DataQualityModal";
 import AnomalyModal from "./components/AnomalyModal";
 import { RCAModal } from "./components/RCAModal";
+import { BlastRadiusModal } from "./components/BlastRadiusModal";
 
 export default function ObsidianCommandCenter() {
   // --- CORE STATE ---
@@ -67,6 +68,9 @@ export default function ObsidianCommandCenter() {
 
   // --- ROOT CAUSE ANALYSIS STATE ---
   const [showRcaModal, setShowRcaModal] = useState(false);
+
+  // --- BLAST RADIUS STATE ---
+  const [showBlastRadiusModal, setShowBlastRadiusModal] = useState(false);
 
   // --- SECURITY INTRUSION ALERT STATE ---
   const [securityAlert, setSecurityAlert] = useState<{
@@ -390,6 +394,7 @@ export default function ObsidianCommandCenter() {
         onDataQualityClick={() => setShowDataQualityModal(true)}
         onAnomalyClick={() => setShowAnomalyModal(true)}
         onRcaClick={() => setShowRcaModal(true)}
+        onBlastRadiusClick={() => setShowBlastRadiusModal(true)}
         onHardwareVisionClick={() => imageInputRef.current?.click()}
         onCoreScanClick={triggerScan}
         onRoleChange={setUserRole}
@@ -510,6 +515,10 @@ export default function ObsidianCommandCenter() {
 
       {showRcaModal && (
         <RCAModal onClose={() => setShowRcaModal(false)} />
+      )}
+
+      {showBlastRadiusModal && (
+        <BlastRadiusModal onClose={() => setShowBlastRadiusModal(false)} />
       )}
     </div>
   );

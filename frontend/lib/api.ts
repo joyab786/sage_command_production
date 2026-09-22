@@ -35,3 +35,15 @@ export async function fetchSage(endpoint: string, options: RequestInit = {}) {
   }
   return res.json();
 }
+
+// --- BLAST RADIUS API ---
+export async function analyzeBlastRadius(sourceEntityId: string) {
+  return fetchSage("/v3/blast-radius/analyze", {
+    method: "POST",
+    body: JSON.stringify({ source_entity_id: sourceEntityId }),
+  });
+}
+
+export async function getBlastRadiusAnalysis(analysisId: string) {
+  return fetchSage(`/v3/blast-radius/${analysisId}`);
+}

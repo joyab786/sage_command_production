@@ -24,6 +24,7 @@ interface OmniHeaderProps {
   onDataQualityClick?: () => void;
   onAnomalyClick?: () => void;
   onRcaClick?: () => void;
+  onBlastRadiusClick?: () => void;
   onHardwareVisionClick: () => void;
   onCoreScanClick: () => void;
   onRoleChange: (role: "operator" | "manager") => void;
@@ -50,6 +51,7 @@ export default function OmniHeader({
   onDataQualityClick,
   onAnomalyClick,
   onRcaClick,
+  onBlastRadiusClick,
   onHardwareVisionClick,
   onCoreScanClick,
   onRoleChange,
@@ -202,6 +204,16 @@ export default function OmniHeader({
           className="border-purple-500/30 bg-purple-500/10 text-purple-400 hover:bg-purple-500/20"
           icon={<Search className="w-3 h-3 text-purple-400" />}
           label="RCA"
+        />
+
+        {/* Blast Radius */}
+        <HeaderButton
+          onClick={onBlastRadiusClick || (() => {})}
+          active={false}
+          activeClass=""
+          className="border-rose-500/30 bg-rose-500/10 text-rose-400 hover:bg-rose-500/20"
+          icon={<Network className="w-3 h-3 text-rose-400" />}
+          label="Blast"
         />
 
         {/* Hardware Vision */}

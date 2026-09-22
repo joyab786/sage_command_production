@@ -34,6 +34,7 @@ try:
     from api.event_bus_routes import router as event_bus_router
     from api.incident_routes import router as incident_router
     from api.rca_routes import router as rca_router
+    from api.blast_radius_routes import router as blast_radius_router
     from services.event_bus import get_event_bus
 except (ImportError, ModuleNotFoundError):
     from backend.core.config import SAGE_ALLOWED_ORIGINS, IS_PRODUCTION
@@ -60,6 +61,7 @@ except (ImportError, ModuleNotFoundError):
     from backend.api.event_bus_routes import router as event_bus_router
     from backend.api.incident_routes import router as incident_router
     from backend.api.rca_routes import router as rca_router
+    from backend.api.blast_radius_routes import router as blast_radius_router
     from backend.services.event_bus import get_event_bus
 
 app = FastAPI(title="SageCommand V3 Industrial Operations AI OS")
@@ -129,6 +131,7 @@ app.include_router(event_router)
 app.include_router(event_bus_router)
 app.include_router(incident_router)
 app.include_router(rca_router)
+app.include_router(blast_radius_router)
 
 # BOOT SEQUENCE
 if __name__ == "__main__":
