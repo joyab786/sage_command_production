@@ -59,3 +59,15 @@ export async function analyzePredictiveMaintenance(assetId: string, horizon: str
 export async function getPredictiveMaintenanceAssessment(assessmentId: string) {
   return fetchSage(`/v3/predictive-maintenance/assessment/${assessmentId}`);
 }
+
+// --- SLA / CUSTOMER RISK API ---
+export async function analyzeSLACustomerRisk(payload: any) {
+  return fetchSage("/api/v3/sla-customer-risk/analyze", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getSLACustomerRiskSummary(customerId: string) {
+  return fetchSage(`/api/v3/sla-customer-risk/customer/${customerId}/summary`);
+}
