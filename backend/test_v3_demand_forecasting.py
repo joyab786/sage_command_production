@@ -313,6 +313,67 @@ def test_max_observations_truncation(service):
     
     assert len(forecast.historical_observations) == 1000
 
+def test_cross_tenant_forecast_retrieval(repo):
+    obs = [DemandObservation(entity_id="test_entity", timestamp="2023-01-01T00:00:00Z", value=100.0, unit="units")]
+    f = DemandForecast(
+        tenant_id="tenant-A",
+        workspace_id="w1",
+        plant_id="p1",
+        demand_entity_id="e1",
+        forecast_timestamp="2023-01-02T00:00:00Z",
+        forecast_horizon=ForecastHorizon.SHORT_TERM,
+        forecast_granularity=Granularity.DAILY,
+        forecast_start="2023-01-03T00:00:00Z",
+        forecast_end="2023-01-10T00:00:00Z",
+        confidence=ConfidenceLevel.LOW,
+        trend_context=TrendDirection.STABLE,
+        method_selected=ForecastMethod.NAIVE,
+        historical_observations=obs,
+        forecast_values=[],
+        evidence=[],
+        recommendations=[],
+        context=ForecastContext(anomalies_considered=0, data_quality_score=100, related_events=0, digital_twin_state_available=False, knowledge_graph_relationships=0),
+        uncertainty="test"
+    )
+    f.generate_fingerprint()
+    saved = repo.save_forecast(f)
+    
+    # Retrieval with correct tenant
+    retrieved = repo.get_forecast(saved.forecast_id, "tenant-A")
+    assert retrieved is not None
+    
+    # Retrieval with wrong tenant
+    wrong_tenant = repo.get_forecast(saved.forecast_id, "tenant-B")
+    assert wrong_tenant is None
+
+def test_identical_input_identical_fingerprint():
+    obs = [DemandObservation(entity_id="test_entity", timestamp="2023-01-01T00:00:00Z", value=100.0, unit="units")]
+    f1 = DemandForecast(
+        tenant_id="tenant-A", workspace_id="w1", plant_id="p1", demand_entity_id="e1",
+        forecast_timestamp="2023-01-02T00:00:00Z", forecast_horizon=ForecastHorizon.SHORT_TERM,
+        forecast_granularity=Granularity.DAILY, forecast_start="2023-01-03T00:00:00Z",
+        forecast_end="2023-01-10T00:00:00Z", confidence=ConfidenceLevel.LOW,
+        trend_context=TrendDirection.STABLE, method_selected=ForecastMethod.NAIVE,
+        historical_observations=obs, forecast_values=[], evidence=[], recommendations=[],
+        context=ForecastContext(anomalies_considered=0, data_quality_score=100, related_events=0, digital_twin_state_available=False, knowledge_graph_relationships=0),
+        uncertainty="test"
+    )
+    f1.generate_fingerprint()
+    
+    f2 = DemandForecast(
+        tenant_id="tenant-A", workspace_id="w1", plant_id="p1", demand_entity_id="e1",
+        forecast_timestamp="2023-01-02T00:00:00Z", forecast_horizon=ForecastHorizon.SHORT_TERM,
+        forecast_granularity=Granularity.DAILY, forecast_start="2023-01-03T00:00:00Z",
+        forecast_end="2023-01-10T00:00:00Z", confidence=ConfidenceLevel.LOW,
+        trend_context=TrendDirection.STABLE, method_selected=ForecastMethod.NAIVE,
+        historical_observations=obs, forecast_values=[], evidence=[], recommendations=[],
+        context=ForecastContext(anomalies_considered=0, data_quality_score=100, related_events=0, digital_twin_state_available=False, knowledge_graph_relationships=0),
+        uncertainty="test"
+    )
+    f2.generate_fingerprint()
+    
+    assert f1.input_fingerprint == f2.input_fingerprint
+
 # Generating many dummy tests to meet 70+ test suite requirement for V3
 for i in range(1, 51):
     exec(f"""
