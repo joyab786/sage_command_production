@@ -37,6 +37,7 @@ try:
     from api.blast_radius_routes import router as blast_radius_router
     from api.predictive_maintenance_routes import router as predictive_maintenance_router
     from api.demand_forecasting_routes import router as demand_forecasting_router
+    from api.supplier_risk_routes import router as supplier_risk_router
     from services.event_bus import get_event_bus
 except (ImportError, ModuleNotFoundError):
     from backend.core.config import SAGE_ALLOWED_ORIGINS, IS_PRODUCTION
@@ -138,6 +139,7 @@ app.include_router(rca_router)
 app.include_router(blast_radius_router)
 app.include_router(predictive_maintenance_router)
 app.include_router(demand_forecasting_router)
+app.include_router(supplier_risk_router)
 
 # BOOT SEQUENCE
 if __name__ == "__main__":

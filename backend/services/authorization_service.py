@@ -146,6 +146,12 @@ CANONICAL_PERMISSIONS: List[Permission] = [
     Permission(permission_id="demand_forecasting.evaluate", resource="demand_forecasting", action="evaluate", description="Evaluate historical forecast accuracy via backtesting"),
     Permission(permission_id="demand_forecasting.admin", resource="demand_forecasting", action="admin", description="Administrative authority over demand forecasting settings", is_sensitive=True),
 
+    # Supplier Risk Intelligence Foundation (Prompt 23)
+    Permission(permission_id="supplier_risk.read", resource="supplier_risk", action="read", description="View supplier risk analytical intelligence"),
+    Permission(permission_id="supplier_risk.analyze", resource="supplier_risk", action="analyze", description="Trigger deterministic supplier risk analysis"),
+    Permission(permission_id="supplier_risk.history", resource="supplier_risk", action="history", description="View historical supplier risk assessments"),
+    Permission(permission_id="supplier_risk.admin", resource="supplier_risk", action="admin", description="Administrative authority over supplier risk settings", is_sensitive=True),
+
     # System Administration (Strictly Non-Operational)
     Permission(permission_id="user.manage", resource="user", action="manage", description="Create, update, or suspend user identities", is_sensitive=True),
     Permission(permission_id="system.config", resource="system", action="config", description="Configure platform infrastructure and endpoints", is_sensitive=True),
@@ -182,7 +188,7 @@ SYSTEM_ROLES: List[Role] = [
         role_id="VIEWER",
         name="Viewer",
         scope_type=RoleScopeType.SYSTEM,
-        permissions=["telemetry.read", "database.read", "action.read", "policy.read", "transaction.read", "ontology.read", "knowledge_graph.read", "digital_twin.read", "data_quality.read", "incidents.read", "rca.read", "blast_radius.read", "demand_forecasting.read"],
+        permissions=["telemetry.read", "database.read", "action.read", "policy.read", "transaction.read", "ontology.read", "knowledge_graph.read", "digital_twin.read", "data_quality.read", "incidents.read", "rca.read", "blast_radius.read", "demand_forecasting.read", "supplier_risk.read"],
         inherits_from=[],
         description="Read-only observer access to telemetry, action states, and policy rules.",
         is_system_role=True
@@ -191,7 +197,7 @@ SYSTEM_ROLES: List[Role] = [
         role_id="ANALYST",
         name="Analyst",
         scope_type=RoleScopeType.SYSTEM,
-        permissions=["sql.analyze", "action.simulate", "transaction.validate", "digital_twin.scenario", "data_quality.assess", "demand_forecasting.analyze", "demand_forecasting.evaluate"],
+        permissions=["sql.analyze", "action.simulate", "transaction.validate", "digital_twin.scenario", "data_quality.assess", "demand_forecasting.analyze", "demand_forecasting.evaluate", "supplier_risk.analyze", "supplier_risk.history"],
         inherits_from=["VIEWER"],
         description="Analytical access including query analysis, simulation preview, and data exploration.",
         is_system_role=True
@@ -262,7 +268,7 @@ SYSTEM_ROLES: List[Role] = [
         scope_type=RoleScopeType.SYSTEM,
         permissions=[
             "user.manage", "system.config", "tenant.admin", "role.assign",
-            "database.connection.create", "database.connection.admin", "ontology.manage", "knowledge_graph.manage", "digital_twin.manage", "data_quality.manage", "incidents.admin", "rca.admin", "blast_radius.admin", "demand_forecasting.admin"
+            "database.connection.create", "database.connection.admin", "ontology.manage", "knowledge_graph.manage", "digital_twin.manage", "data_quality.manage", "incidents.admin", "rca.admin", "blast_radius.admin", "demand_forecasting.admin", "supplier_risk.admin"
         ],
         inherits_from=["VIEWER"],
         description="Platform administrator. Strictly non-operational; cannot propose or approve factory actions.",
