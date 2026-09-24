@@ -27,15 +27,19 @@ api.sla_customer_risk_routes.sla_customer_risk_repository = test_repo
 import server
 client = TestClient(server.app)
 
-original_evaluate = services.authorization_service.authorization_service.evaluate
-def mock_evaluate(ctx):
-    return AuthorizationDecision(
-        effect=AuthzDecisionEffect.ALLOW,
-        reason_code=AuthzReasonCode.ALLOWED_BY_ROLE,
-        reason="Mocked",
-        decision_hash="mock"
-    )
-services.authorization_service.authorization_service.evaluate = mock_evaluate
+from unittest.mock import patch
+
+@pytest.fixture(autouse=True)
+def mock_authz_evaluate():
+    with patch("services.authorization_service.authorization_service.evaluate") as mock_eval:
+        mock_eval.return_value = AuthorizationDecision(
+            effect=AuthzDecisionEffect.ALLOW,
+            reason_code=AuthzReasonCode.ALLOWED,
+            reason="Mocked",
+            decision_hash="mock",
+            required_permission="mock:permission"
+        )
+        yield mock_eval
 
 @pytest.fixture
 def repo():

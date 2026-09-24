@@ -71,3 +71,19 @@ export async function analyzeSLACustomerRisk(payload: any) {
 export async function getSLACustomerRiskSummary(customerId: string) {
   return fetchSage(`/api/v3/sla-customer-risk/customer/${customerId}/summary`);
 }
+
+// --- FINANCIAL IMPACT API ---
+export async function analyzeFinancialImpact(payload: any) {
+  return fetchSage("/api/v3/financial-impact/analyze", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getFinancialImpactAssessment(assessmentId: string) {
+  return fetchSage(`/api/v3/financial-impact/${assessmentId}`);
+}
+
+export async function listFinancialImpactSummary(limit: number = 50) {
+  return fetchSage(`/api/v3/financial-impact/summary?limit=${limit}`);
+}

@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useState, useEffect } from 'react';
-import api from '../../lib/api';
+import * as api from '../../lib/api';
 
 interface SLACustomerRiskModalProps {
   isOpen: boolean;
