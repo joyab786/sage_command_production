@@ -87,3 +87,39 @@ export async function getFinancialImpactAssessment(assessmentId: string) {
 export async function listFinancialImpactSummary(limit: number = 50) {
   return fetchSage(`/api/v3/financial-impact/summary?limit=${limit}`);
 }
+
+// --- SUSTAINABILITY INTELLIGENCE API (Prompt 26 — ANALYTICAL ONLY) ---
+
+export async function analyzeSustainability(payload: any) {
+  return fetchSage("/api/v3/sustainability/analyze", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function runSustainabilityScenario(payload: any) {
+  return fetchSage("/api/v3/sustainability/scenario", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getSustainabilityAssessment(assessmentId: string) {
+  return fetchSage(`/api/v3/sustainability/${assessmentId}`);
+}
+
+export async function listSustainabilityAssessments(
+  limit: number = 50,
+  plantId?: string,
+  assetId?: string
+) {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (plantId) params.append("plant_id", plantId);
+  if (assetId) params.append("asset_id", assetId);
+  return fetchSage(`/api/v3/sustainability?${params.toString()}`);
+}
+
+export async function listSustainabilitySummary(limit: number = 50) {
+  return fetchSage(`/api/v3/sustainability/summary?limit=${limit}`);
+}
+
