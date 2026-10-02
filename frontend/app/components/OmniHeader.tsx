@@ -25,6 +25,7 @@ interface OmniHeaderProps {
   onAnomalyClick?: () => void;
   onRcaClick?: () => void;
   onBlastRadiusClick?: () => void;
+  onSensorFusionClick?: () => void;
   onHardwareVisionClick: () => void;
   onCoreScanClick: () => void;
   onRoleChange: (role: "operator" | "manager") => void;
@@ -52,6 +53,7 @@ export default function OmniHeader({
   onAnomalyClick,
   onRcaClick,
   onBlastRadiusClick,
+  onSensorFusionClick,
   onHardwareVisionClick,
   onCoreScanClick,
   onRoleChange,
@@ -214,6 +216,16 @@ export default function OmniHeader({
           className="border-rose-500/30 bg-rose-500/10 text-rose-400 hover:bg-rose-500/20"
           icon={<Network className="w-3 h-3 text-rose-400" />}
           label="Blast"
+        />
+
+        {/* Sensor Fusion */}
+        <HeaderButton
+          onClick={onSensorFusionClick || (() => {})}
+          active={false}
+          activeClass=""
+          className="border-cyan-500/30 bg-cyan-500/10 text-cyan-300 hover:bg-cyan-500/20"
+          icon={<Layers className="w-3 h-3 text-cyan-300" />}
+          label="Fusion"
         />
 
         {/* Hardware Vision */}

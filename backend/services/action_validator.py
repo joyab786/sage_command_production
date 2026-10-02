@@ -10,7 +10,7 @@ Also provides safe simulation/preview generation without modifying real operatio
 import math
 import re
 from datetime import datetime
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
 
 try:
     from core.auth import Identity

@@ -123,3 +123,31 @@ export async function listSustainabilitySummary(limit: number = 50) {
   return fetchSage(`/api/v3/sustainability/summary?limit=${limit}`);
 }
 
+// --- MULTIMODAL SENSOR FUSION API (Prompt 27 — ANALYTICAL ONLY) ---
+
+export async function analyzeSensorFusion(payload: any) {
+  return fetchSage("/api/v3/sensor-fusion/analyze", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getSensorFusionAssessment(assessmentId: string) {
+  return fetchSage(`/api/v3/sensor-fusion/assessment/${assessmentId}`);
+}
+
+export async function listSensorFusionAssessments(
+  limit: number = 50,
+  targetEntityId?: string,
+  plantId?: string
+) {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (targetEntityId) params.append("target_entity_id", targetEntityId);
+  if (plantId) params.append("plant_id", plantId);
+  return fetchSage(`/api/v3/sensor-fusion/assessments?${params.toString()}`);
+}
+
+export async function getSensorEntitySummary(entityId: string) {
+  return fetchSage(`/api/v3/sensor-fusion/entities/${entityId}/summary`);
+}
+
