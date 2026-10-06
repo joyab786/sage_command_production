@@ -26,6 +26,7 @@ interface OmniHeaderProps {
   onRcaClick?: () => void;
   onBlastRadiusClick?: () => void;
   onSensorFusionClick?: () => void;
+  onWhatIfClick?: () => void;
   onHardwareVisionClick: () => void;
   onCoreScanClick: () => void;
   onRoleChange: (role: "operator" | "manager") => void;
@@ -54,6 +55,7 @@ export default function OmniHeader({
   onRcaClick,
   onBlastRadiusClick,
   onSensorFusionClick,
+  onWhatIfClick,
   onHardwareVisionClick,
   onCoreScanClick,
   onRoleChange,
@@ -226,6 +228,16 @@ export default function OmniHeader({
           className="border-cyan-500/30 bg-cyan-500/10 text-cyan-300 hover:bg-cyan-500/20"
           icon={<Layers className="w-3 h-3 text-cyan-300" />}
           label="Fusion"
+        />
+
+        {/* What-If Simulation */}
+        <HeaderButton
+          onClick={onWhatIfClick || (() => {})}
+          active={false}
+          activeClass=""
+          className="border-blue-500/30 bg-blue-500/10 text-blue-300 hover:bg-blue-500/20"
+          icon={<Box className="w-3 h-3 text-blue-300" />}
+          label="What-If"
         />
 
         {/* Hardware Vision */}

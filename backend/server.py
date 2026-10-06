@@ -42,6 +42,7 @@ try:
     from api.financial_impact_routes import router as financial_impact_router
     from api.sustainability_routes import router as sustainability_router
     from api.sensor_fusion_routes import router as sensor_fusion_router
+    from api.what_if_simulation_routes import router as what_if_simulation_router
     from services.event_bus import get_event_bus
 except (ImportError, ModuleNotFoundError):
     from backend.core.config import SAGE_ALLOWED_ORIGINS, IS_PRODUCTION
@@ -76,6 +77,7 @@ except (ImportError, ModuleNotFoundError):
     from backend.api.financial_impact_routes import router as financial_impact_router
     from backend.api.sustainability_routes import router as sustainability_router
     from backend.api.sensor_fusion_routes import router as sensor_fusion_router
+    from backend.api.what_if_simulation_routes import router as what_if_simulation_router
     from backend.services.event_bus import get_event_bus
 
 app = FastAPI(title="SageCommand V3 Industrial Operations AI OS")
@@ -153,6 +155,7 @@ app.include_router(sla_customer_risk_router)
 app.include_router(financial_impact_router)
 app.include_router(sustainability_router)
 app.include_router(sensor_fusion_router)
+app.include_router(what_if_simulation_router)
 
 # BOOT SEQUENCE
 if __name__ == "__main__":

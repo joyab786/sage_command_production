@@ -151,3 +151,36 @@ export async function getSensorEntitySummary(entityId: string) {
   return fetchSage(`/api/v3/sensor-fusion/entities/${entityId}/summary`);
 }
 
+// --- WHAT-IF SIMULATION INTELLIGENCE API (Prompt 28 — ANALYTICAL ONLY) ---
+
+export async function analyzeWhatIfSimulation(payload: any) {
+  return fetchSage("/api/v3/what-if-simulation/analyze", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getWhatIfSimulation(simulationId: string) {
+  return fetchSage(`/api/v3/what-if-simulation/${simulationId}`);
+}
+
+export async function listWhatIfSimulations(
+  limit: number = 50,
+  workspaceId?: string,
+  plantId?: string
+) {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (workspaceId) params.append("workspace_id", workspaceId);
+  if (plantId) params.append("plant_id", plantId);
+  return fetchSage(`/api/v3/what-if-simulation?${params.toString()}`);
+}
+
+export async function getWhatIfSimulationImpact(simulationId: string) {
+  return fetchSage(`/api/v3/what-if-simulation/${simulationId}/impact`);
+}
+
+export async function getWhatIfSimulationEvidence(simulationId: string) {
+  return fetchSage(`/api/v3/what-if-simulation/${simulationId}/evidence`);
+}
+
+
