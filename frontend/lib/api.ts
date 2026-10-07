@@ -183,4 +183,41 @@ export async function getWhatIfSimulationEvidence(simulationId: string) {
   return fetchSage(`/api/v3/what-if-simulation/${simulationId}/evidence`);
 }
 
+// --- OPTIMIZATION INTELLIGENCE API (Prompt 29 — ANALYTICAL DECISION SUPPORT ONLY) ---
+
+export async function analyzeOptimization(payload: any) {
+  return fetchSage("/api/v3/optimization/analyze", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getOptimization(optimizationId: string) {
+  return fetchSage(`/api/v3/optimization/${optimizationId}`);
+}
+
+export async function listOptimizations(
+  limit: number = 50,
+  workspaceId?: string,
+  plantId?: string
+) {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (workspaceId) params.append("workspace_id", workspaceId);
+  if (plantId) params.append("plant_id", plantId);
+  return fetchSage(`/api/v3/optimization?${params.toString()}`);
+}
+
+export async function getOptimizationCandidates(optimizationId: string) {
+  return fetchSage(`/api/v3/optimization/${optimizationId}/candidates`);
+}
+
+export async function getOptimizationSensitivity(optimizationId: string) {
+  return fetchSage(`/api/v3/optimization/${optimizationId}/sensitivity`);
+}
+
+export async function getOptimizationEvidence(optimizationId: string) {
+  return fetchSage(`/api/v3/optimization/${optimizationId}/evidence`);
+}
+
+
 

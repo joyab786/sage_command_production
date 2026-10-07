@@ -22,6 +22,7 @@ import { RCAModal } from "./components/RCAModal";
 import { BlastRadiusModal } from "./components/BlastRadiusModal";
 import SensorFusionModal from "./components/SensorFusionModal";
 import WhatIfSimulationModal from "./components/WhatIfSimulationModal";
+import OptimizationModal from "./components/OptimizationModal";
 
 export default function ObsidianCommandCenter() {
   // --- CORE STATE ---
@@ -79,6 +80,9 @@ export default function ObsidianCommandCenter() {
 
   // --- WHAT-IF SIMULATION STATE ---
   const [showWhatIfModal, setShowWhatIfModal] = useState(false);
+
+  // --- OPTIMIZATION INTELLIGENCE STATE ---
+  const [showOptimizationModal, setShowOptimizationModal] = useState(false);
 
   // --- SECURITY INTRUSION ALERT STATE ---
   const [securityAlert, setSecurityAlert] = useState<{
@@ -405,6 +409,7 @@ export default function ObsidianCommandCenter() {
         onBlastRadiusClick={() => setShowBlastRadiusModal(true)}
         onSensorFusionClick={() => setShowSensorFusionModal(true)}
         onWhatIfClick={() => setShowWhatIfModal(true)}
+        onOptimizationClick={() => setShowOptimizationModal(true)}
         onHardwareVisionClick={() => imageInputRef.current?.click()}
         onCoreScanClick={triggerScan}
         onRoleChange={setUserRole}
@@ -539,6 +544,11 @@ export default function ObsidianCommandCenter() {
       <WhatIfSimulationModal
         isOpen={showWhatIfModal}
         onClose={() => setShowWhatIfModal(false)}
+      />
+
+      <OptimizationModal
+        isOpen={showOptimizationModal}
+        onClose={() => setShowOptimizationModal(false)}
       />
     </div>
   );
