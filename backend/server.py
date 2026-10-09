@@ -45,6 +45,7 @@ try:
     from api.what_if_simulation_routes import router as what_if_simulation_router
     from api.optimization_routes import router as optimization_router
     from api.decision_engine_routes import router as decision_engine_router
+    from api.evidence_explainability_routes import router as evidence_explainability_router
     from services.event_bus import get_event_bus
 except (ImportError, ModuleNotFoundError):
     from backend.core.config import SAGE_ALLOWED_ORIGINS, IS_PRODUCTION
@@ -82,6 +83,7 @@ except (ImportError, ModuleNotFoundError):
     from backend.api.what_if_simulation_routes import router as what_if_simulation_router
     from backend.api.optimization_routes import router as optimization_router
     from backend.api.decision_engine_routes import router as decision_engine_router
+    from backend.api.evidence_explainability_routes import router as evidence_explainability_router
     from backend.services.event_bus import get_event_bus
 
 app = FastAPI(title="SageCommand V3 Industrial Operations AI OS")
@@ -162,6 +164,7 @@ app.include_router(sensor_fusion_router)
 app.include_router(what_if_simulation_router)
 app.include_router(optimization_router)
 app.include_router(decision_engine_router)
+app.include_router(evidence_explainability_router)
 
 # BOOT SEQUENCE
 if __name__ == "__main__":

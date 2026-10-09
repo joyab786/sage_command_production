@@ -29,6 +29,7 @@ interface OmniHeaderProps {
   onWhatIfClick?: () => void;
   onOptimizationClick?: () => void;
   onDecisionEngineClick?: () => void;
+  onExplainabilityClick?: () => void;
   onHardwareVisionClick: () => void;
   onCoreScanClick: () => void;
   onRoleChange: (role: "operator" | "manager") => void;
@@ -60,6 +61,7 @@ export default function OmniHeader({
   onWhatIfClick,
   onOptimizationClick,
   onDecisionEngineClick,
+  onExplainabilityClick,
   onHardwareVisionClick,
   onCoreScanClick,
   onRoleChange,
@@ -262,6 +264,16 @@ export default function OmniHeader({
           className="border-violet-500/30 bg-violet-500/10 text-violet-300 hover:bg-violet-500/20"
           icon={<Compass className="w-3 h-3 text-violet-300" />}
           label="Decisions"
+        />
+
+        {/* Evidence & Explainability Foundation */}
+        <HeaderButton
+          onClick={onExplainabilityClick || (() => {})}
+          active={false}
+          activeClass=""
+          className="border-cyan-500/30 bg-cyan-500/10 text-cyan-300 hover:bg-cyan-500/20"
+          icon={<FileText className="w-3 h-3 text-cyan-300" />}
+          label="Explain"
         />
 
         {/* Hardware Vision */}

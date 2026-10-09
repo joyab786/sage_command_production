@@ -24,6 +24,7 @@ import SensorFusionModal from "./components/SensorFusionModal";
 import WhatIfSimulationModal from "./components/WhatIfSimulationModal";
 import OptimizationModal from "./components/OptimizationModal";
 import DecisionEngineModal from "./components/DecisionEngineModal";
+import EvidenceExplainabilityModal from "./components/EvidenceExplainabilityModal";
 
 export default function ObsidianCommandCenter() {
   // --- CORE STATE ---
@@ -87,6 +88,9 @@ export default function ObsidianCommandCenter() {
 
   // --- DECISION ENGINE FOUNDATION STATE ---
   const [showDecisionEngineModal, setShowDecisionEngineModal] = useState(false);
+
+  // --- EVIDENCE & EXPLAINABILITY FOUNDATION STATE ---
+  const [showEvidenceExplainabilityModal, setShowEvidenceExplainabilityModal] = useState(false);
 
   // --- SECURITY INTRUSION ALERT STATE ---
   const [securityAlert, setSecurityAlert] = useState<{
@@ -415,6 +419,7 @@ export default function ObsidianCommandCenter() {
         onWhatIfClick={() => setShowWhatIfModal(true)}
         onOptimizationClick={() => setShowOptimizationModal(true)}
         onDecisionEngineClick={() => setShowDecisionEngineModal(true)}
+        onExplainabilityClick={() => setShowEvidenceExplainabilityModal(true)}
         onHardwareVisionClick={() => imageInputRef.current?.click()}
         onCoreScanClick={triggerScan}
         onRoleChange={setUserRole}
@@ -559,6 +564,11 @@ export default function ObsidianCommandCenter() {
       <DecisionEngineModal
         isOpen={showDecisionEngineModal}
         onClose={() => setShowDecisionEngineModal(false)}
+      />
+
+      <EvidenceExplainabilityModal
+        isOpen={showEvidenceExplainabilityModal}
+        onClose={() => setShowEvidenceExplainabilityModal(false)}
       />
     </div>
   );

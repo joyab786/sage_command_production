@@ -257,5 +257,47 @@ export async function getDecisionAudit(decisionId: string) {
   return fetchSage(`/api/v3/decision-engine/${decisionId}/audit`);
 }
 
+// --- EVIDENCE AND EXPLAINABILITY API (Prompt 31 — READ-ONLY EXPLAINABILITY) ---
 
+export async function explainEvidence(payload: any) {
+  return fetchSage("/api/v3/evidence-explainability/explain", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
 
+export async function validateEvidence(payload: any) {
+  return fetchSage("/api/v3/evidence-explainability/validate", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getExplanation(explanationId: string) {
+  return fetchSage(`/api/v3/evidence-explainability/${explanationId}`);
+}
+
+export async function getExplanationLineage(explanationId: string) {
+  return fetchSage(`/api/v3/evidence-explainability/${explanationId}/lineage`);
+}
+
+export async function getExplanationEvidence(explanationId: string) {
+  return fetchSage(`/api/v3/evidence-explainability/${explanationId}/evidence`);
+}
+
+export async function getExplanationAudit(explanationId: string) {
+  return fetchSage(`/api/v3/evidence-explainability/${explanationId}/audit`);
+}
+
+export async function listExplanations(
+  limit: number = 50,
+  workspaceId?: string,
+  plantId?: string,
+  targetType?: string
+) {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (workspaceId) params.append("workspace_id", workspaceId);
+  if (plantId) params.append("plant_id", plantId);
+  if (targetType) params.append("target_type", targetType);
+  return fetchSage(`/api/v3/evidence-explainability?${params.toString()}`);
+}
