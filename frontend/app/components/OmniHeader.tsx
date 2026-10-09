@@ -1,7 +1,7 @@
 "use client";
 import React from "react";
 import { motion } from "framer-motion";
-import { Activity, Terminal, Database, Search, FileText, Layers, Network, Box, ShieldAlert } from "lucide-react";
+import { Activity, Terminal, Database, Search, FileText, Layers, Network, Box, ShieldAlert, Compass } from "lucide-react";
 
 interface OmniHeaderProps {
   systemStatus: string;
@@ -28,6 +28,7 @@ interface OmniHeaderProps {
   onSensorFusionClick?: () => void;
   onWhatIfClick?: () => void;
   onOptimizationClick?: () => void;
+  onDecisionEngineClick?: () => void;
   onHardwareVisionClick: () => void;
   onCoreScanClick: () => void;
   onRoleChange: (role: "operator" | "manager") => void;
@@ -58,6 +59,7 @@ export default function OmniHeader({
   onSensorFusionClick,
   onWhatIfClick,
   onOptimizationClick,
+  onDecisionEngineClick,
   onHardwareVisionClick,
   onCoreScanClick,
   onRoleChange,
@@ -250,6 +252,16 @@ export default function OmniHeader({
           className="border-emerald-500/30 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20"
           icon={<Layers className="w-3 h-3 text-emerald-300" />}
           label="Optimize"
+        />
+
+        {/* Decision Engine Foundation */}
+        <HeaderButton
+          onClick={onDecisionEngineClick || (() => {})}
+          active={false}
+          activeClass=""
+          className="border-violet-500/30 bg-violet-500/10 text-violet-300 hover:bg-violet-500/20"
+          icon={<Compass className="w-3 h-3 text-violet-300" />}
+          label="Decisions"
         />
 
         {/* Hardware Vision */}

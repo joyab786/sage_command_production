@@ -170,6 +170,11 @@ CANONICAL_PERMISSIONS: List[Permission] = [
     Permission(permission_id="optimization.evaluate", resource="optimization", action="evaluate", description="Evaluate candidate solutions, constraint violations, trade-offs, and sensitivity"),
     Permission(permission_id="optimization.admin", resource="optimization", action="admin", description="Administrative authority over optimization parameters, solvers, and limits", is_sensitive=True),
 
+    # Decision Engine Foundation (Prompt 30)
+    Permission(permission_id="decision_engine.read", resource="decision_engine", action="read", description="View decision problems, candidate options, evaluations, trade-offs, and audit ledger"),
+    Permission(permission_id="decision_engine.evaluate", resource="decision_engine", action="evaluate", description="Evaluate decision problems deterministically against policies and constraints"),
+    Permission(permission_id="decision_engine.admin", resource="decision_engine", action="admin", description="Administrative authority over decision engine policies and bounds", is_sensitive=True),
+
     # System Administration (Strictly Non-Operational)
     Permission(permission_id="user.manage", resource="user", action="manage", description="Create, update, or suspend user identities", is_sensitive=True),
     Permission(permission_id="system.config", resource="system", action="config", description="Configure platform infrastructure and endpoints", is_sensitive=True),
@@ -206,7 +211,7 @@ SYSTEM_ROLES: List[Role] = [
         role_id="VIEWER",
         name="Viewer",
         scope_type=RoleScopeType.SYSTEM,
-        permissions=["telemetry.read", "database.read", "action.read", "policy.read", "transaction.read", "ontology.read", "knowledge_graph.read", "digital_twin.read", "data_quality.read", "incidents.read", "rca.read", "blast_radius.read", "demand_forecasting.read", "supplier_risk.read", "sensor_fusion.read", "what_if_simulation.read", "optimization.read"],
+        permissions=["telemetry.read", "database.read", "action.read", "policy.read", "transaction.read", "ontology.read", "knowledge_graph.read", "digital_twin.read", "data_quality.read", "incidents.read", "rca.read", "blast_radius.read", "demand_forecasting.read", "supplier_risk.read", "sensor_fusion.read", "what_if_simulation.read", "optimization.read", "decision_engine.read"],
         inherits_from=[],
         description="Read-only observer access to telemetry, action states, and policy rules.",
         is_system_role=True
@@ -215,7 +220,7 @@ SYSTEM_ROLES: List[Role] = [
         role_id="ANALYST",
         name="Analyst",
         scope_type=RoleScopeType.SYSTEM,
-        permissions=["sql.analyze", "action.simulate", "transaction.validate", "digital_twin.scenario", "data_quality.assess", "demand_forecasting.analyze", "demand_forecasting.evaluate", "supplier_risk.analyze", "supplier_risk.history", "sensor_fusion.analyze", "sensor_fusion.evaluate", "what_if_simulation.analyze", "what_if_simulation.evaluate", "optimization.analyze", "optimization.evaluate"],
+        permissions=["sql.analyze", "action.simulate", "transaction.validate", "digital_twin.scenario", "data_quality.assess", "demand_forecasting.analyze", "demand_forecasting.evaluate", "supplier_risk.analyze", "supplier_risk.history", "sensor_fusion.analyze", "sensor_fusion.evaluate", "what_if_simulation.analyze", "what_if_simulation.evaluate", "optimization.analyze", "optimization.evaluate", "decision_engine.evaluate"],
         inherits_from=["VIEWER"],
         description="Analytical access including query analysis, simulation preview, and data exploration.",
         is_system_role=True
@@ -286,7 +291,7 @@ SYSTEM_ROLES: List[Role] = [
         scope_type=RoleScopeType.SYSTEM,
         permissions=[
             "user.manage", "system.config", "tenant.admin", "role.assign",
-            "database.connection.create", "database.connection.admin", "ontology.manage", "knowledge_graph.manage", "digital_twin.manage", "data_quality.manage", "incidents.admin", "rca.admin", "blast_radius.admin", "demand_forecasting.admin", "supplier_risk.admin", "sensor_fusion.admin", "what_if_simulation.admin", "optimization.admin"
+            "database.connection.create", "database.connection.admin", "ontology.manage", "knowledge_graph.manage", "digital_twin.manage", "data_quality.manage", "incidents.admin", "rca.admin", "blast_radius.admin", "demand_forecasting.admin", "supplier_risk.admin", "sensor_fusion.admin", "what_if_simulation.admin", "optimization.admin", "decision_engine.admin"
         ],
         inherits_from=["VIEWER"],
         description="Platform administrator. Strictly non-operational; cannot propose or approve factory actions.",

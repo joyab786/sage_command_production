@@ -219,5 +219,43 @@ export async function getOptimizationEvidence(optimizationId: string) {
   return fetchSage(`/api/v3/optimization/${optimizationId}/evidence`);
 }
 
+// --- DECISION ENGINE FOUNDATION API (Prompt 30 — ANALYTICAL DECISION SUPPORT ONLY) ---
+
+export async function evaluateDecision(payload: any) {
+  return fetchSage("/api/v3/decision-engine/evaluate", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getDecision(decisionId: string) {
+  return fetchSage(`/api/v3/decision-engine/${decisionId}`);
+}
+
+export async function listDecisions(
+  limit: number = 50,
+  workspaceId?: string,
+  plantId?: string,
+  decisionType?: string
+) {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (workspaceId) params.append("workspace_id", workspaceId);
+  if (plantId) params.append("plant_id", plantId);
+  if (decisionType) params.append("decision_type", decisionType);
+  return fetchSage(`/api/v3/decision-engine?${params.toString()}`);
+}
+
+export async function getDecisionAlternatives(decisionId: string) {
+  return fetchSage(`/api/v3/decision-engine/${decisionId}/alternatives`);
+}
+
+export async function getDecisionEvidence(decisionId: string) {
+  return fetchSage(`/api/v3/decision-engine/${decisionId}/evidence`);
+}
+
+export async function getDecisionAudit(decisionId: string) {
+  return fetchSage(`/api/v3/decision-engine/${decisionId}/audit`);
+}
+
 
 
