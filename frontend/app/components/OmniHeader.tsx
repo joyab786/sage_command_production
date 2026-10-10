@@ -30,6 +30,7 @@ interface OmniHeaderProps {
   onOptimizationClick?: () => void;
   onDecisionEngineClick?: () => void;
   onExplainabilityClick?: () => void;
+  onConfidenceClick?: () => void;
   onHardwareVisionClick: () => void;
   onCoreScanClick: () => void;
   onRoleChange: (role: "operator" | "manager") => void;
@@ -62,6 +63,7 @@ export default function OmniHeader({
   onOptimizationClick,
   onDecisionEngineClick,
   onExplainabilityClick,
+  onConfidenceClick,
   onHardwareVisionClick,
   onCoreScanClick,
   onRoleChange,
@@ -274,6 +276,16 @@ export default function OmniHeader({
           className="border-cyan-500/30 bg-cyan-500/10 text-cyan-300 hover:bg-cyan-500/20"
           icon={<FileText className="w-3 h-3 text-cyan-300" />}
           label="Explain"
+        />
+
+        {/* Confidence & Uncertainty Intelligence Foundation */}
+        <HeaderButton
+          onClick={onConfidenceClick || (() => {})}
+          active={false}
+          activeClass=""
+          className="border-indigo-500/30 bg-indigo-500/10 text-indigo-300 hover:bg-indigo-500/20"
+          icon={<ShieldAlert className="w-3 h-3 text-indigo-300" />}
+          label="Confidence"
         />
 
         {/* Hardware Vision */}
