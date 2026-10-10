@@ -19,6 +19,7 @@ Invariants:
    RETRIEVAL_ONLY response with authoritative citations and evidence metadata.
 """
 
+import logging
 import hashlib
 import json
 import math
@@ -29,6 +30,8 @@ import uuid
 import unicodedata
 from typing import Dict, Any, List, Optional, Tuple, Set
 from datetime import datetime, timezone
+
+logger = logging.getLogger("sop_rag_service")
 
 try:
     from core.config import (
@@ -66,6 +69,9 @@ try:
         FreshnessStatus,
         SOPAuditRecord,
         MANDATORY_SOP_RAG_NOTICE,
+        VALID_LIFECYCLE_TRANSITIONS,
+        CLASSIFICATION_CLEARANCE_MAP,
+        get_allowed_classifications_for_clearance,
     )
     from data.schemas.evidence_explainability_contract import (
         EvidenceRecord,
@@ -117,6 +123,9 @@ except (ImportError, ModuleNotFoundError):
         FreshnessStatus,
         SOPAuditRecord,
         MANDATORY_SOP_RAG_NOTICE,
+        VALID_LIFECYCLE_TRANSITIONS,
+        CLASSIFICATION_CLEARANCE_MAP,
+        get_allowed_classifications_for_clearance,
     )
     from backend.data.schemas.evidence_explainability_contract import (
         EvidenceRecord,
@@ -169,14 +178,18 @@ class SOPRAGService:
         actor_id: str,
         authoritative_tenant_id: str,
         clearance_level: int = 1,
+        user_permissions: Optional[List[str]] = None,
+        is_admin: bool = False,
     ) -> IngestionResult:
         """
         Deterministic, validated ingestion pipeline for SOP documents.
         Enforces tenant isolation, input normalization, content deduplication,
-        safe heading-aware chunking, and append-only audit tracking.
+        safe heading-aware chunking, governed publication authorization,
+        and append-only audit tracking.
         """
         now_ts = datetime.now(timezone.utc).isoformat()
         tenant_id = authoritative_tenant_id  # Strictly server-derived
+        effective_is_admin = is_admin or ("sop_rag.admin" in (user_permissions or []))
 
         # 1. Size & safety validation
         content_bytes = request.content.encode("utf-8")
@@ -233,35 +246,102 @@ class SOPRAGService:
         # 3. Content fingerprint calculation (SHA-256)
         content_digest = hashlib.sha256(normalized_text.encode("utf-8")).hexdigest()
 
-        # 4. Duplicate content & revision detection
+        # 4. Duplicate content, revision, and lifecycle overwrite safety check
         existing_doc = self.repository.get_document(
             tenant_id=tenant_id,
             document_id=request.document_id,
             version=request.version,
         )
-        if existing_doc and existing_doc.content_digest == content_digest:
-            # Unchanged duplicate submission of existing revision
-            self._record_audit(
-                tenant_id=tenant_id,
-                actor_id=actor_id,
-                event_type="DOCUMENT_INGESTED",
-                document_id=request.document_id,
-                outcome="SUCCESS",
-                detail=f"Identical duplicate document version '{request.version}' detected; preserved existing state.",
-            )
-            return IngestionResult(
-                document_id=request.document_id,
-                version=request.version,
-                tenant_id=tenant_id,
-                lifecycle_status=existing_doc.lifecycle_status,
-                total_chunks=existing_doc.total_chunks,
-                content_digest=content_digest,
-                is_duplicate=True,
-                is_revision=False,
-                ingestion_status="UNCHANGED_DUPLICATE",
-                validation_errors=[],
-                ingested_at=now_ts,
-            )
+        if existing_doc:
+            # A revoked document can NEVER be re-ingested or reactivated
+            if existing_doc.lifecycle_status == DocumentLifecycleStatus.REVOKED:
+                err_msg = f"Document '{request.document_id}' v{request.version} has been REVOKED and cannot be modified, re-ingested, or reactivated."
+                self._record_audit(
+                    tenant_id=tenant_id,
+                    actor_id=actor_id,
+                    event_type="INGESTION_FAILED",
+                    document_id=request.document_id,
+                    outcome="FAILED",
+                    detail=err_msg,
+                )
+                return IngestionResult(
+                    document_id=request.document_id,
+                    version=request.version,
+                    tenant_id=tenant_id,
+                    lifecycle_status=DocumentLifecycleStatus.REVOKED,
+                    total_chunks=existing_doc.total_chunks,
+                    content_digest=existing_doc.content_digest,
+                    is_duplicate=False,
+                    is_revision=False,
+                    ingestion_status="FAILED",
+                    validation_errors=[err_msg],
+                    ingested_at=now_ts,
+                )
+
+            # A published document cannot be silently overwritten under the same version
+            if existing_doc.lifecycle_status == DocumentLifecycleStatus.PUBLISHED:
+                if existing_doc.content_digest == content_digest:
+                    # Unchanged duplicate submission of existing published revision
+                    self._record_audit(
+                        tenant_id=tenant_id,
+                        actor_id=actor_id,
+                        event_type="DOCUMENT_INGESTED",
+                        document_id=request.document_id,
+                        outcome="SUCCESS",
+                        detail=f"Identical duplicate published document version '{request.version}' detected; preserved existing state.",
+                    )
+                    return IngestionResult(
+                        document_id=request.document_id,
+                        version=request.version,
+                        tenant_id=tenant_id,
+                        lifecycle_status=existing_doc.lifecycle_status,
+                        total_chunks=existing_doc.total_chunks,
+                        content_digest=content_digest,
+                        is_duplicate=True,
+                        is_revision=False,
+                        ingestion_status="UNCHANGED_DUPLICATE",
+                        validation_errors=[],
+                        ingested_at=now_ts,
+                    )
+                else:
+                    err_msg = f"Document '{request.document_id}' v{request.version} is already PUBLISHED and cannot be overwritten with different content under the same version."
+                    self._record_audit(
+                        tenant_id=tenant_id,
+                        actor_id=actor_id,
+                        event_type="INGESTION_FAILED",
+                        document_id=request.document_id,
+                        outcome="FAILED",
+                        detail=err_msg,
+                    )
+                    return IngestionResult(
+                        document_id=request.document_id,
+                        version=request.version,
+                        tenant_id=tenant_id,
+                        lifecycle_status=existing_doc.lifecycle_status,
+                        total_chunks=existing_doc.total_chunks,
+                        content_digest=existing_doc.content_digest,
+                        is_duplicate=False,
+                        is_revision=False,
+                        ingestion_status="FAILED",
+                        validation_errors=[err_msg],
+                        ingested_at=now_ts,
+                    )
+
+            if existing_doc.lifecycle_status == DocumentLifecycleStatus.DRAFT and existing_doc.content_digest == content_digest:
+                # Unchanged duplicate submission of existing draft revision
+                return IngestionResult(
+                    document_id=request.document_id,
+                    version=request.version,
+                    tenant_id=tenant_id,
+                    lifecycle_status=existing_doc.lifecycle_status,
+                    total_chunks=existing_doc.total_chunks,
+                    content_digest=content_digest,
+                    is_duplicate=True,
+                    is_revision=False,
+                    ingestion_status="UNCHANGED_DUPLICATE",
+                    validation_errors=[],
+                    ingested_at=now_ts,
+                )
 
         # Check if this document exists under an earlier version (Revision detection)
         any_existing = self.repository.get_document(
@@ -270,7 +350,44 @@ class SOPRAGService:
         )
         is_revision = bool(any_existing and any_existing.version != request.version)
 
-        # 5. Deterministic Chunking
+        # 5. Authoritative Lifecycle & Approval Governance Determination
+        # Ordinary ingestion cannot publish a document. Client-supplied approval is never trusted.
+        validation_warnings: List[str] = []
+        if request.lifecycle_status == DocumentLifecycleStatus.PUBLISHED:
+            if not effective_is_admin:
+                # Non-admin attempted direct publication: fail closed, retain as DRAFT
+                authoritative_lifecycle_status = DocumentLifecycleStatus.DRAFT
+                validation_warnings.append(
+                    "Direct publication denied: non-administrative caller lacks 'sop_rag.admin' authority. Document retained as DRAFT."
+                )
+                approval_meta = DocumentApprovalMetadata(
+                    approved_by=None,
+                    approval_timestamp=None,
+                    approval_id=None,
+                    approval_role=None,
+                    is_verified=False,
+                )
+            else:
+                # Admin caller authorized to publish: server authoritatively establishes approval
+                authoritative_lifecycle_status = DocumentLifecycleStatus.PUBLISHED
+                approval_meta = DocumentApprovalMetadata(
+                    approved_by=actor_id,
+                    approval_timestamp=now_ts,
+                    approval_id=f"appr_{uuid.uuid4().hex[:8]}",
+                    approval_role="ADMINISTRATOR",
+                    is_verified=True,
+                )
+        else:
+            authoritative_lifecycle_status = request.lifecycle_status  # DRAFT or other non-published state
+            approval_meta = DocumentApprovalMetadata(
+                approved_by=None,
+                approval_timestamp=None,
+                approval_id=None,
+                approval_role=None,
+                is_verified=False,
+            )
+
+        # 6. Deterministic Chunking (chunks inherit authoritative lifecycle and classification)
         chunk_size = request.chunk_size_chars or SAGE_SOP_DEFAULT_CHUNK_SIZE_CHARS
         chunk_overlap = request.chunk_overlap_chars or SAGE_SOP_DEFAULT_CHUNK_OVERLAP_CHARS
 
@@ -282,7 +399,7 @@ class SOPRAGService:
                 plant_id=request.plant_id,
                 classification=request.classification,
                 access_control_roles=request.access_control_roles,
-                lifecycle_status=request.lifecycle_status,
+                lifecycle_status=authoritative_lifecycle_status,
                 text=normalized_text,
                 target_chunk_size=chunk_size,
                 overlap=chunk_overlap,
@@ -336,7 +453,7 @@ class SOPRAGService:
                 ingested_at=now_ts,
             )
 
-        # 6. Provenance & Lineage construction
+        # 7. Provenance & Lineage construction
         provenance = DocumentProvenanceInfo(
             source_identifier=request.document_id,
             source_uri=request.source_uri,
@@ -357,10 +474,10 @@ class SOPRAGService:
             document_type=request.document_type,
             operational_domain=request.operational_domain,
             version=request.version,
-            lifecycle_status=request.lifecycle_status,
+            lifecycle_status=authoritative_lifecycle_status,
             effective_from=request.effective_from,
             effective_until=request.effective_until,
-            approval_metadata=request.approval_metadata,
+            approval_metadata=approval_meta,
             classification=request.classification,
             access_control_roles=request.access_control_roles,
             content_digest=content_digest,
@@ -374,10 +491,13 @@ class SOPRAGService:
             validation_errors=[],
         )
 
-        # 7. Persist document and chunks atomically
+        # 8. Persist document and chunks atomically
         self.repository.save_document(sop_doc)
 
-        # 8. Audit ledger recording
+        # 9. Audit ledger recording
+        audit_detail = f"Successfully ingested SOP '{request.title}' v{request.version} ({len(chunks)} chunks) as {authoritative_lifecycle_status.value}."
+        if validation_warnings:
+            audit_detail += f" Governance note: {'; '.join(validation_warnings)}"
         self._record_audit(
             tenant_id=tenant_id,
             actor_id=actor_id,
@@ -385,22 +505,139 @@ class SOPRAGService:
             document_id=request.document_id,
             passage_count=len(chunks),
             outcome="SUCCESS",
-            detail=f"Successfully ingested SOP '{request.title}' v{request.version} ({len(chunks)} chunks).",
+            detail=audit_detail,
         )
 
         return IngestionResult(
             document_id=request.document_id,
             version=request.version,
             tenant_id=tenant_id,
-            lifecycle_status=request.lifecycle_status,
+            lifecycle_status=authoritative_lifecycle_status,
             total_chunks=len(chunks),
             content_digest=content_digest,
             is_duplicate=False,
             is_revision=is_revision,
             ingestion_status="SUCCESS",
-            validation_errors=[],
+            validation_errors=validation_warnings,
             ingested_at=now_ts,
         )
+
+    # -------------------------------------------------------------------------
+    # GOVERNED LIFECYCLE TRANSITION
+    # -------------------------------------------------------------------------
+
+    def transition_lifecycle(
+        self,
+        tenant_id: str,
+        document_id: str,
+        version: str,
+        new_status: DocumentLifecycleStatus,
+        actor_id: str,
+        user_permissions: Optional[List[str]] = None,
+        user_roles: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Executes a governed, authorized lifecycle state transition for an SOP document.
+        Validates administrative authority, enforces the state transition matrix,
+        synchronizes child chunks, and records an immutable audit entry in the ledger.
+        """
+        now_ts = datetime.now(timezone.utc).isoformat()
+
+        # 1. Authority check: require sop_rag.admin permission
+        if user_permissions is not None and "sop_rag.admin" not in user_permissions:
+            err_msg = f"Actor '{actor_id}' lacks administrative permission 'sop_rag.admin' required for lifecycle transitions."
+            self._record_audit(
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+                event_type="LIFECYCLE_TRANSITION_REJECTED",
+                document_id=document_id,
+                outcome="DENIED",
+                detail=err_msg,
+            )
+            raise PermissionError(err_msg)
+
+        # 2. Document existence check
+        existing_doc = self.repository.get_document(
+            tenant_id=tenant_id,
+            document_id=document_id,
+            version=version,
+        )
+        if not existing_doc:
+            err_msg = f"Document '{document_id}' v{version} not found in tenant partition."
+            self._record_audit(
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+                event_type="LIFECYCLE_TRANSITION_REJECTED",
+                document_id=document_id,
+                outcome="FAILED",
+                detail=err_msg,
+            )
+            raise KeyError(err_msg)
+
+        # 3. State transition validity check
+        current_status = existing_doc.lifecycle_status
+        valid_targets = VALID_LIFECYCLE_TRANSITIONS.get(current_status, set())
+        if new_status not in valid_targets:
+            err_msg = f"Invalid lifecycle transition from '{current_status.value}' to '{new_status.value}'. Transition not permitted by policy."
+            self._record_audit(
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+                event_type="LIFECYCLE_TRANSITION_REJECTED",
+                document_id=document_id,
+                outcome="REJECTED",
+                detail=err_msg,
+            )
+            raise ValueError(err_msg)
+
+        # 4. Governed publication approval record
+        approval: Optional[DocumentApprovalMetadata] = existing_doc.approval_metadata
+        if new_status == DocumentLifecycleStatus.PUBLISHED:
+            approval = DocumentApprovalMetadata(
+                approved_by=actor_id,
+                approval_timestamp=now_ts,
+                approval_id=f"appr_{uuid.uuid4().hex[:8]}",
+                approval_role="ADMINISTRATOR",
+                is_verified=True,
+            )
+
+        # 5. Atomic persistence in repository
+        updated = self.repository.update_lifecycle_status(
+            tenant_id=tenant_id,
+            document_id=document_id,
+            version=version,
+            new_status=new_status,
+            approval_metadata=approval,
+        )
+        if not updated:
+            err_msg = f"Failed to persist lifecycle transition for '{document_id}' v{version}."
+            raise RuntimeError(err_msg)
+
+        # 6. Strict audit ledger persistence (fails operation if audit recording fails)
+        audit = SOPAuditRecord(
+            audit_id=f"aud_sop_{uuid.uuid4().hex[:12]}",
+            timestamp=now_ts,
+            event_type="LIFECYCLE_TRANSITION_EXECUTED",
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            document_id=document_id,
+            outcome="SUCCESS",
+            detail=f"Successfully transitioned document '{document_id}' v{version} from {current_status.value} to {new_status.value}.",
+        )
+        try:
+            self.repository.record_audit_strict(audit)
+        except Exception as e:
+            logger.error("Lifecycle transition audit persistence failure: %s", e)
+            raise RuntimeError(f"Lifecycle transition audit could not be persisted: {e}") from e
+
+        return {
+            "document_id": document_id,
+            "version": version,
+            "previous_status": current_status.value,
+            "new_status": new_status.value,
+            "message": f"Successfully transitioned lifecycle status from {current_status.value} to {new_status.value}.",
+            "approval_metadata": approval.model_dump() if approval else None,
+            "notice": MANDATORY_SOP_RAG_NOTICE,
+        }
 
     # =========================================================================
     # 2. DETERMINISTIC LEXICAL / BM25 RETRIEVAL ENGINE
@@ -439,7 +676,7 @@ class SOPRAGService:
                 evidence_status=EvidenceSufficiencyStatus.NO_RELEVANT_PASSAGES,
             )
 
-        # 2. Fetch eligible chunks from repository under strict security filters
+        # 2. Fetch eligible chunks from repository under strict security and clearance filters
         eligible_statuses = (
             [s.value for s in request.lifecycle_statuses]
             if request.lifecycle_statuses
@@ -447,6 +684,8 @@ class SOPRAGService:
         )
         op_domains = [d.value for d in request.operational_domains] if request.operational_domains else None
         doc_types = [t.value for t in request.document_types] if request.document_types else None
+
+        allowed_cls = get_allowed_classifications_for_clearance(clearance_level)
 
         candidate_chunks = self.repository.query_eligible_chunks(
             tenant_id=tenant_id,
@@ -457,6 +696,7 @@ class SOPRAGService:
             lifecycle_statuses=eligible_statuses,
             require_effective_at=request.require_effective_at,
             allowed_roles=user_roles,
+            allowed_classifications=allowed_cls,
         )
 
         total_eligible = len(candidate_chunks)
@@ -469,7 +709,7 @@ class SOPRAGService:
                 query_hash=query_hash,
                 passage_count=0,
                 outcome="SUCCESS",
-                detail="Zero eligible chunks found matching security/scope filters.",
+                detail="Zero eligible chunks found matching security/scope/clearance filters.",
             )
             return RetrievalResponse(
                 query=query_text,
@@ -481,6 +721,8 @@ class SOPRAGService:
                     "tenant_id": tenant_id,
                     "plant_id": request.plant_id,
                     "statuses": eligible_statuses,
+                    "clearance_level": clearance_level,
+                    "allowed_classifications": allowed_cls,
                 },
                 evidence_status=EvidenceSufficiencyStatus.NO_RELEVANT_PASSAGES,
             )
@@ -527,6 +769,8 @@ class SOPRAGService:
                 "statuses": eligible_statuses,
                 "min_score": request.min_score,
                 "top_k": request.top_k,
+                "clearance_level": clearance_level,
+                "allowed_classifications": allowed_cls,
             },
             evidence_status=evidence_status,
         )

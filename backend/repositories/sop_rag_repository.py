@@ -318,10 +318,11 @@ class SOPRAGRepository:
         tenant_id: str,
         plant_id: Optional[str] = None,
         lifecycle_statuses: Optional[List[str]] = None,
+        allowed_classifications: Optional[List[str]] = None,
         limit: int = 100
     ) -> List[SOPDocument]:
         """
-        Lists documents within tenant scope with optional plant and status filtering.
+        Lists documents within tenant scope with optional plant, status, and classification filtering.
         """
         query = "SELECT * FROM sop_documents WHERE tenant_id = ?"
         params: List[Any] = [tenant_id]
@@ -334,6 +335,11 @@ class SOPRAGRepository:
             placeholders = ",".join("?" for _ in lifecycle_statuses)
             query += f" AND lifecycle_status IN ({placeholders})"
             params.extend(lifecycle_statuses)
+
+        if allowed_classifications is not None:
+            cls_placeholders = ",".join("?" for _ in allowed_classifications)
+            query += f" AND classification IN ({cls_placeholders})"
+            params.extend(allowed_classifications)
 
         query += " ORDER BY updated_at DESC LIMIT ?"
         params.append(limit)
@@ -352,19 +358,29 @@ class SOPRAGRepository:
         tenant_id: str,
         document_id: str,
         version: str,
-        new_status: DocumentLifecycleStatus
+        new_status: DocumentLifecycleStatus,
+        approval_metadata: Optional[DocumentApprovalMetadata] = None,
     ) -> bool:
         """
-        Updates the lifecycle status of a document and synchronizes all child chunks.
+        Updates the lifecycle status of a document, optionally records authoritative approval metadata,
+        and synchronizes all child chunks.
         """
         now_ts = datetime.now(timezone.utc).isoformat()
         with self._lock:
             with self._get_connection() as conn:
-                cursor = conn.execute("""
-                    UPDATE sop_documents
-                    SET lifecycle_status = ?, updated_at = ?
-                    WHERE tenant_id = ? AND document_id = ? AND version = ?
-                """, (new_status.value, now_ts, tenant_id, document_id, version))
+                if approval_metadata is not None:
+                    approval_json = json.dumps(approval_metadata.model_dump())
+                    cursor = conn.execute("""
+                        UPDATE sop_documents
+                        SET lifecycle_status = ?, updated_at = ?, approval_metadata_json = ?
+                        WHERE tenant_id = ? AND document_id = ? AND version = ?
+                    """, (new_status.value, now_ts, approval_json, tenant_id, document_id, version))
+                else:
+                    cursor = conn.execute("""
+                        UPDATE sop_documents
+                        SET lifecycle_status = ?, updated_at = ?
+                        WHERE tenant_id = ? AND document_id = ? AND version = ?
+                    """, (new_status.value, now_ts, tenant_id, document_id, version))
 
                 if cursor.rowcount == 0:
                     return False
@@ -410,11 +426,12 @@ class SOPRAGRepository:
         document_ids: Optional[List[str]] = None,
         lifecycle_statuses: Optional[List[str]] = None,
         require_effective_at: Optional[str] = None,
-        allowed_roles: Optional[List[str]] = None
+        allowed_roles: Optional[List[str]] = None,
+        allowed_classifications: Optional[List[str]] = None,
     ) -> List[DocumentChunk]:
         """
         Selects all chunks from eligible documents adhering strictly to tenant isolation,
-        plant scope, lifecycle status, temporal validity, and access roles.
+        plant scope, lifecycle status, temporal validity, classification clearance, and access roles.
         """
         # Join with sop_documents to filter on document-level metadata (domain, doc_type, effective dates)
         query = """
@@ -433,6 +450,16 @@ class SOPRAGRepository:
         placeholders = ",".join("?" for _ in statuses)
         query += f" AND c.lifecycle_status IN ({placeholders})"
         params.extend(statuses)
+
+        # Classification / Security Clearance filtering (Enforce in repository query path)
+        if allowed_classifications is not None:
+            cls_placeholders = ",".join("?" for _ in allowed_classifications)
+            query += f" AND c.classification IN ({cls_placeholders})"
+            params.extend(allowed_classifications)
+        else:
+            # Strict fail-closed: if allowed classifications not supplied, only PUBLIC chunks are accessible
+            query += " AND c.classification = ?"
+            params.append(ClassificationLevel.PUBLIC.value)
 
         # Plant partition check
         if plant_id:
@@ -488,7 +515,19 @@ class SOPRAGRepository:
 
     def record_audit(self, audit: SOPAuditRecord) -> None:
         """
-        Persists an immutable audit log entry into the ledger.
+        Persists an immutable audit log entry into the ledger (best-effort logging).
+        """
+        try:
+            self.record_audit_strict(audit)
+        except Exception as e:
+            # Best-effort logging avoids failing read/query operations
+            pass
+
+    def record_audit_strict(self, audit: SOPAuditRecord) -> None:
+        """
+        Strictly persists an immutable audit log entry into the ledger.
+        Raises an exception if persistence fails, guaranteeing that privileged operations
+        (such as lifecycle transitions and approvals) fail closed if auditing cannot be committed.
         """
         with self._lock:
             with self._get_connection() as conn:

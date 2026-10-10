@@ -1,17 +1,21 @@
 # backend/api/sop_rag_routes.py
 """
-SageCommand V3 — SOP / RAG Intelligence Foundation API Routes (Prompt 33)
+SageCommand V3 — SOP / RAG Intelligence Foundation API Routes (Prompt 33 / 33A)
 
 Versioned REST endpoints rooted at /api/v3/sop-rag.
 Enforces authentication, RBAC/ABAC permissions, fail-closed tenant isolation,
-plant boundary restrictions, payload bounds, and non-disclosing error responses.
+plant boundary restrictions, classification clearance gates, governed publication state transitions,
+payload bounds, and safe non-disclosing error responses.
 
 Notice:
 ADVISORY SOP KNOWLEDGE ONLY — NEVER EXECUTES ACTIONS, MUTATES EQUIPMENT, OR BYPASSES OPERATIONAL GOVERNANCE
 """
 
-from typing import List, Optional
+import logging
+from typing import List, Optional, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+
+logger = logging.getLogger("sop_rag_routes")
 
 try:
     from core.auth import Identity, get_current_identity, require_permission
@@ -20,6 +24,7 @@ try:
         SOPDocument,
         DocumentChunk,
         DocumentLifecycleStatus,
+        ClassificationLevel,
         IngestionRequest,
         IngestionResult,
         RetrievalRequest,
@@ -28,6 +33,9 @@ try:
         RAGAnswer,
         SOPAuditRecord,
         MANDATORY_SOP_RAG_NOTICE,
+        CLASSIFICATION_CLEARANCE_MAP,
+        VALID_LIFECYCLE_TRANSITIONS,
+        get_allowed_classifications_for_clearance,
     )
     from services.sop_rag_service import (
         SOPRAGService,
@@ -43,6 +51,7 @@ except (ImportError, ModuleNotFoundError):
         SOPDocument,
         DocumentChunk,
         DocumentLifecycleStatus,
+        ClassificationLevel,
         IngestionRequest,
         IngestionResult,
         RetrievalRequest,
@@ -51,6 +60,9 @@ except (ImportError, ModuleNotFoundError):
         RAGAnswer,
         SOPAuditRecord,
         MANDATORY_SOP_RAG_NOTICE,
+        CLASSIFICATION_CLEARANCE_MAP,
+        VALID_LIFECYCLE_TRANSITIONS,
+        get_allowed_classifications_for_clearance,
     )
     from backend.services.sop_rag_service import (
         SOPRAGService,
@@ -77,7 +89,9 @@ async def ingest_sop_document(
 ):
     """
     Ingests, validates, chunks, and registers an authoritative SOP document.
-    Enforces tenant partition isolation and plant boundary access control.
+    Enforces tenant partition isolation, plant boundary access control,
+    and governed lifecycle defaulting (new documents default to DRAFT;
+    ordinary ingestion permission cannot directly publish).
     """
     # Tenant boundary enforcement: prevent caller from spoofing a foreign tenant
     if request.tenant_id and request.tenant_id != user.tenant_id:
@@ -97,11 +111,16 @@ async def ingest_sop_document(
     try:
         actor_id = getattr(user, "user_id", None) or getattr(user, "sub", "system")
         clearance = getattr(user, "clearance_level", 1)
+        user_permissions = getattr(user, "permissions", [])
+        is_admin = "sop_rag.admin" in user_permissions
+
         result = sop_rag_service.ingest_document(
             request=request,
             actor_id=actor_id,
             authoritative_tenant_id=user.tenant_id,
             clearance_level=clearance,
+            user_permissions=user_permissions,
+            is_admin=is_admin,
         )
         if result.ingestion_status == "FAILED":
             raise HTTPException(
@@ -112,14 +131,16 @@ async def ingest_sop_document(
     except HTTPException:
         raise
     except ValueError as e:
+        logger.warning("Document ingestion validation error: %s", type(e).__name__)
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(e),
+            detail="Document validation failed: invalid format or payload parameters.",
         )
     except Exception as e:
+        logger.error("Document ingestion internal failure: %s", type(e).__name__, exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Ingestion processing failed: {str(e)}",
+            detail="An internal processing error occurred during document ingestion.",
         )
 
 
@@ -135,27 +156,46 @@ async def get_sop_document(
 ):
     """
     Retrieves full metadata and chunk list for an authoritative SOP document.
+    Enforces tenant isolation, plant scoping, and classification clearance.
     """
-    doc = sop_rag_repository.get_document(
-        tenant_id=user.tenant_id,
-        document_id=document_id,
-        version=version,
-    )
-    if not doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"SOP document '{document_id}' not found in tenant partition.",
+    try:
+        doc = sop_rag_repository.get_document(
+            tenant_id=user.tenant_id,
+            document_id=document_id,
+            version=version,
         )
-
-    # Plant check if document is assigned to a plant
-    if doc.plant_id and user.assigned_plants and "*" not in user.assigned_plants:
-        if doc.plant_id not in user.assigned_plants:
+        if not doc:
             raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Plant boundary violation: user not authorized for plant '{doc.plant_id}'.",
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"SOP document '{document_id}' not found in tenant partition.",
             )
 
-    return doc
+        # Plant check if document is assigned to a plant
+        if doc.plant_id and user.assigned_plants and "*" not in user.assigned_plants:
+            if doc.plant_id not in user.assigned_plants:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Plant boundary violation: user not authorized for this document plant partition.",
+                )
+
+        # Classification & Security Clearance verification
+        user_clearance = getattr(user, "clearance_level", 1)
+        required_clearance = CLASSIFICATION_CLEARANCE_MAP.get(doc.classification, 3)
+        if user_clearance < required_clearance:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied: document classification requires higher clearance level.",
+            )
+
+        return doc
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Document retrieval failure: %s", type(e).__name__, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An internal error occurred while retrieving the document.",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +210,8 @@ async def list_sop_documents(
     user: Identity = Depends(require_permission("sop_rag.read")),
 ):
     """
-    Lists authoritative SOP documents in tenant partition with optional plant and status filtering.
+    Lists authoritative SOP documents in tenant partition with optional plant,
+    lifecycle status, and clearance filtering.
     """
     if plant_id and user.assigned_plants and "*" not in user.assigned_plants:
         if plant_id not in user.assigned_plants:
@@ -179,13 +220,25 @@ async def list_sop_documents(
                 detail=f"Plant boundary violation: user not authorized for plant '{plant_id}'.",
             )
 
-    statuses = [status_filter] if status_filter else None
-    return sop_rag_repository.list_documents(
-        tenant_id=user.tenant_id,
-        plant_id=plant_id,
-        lifecycle_statuses=statuses,
-        limit=limit,
-    )
+    try:
+        user_clearance = getattr(user, "clearance_level", 1)
+        allowed_cls = get_allowed_classifications_for_clearance(user_clearance)
+        statuses = [status_filter] if status_filter else None
+        return sop_rag_repository.list_documents(
+            tenant_id=user.tenant_id,
+            plant_id=plant_id,
+            lifecycle_statuses=statuses,
+            allowed_classifications=allowed_cls,
+            limit=limit,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Document listing failure: %s", type(e).__name__, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An internal error occurred while listing documents.",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -200,27 +253,49 @@ async def update_document_lifecycle(
     user: Identity = Depends(require_permission("sop_rag.admin")),
 ):
     """
-    Updates the lifecycle status of an authoritative SOP document (e.g., PUBLISHED, REVOKED, ARCHIVED).
-    Requires administrative authority.
+    Executes a governed lifecycle state transition for an SOP document
+    (e.g., DRAFT -> PUBLISHED, PUBLISHED -> SUPERSEDED / REVOKED / ARCHIVED).
+    Requires administrative authority (sop_rag.admin).
+    Enforces valid state transition matrix and synchronizes child chunks.
     """
-    success = sop_rag_repository.update_lifecycle_status(
-        tenant_id=user.tenant_id,
-        document_id=document_id,
-        version=version,
-        new_status=new_status,
-    )
-    if not success:
+    try:
+        actor_id = getattr(user, "user_id", None) or getattr(user, "sub", "system")
+        user_permissions = getattr(user, "permissions", [])
+        user_roles = getattr(user, "roles", [])
+
+        result = sop_rag_service.transition_lifecycle(
+            tenant_id=user.tenant_id,
+            document_id=document_id,
+            version=version,
+            new_status=new_status,
+            actor_id=actor_id,
+            user_permissions=user_permissions,
+            user_roles=user_roles,
+        )
+        return result
+    except HTTPException:
+        raise
+    except PermissionError as e:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Administrative permission 'sop_rag.admin' required for lifecycle transitions.",
+        )
+    except KeyError as e:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Document '{document_id}' v{version} not found in tenant.",
+            detail=f"Document '{document_id}' v{version} not found in tenant partition.",
         )
-    return {
-        "document_id": document_id,
-        "version": version,
-        "new_status": new_status.value,
-        "message": f"Successfully updated lifecycle status to {new_status.value}.",
-        "notice": MANDATORY_SOP_RAG_NOTICE,
-    }
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        )
+    except Exception as e:
+        logger.error("Lifecycle transition failure: %s", type(e).__name__, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An internal error occurred while updating document lifecycle.",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +309,7 @@ async def retrieve_passages(
 ):
     """
     Executes scoped, deterministic BM25 passage retrieval against eligible SOP chunks.
-    Enforces strict tenant isolation and caller authorization boundaries.
+    Enforces strict tenant isolation, plant scoping, and clearance boundaries.
     """
     if request.tenant_id and request.tenant_id != user.tenant_id:
         raise HTTPException(
@@ -260,10 +335,19 @@ async def retrieve_passages(
             user_roles=user_roles,
             clearance_level=clearance,
         )
+    except HTTPException:
+        raise
     except ValueError as e:
+        logger.warning("Retrieval validation error: %s", type(e).__name__)
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(e),
+            detail="Invalid retrieval parameters.",
+        )
+    except Exception as e:
+        logger.error("Passage retrieval failure: %s", type(e).__name__, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An internal error occurred during passage retrieval.",
         )
 
 
@@ -280,6 +364,7 @@ async def query_rag_answer(
     End-to-end RAG question answering.
     Retrieves authorized evidence, validates sufficiency, builds bounded context,
     and returns an evidence-backed advisory answer with real citations.
+    Enforces strict clearance gates across retrieved context and citations.
     """
     if request.tenant_id and request.tenant_id != user.tenant_id:
         raise HTTPException(
@@ -305,10 +390,19 @@ async def query_rag_answer(
             user_roles=user_roles,
             clearance_level=clearance,
         )
+    except HTTPException:
+        raise
     except ValueError as e:
+        logger.warning("RAG query validation error: %s", type(e).__name__)
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(e),
+            detail="Invalid query parameters.",
+        )
+    except Exception as e:
+        logger.error("RAG query processing failure: %s", type(e).__name__, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An internal error occurred during RAG query processing.",
         )
 
 
@@ -323,9 +417,18 @@ async def get_sop_audits(
 ):
     """
     Retrieves append-only SOP ingestion and retrieval audit logs for tenant.
-    Requires administrative authority.
+    Requires administrative authority (sop_rag.admin).
     """
-    return sop_rag_repository.get_audit_records(
-        tenant_id=user.tenant_id,
-        limit=limit,
-    )
+    try:
+        return sop_rag_repository.get_audit_records(
+            tenant_id=user.tenant_id,
+            limit=limit,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Audit log retrieval failure: %s", type(e).__name__, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An internal error occurred while retrieving audit logs.",
+        )

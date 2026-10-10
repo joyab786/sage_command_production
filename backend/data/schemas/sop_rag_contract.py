@@ -24,7 +24,7 @@ ADVISORY SOP KNOWLEDGE ONLY — NEVER EXECUTES ACTIONS, MUTATES EQUIPMENT, OR BY
 """
 
 from enum import Enum
-from typing import Dict, List, Optional, Any, Union
+from typing import Dict, List, Optional, Any, Union, Set
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -175,6 +175,67 @@ class FreshnessStatus(str, Enum):
     UNKNOWN = "UNKNOWN"
 
 
+# Mapping from classification level to minimum required user clearance level
+CLASSIFICATION_CLEARANCE_MAP: Dict[ClassificationLevel, int] = {
+    ClassificationLevel.PUBLIC: 1,
+    ClassificationLevel.INTERNAL: 1,
+    ClassificationLevel.CONFIDENTIAL: 2,
+    ClassificationLevel.RESTRICTED: 3,
+}
+
+# Formal state machine for SOP document lifecycle transitions
+VALID_LIFECYCLE_TRANSITIONS: Dict[DocumentLifecycleStatus, Set[DocumentLifecycleStatus]] = {
+    DocumentLifecycleStatus.DRAFT: {
+        DocumentLifecycleStatus.PUBLISHED,
+        DocumentLifecycleStatus.ARCHIVED,
+    },
+    DocumentLifecycleStatus.PUBLISHED: {
+        DocumentLifecycleStatus.SUPERSEDED,
+        DocumentLifecycleStatus.REVOKED,
+        DocumentLifecycleStatus.ARCHIVED,
+    },
+    DocumentLifecycleStatus.SUPERSEDED: {
+        DocumentLifecycleStatus.ARCHIVED,
+        DocumentLifecycleStatus.REVOKED,
+    },
+    DocumentLifecycleStatus.ARCHIVED: {
+        DocumentLifecycleStatus.REVOKED,
+    },
+    DocumentLifecycleStatus.REVOKED: set(),  # Terminal state: cannot transition to any other status
+    DocumentLifecycleStatus.FAILED_INGESTION: {
+        DocumentLifecycleStatus.ARCHIVED,
+    },
+}
+
+
+def get_allowed_classifications_for_clearance(clearance_level: Optional[int]) -> List[str]:
+    """
+    Determines permitted document/chunk classification levels based strictly on caller's
+    authoritative clearance level.
+    Fails closed: if clearance_level is None, non-integer, or < 1, permits only PUBLIC.
+    Level 1: PUBLIC, INTERNAL
+    Level 2: PUBLIC, INTERNAL, CONFIDENTIAL
+    Level 3+: PUBLIC, INTERNAL, CONFIDENTIAL, RESTRICTED
+    """
+    if clearance_level is None or not isinstance(clearance_level, int) or clearance_level < 1:
+        return [ClassificationLevel.PUBLIC.value]
+    if clearance_level == 1:
+        return [ClassificationLevel.PUBLIC.value, ClassificationLevel.INTERNAL.value]
+    elif clearance_level == 2:
+        return [
+            ClassificationLevel.PUBLIC.value,
+            ClassificationLevel.INTERNAL.value,
+            ClassificationLevel.CONFIDENTIAL.value,
+        ]
+    else:
+        return [
+            ClassificationLevel.PUBLIC.value,
+            ClassificationLevel.INTERNAL.value,
+            ClassificationLevel.CONFIDENTIAL.value,
+            ClassificationLevel.RESTRICTED.value,
+        ]
+
+
 # =============================================================================
 # 2. DOCUMENT GOVERNANCE & METADATA CONTRACTS
 # =============================================================================
@@ -232,7 +293,7 @@ class DocumentChunk(BaseModel):
     plant_id: Optional[str] = Field(default=None, description="Plant scope inherited from parent document")
     classification: ClassificationLevel = Field(default=ClassificationLevel.INTERNAL, description="Classification tier inherited from parent")
     access_control_roles: List[str] = Field(default_factory=list, description="Permitted roles inherited from parent")
-    lifecycle_status: DocumentLifecycleStatus = Field(default=DocumentLifecycleStatus.PUBLISHED, description="Lifecycle status inherited from parent")
+    lifecycle_status: DocumentLifecycleStatus = Field(default=DocumentLifecycleStatus.DRAFT, description="Lifecycle status inherited from parent; defaults to DRAFT")
     char_count: int = Field(..., ge=1, description="Character count of chunk text")
     token_count_estimate: int = Field(..., ge=1, description="Estimated token count (approx. words / 0.75)")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Extracted domain tags or operational metadata")
@@ -264,7 +325,7 @@ class SOPDocument(BaseModel):
     document_type: DocumentType = Field(default=DocumentType.STANDARD_OPERATING_PROCEDURE, description="Functional document classification")
     operational_domain: OperationalDomain = Field(default=OperationalDomain.GENERAL, description="Operational industrial domain")
     version: str = Field(default="1.0", description="Document revision identifier")
-    lifecycle_status: DocumentLifecycleStatus = Field(default=DocumentLifecycleStatus.PUBLISHED, description="Lifecycle governance status")
+    lifecycle_status: DocumentLifecycleStatus = Field(default=DocumentLifecycleStatus.DRAFT, description="Lifecycle governance status; new documents default to DRAFT")
     effective_from: Optional[str] = Field(default=None, description="ISO timestamp from which procedure is effective")
     effective_until: Optional[str] = Field(default=None, description="ISO timestamp after which procedure is superseded or invalid")
     approval_metadata: Optional[DocumentApprovalMetadata] = Field(default=None, description="Governance approval record")
@@ -308,7 +369,7 @@ class IngestionRequest(BaseModel):
     document_type: DocumentType = Field(default=DocumentType.STANDARD_OPERATING_PROCEDURE, description="Functional type")
     operational_domain: OperationalDomain = Field(default=OperationalDomain.GENERAL, description="Domain")
     version: str = Field(default="1.0", max_length=32, description="Version string")
-    lifecycle_status: DocumentLifecycleStatus = Field(default=DocumentLifecycleStatus.PUBLISHED, description="Initial lifecycle status")
+    lifecycle_status: DocumentLifecycleStatus = Field(default=DocumentLifecycleStatus.DRAFT, description="Initial lifecycle status; new documents default to DRAFT")
     effective_from: Optional[str] = Field(default=None, description="ISO timestamp effective start")
     effective_until: Optional[str] = Field(default=None, description="ISO timestamp effective end")
     approval_metadata: Optional[DocumentApprovalMetadata] = Field(default=None, description="Approval governance")
