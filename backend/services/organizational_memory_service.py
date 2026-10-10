@@ -130,7 +130,7 @@ class OrganizationalMemoryService:
         plant_id: Optional[str] = None,
     ) -> None:
         """
-        Enforces fail-closed identity, tenant, permission, and plant access control.
+        Enforces fail-closed identity, tenant, workspace, permission, and plant access control.
         """
         if identity is None:
             raise PermissionError("Authentication required: Identity context is missing.")
@@ -138,25 +138,31 @@ class OrganizationalMemoryService:
         if not identity.tenant_id or not identity.tenant_id.strip():
             raise PermissionError("Authoritative tenant_id is missing from identity context.")
 
+        if not identity.workspace_id or not identity.workspace_id.strip():
+            raise PermissionError("Authoritative workspace_id is missing from identity context.")
+
         if not isinstance(identity.permissions, (list, set, tuple)):
             raise PermissionError(f"Malformed permissions context for actor '{identity.user_id}'.")
 
         perms = {p.lower() for p in identity.permissions if isinstance(p, str)}
-        # Grant if explicit permission present or admin/memory.admin wildcard
+        # Grant only if explicit required permission or canonical memory.admin permission present.
+        # Generic role bypass strings (admin, administrator, system) are strictly rejected.
         allowed = (
             required_permission.lower() in perms
             or "memory.admin" in perms
-            or "admin" in perms
-            or "administrator" in perms
-            or "system" in perms
         )
         if not allowed:
             raise PermissionError(
                 f"Actor '{identity.user_id}' lacks required permission '{required_permission}'."
             )
 
+        assigned = set(identity.assigned_plants or [])
+        if not assigned:
+            raise PermissionError(
+                f"Actor '{identity.user_id}' has no assigned plants."
+            )
+
         if plant_id:
-            assigned = set(identity.assigned_plants or [])
             if "*" not in assigned and plant_id not in assigned:
                 raise PermissionError(
                     f"Actor '{identity.user_id}' lacks access to plant '{plant_id}'."
@@ -200,15 +206,18 @@ class OrganizationalMemoryService:
 
         # Tenant and workspace scoping derived strictly from server identity
         tenant_id = identity.tenant_id
-        workspace_id = identity.workspace_id or "workspace_default"
+        workspace_id = identity.workspace_id
 
-        # Determine authoritative plant_id
+        # Determine authoritative plant_id without synthetic defaults
+        assigned = set(identity.assigned_plants or [])
         if request.plant_id:
+            if "*" not in assigned and request.plant_id not in assigned:
+                raise PermissionError(f"Actor '{identity.user_id}' lacks access to plant '{request.plant_id}'.")
             plant_id = request.plant_id
-        elif identity.assigned_plants and "*" not in identity.assigned_plants:
-            plant_id = identity.assigned_plants[0]
+        elif len(assigned) == 1 and "*" not in assigned:
+            plant_id = next(iter(assigned))
         else:
-            plant_id = "plant_default"
+            raise ValueError("Draft creation requires an explicit authorized plant_id.")
 
         # Epistemic guard: OBSERVED_FACT requires at least one source reference or evidence reference
         if request.epistemic_status == EpistemicStatus.OBSERVED_FACT:
@@ -292,8 +301,9 @@ class OrganizationalMemoryService:
         """
         self._validate_identity_and_permissions(identity, "memory.write")
         tenant_id = identity.tenant_id
+        workspace_id = identity.workspace_id
 
-        existing = self.repository.get_entry(tenant_id, memory_id)
+        existing = self.repository.get_entry(tenant_id, workspace_id, memory_id)
         if not existing:
             raise KeyError(f"Organizational memory entry '{memory_id}' not found.")
 
@@ -330,7 +340,7 @@ class OrganizationalMemoryService:
             event_type="ORGANIZATIONAL_MEMORY_UPDATED",
             memory_id=memory_id,
             tenant_id=tenant_id,
-            workspace_id=existing.workspace_id,
+            workspace_id=workspace_id,
             plant_id=existing.plant_id,
             actor_id=identity.user_id,
             timestamp=now,
@@ -350,8 +360,9 @@ class OrganizationalMemoryService:
         """
         self._validate_identity_and_permissions(identity, "memory.write")
         tenant_id = identity.tenant_id
+        workspace_id = identity.workspace_id
 
-        existing = self.repository.get_entry(tenant_id, memory_id)
+        existing = self.repository.get_entry(tenant_id, workspace_id, memory_id)
         if not existing:
             raise KeyError(f"Memory entry '{memory_id}' not found.")
 
@@ -404,8 +415,9 @@ class OrganizationalMemoryService:
         """
         self._validate_identity_and_permissions(identity, "memory.verify")
         tenant_id = identity.tenant_id
+        workspace_id = identity.workspace_id
 
-        existing = self.repository.get_entry(tenant_id, memory_id)
+        existing = self.repository.get_entry(tenant_id, workspace_id, memory_id)
         if not existing:
             raise KeyError(f"Memory entry '{memory_id}' not found.")
 
@@ -433,7 +445,7 @@ class OrganizationalMemoryService:
                 event_type="ORGANIZATIONAL_MEMORY_VERIFICATION_DENIED",
                 memory_id=memory_id,
                 tenant_id=tenant_id,
-                workspace_id=existing.workspace_id,
+                workspace_id=workspace_id,
                 plant_id=existing.plant_id,
                 actor_id=identity.user_id,
                 timestamp=datetime.now(timezone.utc),
@@ -465,7 +477,7 @@ class OrganizationalMemoryService:
             event_type="ORGANIZATIONAL_MEMORY_VERIFIED",
             memory_id=memory_id,
             tenant_id=tenant_id,
-            workspace_id=existing.workspace_id,
+            workspace_id=workspace_id,
             plant_id=existing.plant_id,
             actor_id=identity.user_id,
             timestamp=now,
@@ -489,8 +501,9 @@ class OrganizationalMemoryService:
         """
         self._validate_identity_and_permissions(identity, "memory.verify")
         tenant_id = identity.tenant_id
+        workspace_id = identity.workspace_id
 
-        existing = self.repository.get_entry(tenant_id, memory_id)
+        existing = self.repository.get_entry(tenant_id, workspace_id, memory_id)
         if not existing:
             raise KeyError(f"Memory entry '{memory_id}' not found.")
 
@@ -514,7 +527,7 @@ class OrganizationalMemoryService:
             event_type="ORGANIZATIONAL_MEMORY_ACTIVATED",
             memory_id=memory_id,
             tenant_id=tenant_id,
-            workspace_id=existing.workspace_id,
+            workspace_id=workspace_id,
             plant_id=existing.plant_id,
             actor_id=identity.user_id,
             timestamp=now,
@@ -546,8 +559,9 @@ class OrganizationalMemoryService:
         """
         self._validate_identity_and_permissions(identity, "memory.verify")
         tenant_id = identity.tenant_id
+        workspace_id = identity.workspace_id
 
-        target = self.repository.get_entry(tenant_id, memory_id)
+        target = self.repository.get_entry(tenant_id, workspace_id, memory_id)
         if not target:
             raise KeyError(f"Memory entry '{memory_id}' to supersede not found.")
 
@@ -578,7 +592,7 @@ class OrganizationalMemoryService:
             replacement_entry = OrganizationalMemoryEntry(
                 memory_id=replacement_id,
                 tenant_id=tenant_id,
-                workspace_id=target.workspace_id,
+                workspace_id=workspace_id,
                 plant_id=target.plant_id,
                 asset_id=r_draft.asset_id or target.asset_id,
                 process_id=r_draft.process_id or target.process_id,
@@ -649,7 +663,7 @@ class OrganizationalMemoryService:
             event_type="ORGANIZATIONAL_MEMORY_SUPERSEDED",
             memory_id=memory_id,
             tenant_id=tenant_id,
-            workspace_id=target.workspace_id,
+            workspace_id=workspace_id,
             plant_id=target.plant_id,
             actor_id=identity.user_id,
             timestamp=now,
@@ -666,7 +680,7 @@ class OrganizationalMemoryService:
                 event_type="ORGANIZATIONAL_MEMORY_CREATED",
                 memory_id=replacement_id,
                 tenant_id=tenant_id,
-                workspace_id=target.workspace_id,
+                workspace_id=workspace_id,
                 plant_id=target.plant_id,
                 actor_id=identity.user_id,
                 timestamp=now,
@@ -697,8 +711,9 @@ class OrganizationalMemoryService:
         """
         self._validate_identity_and_permissions(identity, "memory.admin")
         tenant_id = identity.tenant_id
+        workspace_id = identity.workspace_id
 
-        target = self.repository.get_entry(tenant_id, memory_id)
+        target = self.repository.get_entry(tenant_id, workspace_id, memory_id)
         if not target:
             raise KeyError(f"Memory entry '{memory_id}' not found.")
 
@@ -724,7 +739,7 @@ class OrganizationalMemoryService:
             event_type="ORGANIZATIONAL_MEMORY_ARCHIVED",
             memory_id=memory_id,
             tenant_id=tenant_id,
-            workspace_id=target.workspace_id,
+            workspace_id=workspace_id,
             plant_id=target.plant_id,
             actor_id=identity.user_id,
             timestamp=now,
@@ -750,8 +765,9 @@ class OrganizationalMemoryService:
         """
         self._validate_identity_and_permissions(identity, "memory.admin")
         tenant_id = identity.tenant_id
+        workspace_id = identity.workspace_id
 
-        target = self.repository.get_entry(tenant_id, memory_id)
+        target = self.repository.get_entry(tenant_id, workspace_id, memory_id)
         if not target:
             raise KeyError(f"Memory entry '{memory_id}' not found.")
 
@@ -775,7 +791,7 @@ class OrganizationalMemoryService:
             event_type="ORGANIZATIONAL_MEMORY_REVOKED",
             memory_id=memory_id,
             tenant_id=tenant_id,
-            workspace_id=target.workspace_id,
+            workspace_id=workspace_id,
             plant_id=target.plant_id,
             actor_id=identity.user_id,
             timestamp=now,
@@ -795,17 +811,20 @@ class OrganizationalMemoryService:
 
     def get_entry(self, memory_id: str, identity: Identity) -> Optional[OrganizationalMemoryEntry]:
         """
-        Retrieves a single memory entry with full tenant, plant, and classification checks.
+        Retrieves a single memory entry with full tenant, workspace, plant, and classification checks.
         """
         self._validate_identity_and_permissions(identity, "memory.read")
         tenant_id = identity.tenant_id
+        workspace_id = identity.workspace_id
 
-        entry = self.repository.get_entry(tenant_id, memory_id)
+        entry = self.repository.get_entry(tenant_id, workspace_id, memory_id)
         if not entry:
             return None
 
         # Plant isolation check
         assigned = set(identity.assigned_plants or [])
+        if not assigned:
+            return None
         if "*" not in assigned and entry.plant_id not in assigned:
             return None
 
@@ -822,22 +841,45 @@ class OrganizationalMemoryService:
     ) -> MemorySearchResponse:
         """
         Executes a bounded, authorized search across organizational memory.
-        Enforces tenant isolation, plant scoping, and classification clearance ceiling.
+        Enforces tenant isolation, workspace isolation, plant scoping, and classification clearance ceiling.
         """
         self._validate_identity_and_permissions(identity, "memory.read")
         tenant_id = identity.tenant_id
+        workspace_id = identity.workspace_id
 
         # Determine plant boundaries
+        assigned = set(identity.assigned_plants or [])
+        if not assigned:
+            return MemorySearchResponse(
+                entries=[],
+                total_count=0,
+                returned_count=0,
+                offset=request.offset,
+                limit=request.limit,
+                has_more=False,
+            )
+
+        # Plant intersection: client requested plant must be validated against assigned set
+        if request.plant_id and "*" not in assigned and request.plant_id not in assigned:
+            return MemorySearchResponse(
+                entries=[],
+                total_count=0,
+                returned_count=0,
+                offset=request.offset,
+                limit=request.limit,
+                has_more=False,
+            )
+
         allowed_plants: Optional[Set[str]] = None
-        assigned = identity.assigned_plants or []
         if "*" not in assigned:
-            allowed_plants = set(assigned)
+            allowed_plants = assigned
 
         # Determine classification ceiling
         max_classification = self._get_max_classification_for_user(identity)
 
         entries, total = self.repository.search_entries(
             tenant_id=tenant_id,
+            workspace_id=workspace_id,
             search_req=request,
             allowed_plant_ids=allowed_plants,
             max_classification=max_classification,
@@ -867,13 +909,35 @@ class OrganizationalMemoryService:
         Assembles safe, bounded organizational memory context for the AI reasoning layer.
         Guarantees:
         - Only active and verified entries are included.
-        - Clearance boundaries strictly enforced before content exposure.
+        - Workspace and clearance boundaries strictly enforced before content exposure.
         - Untrusted XML fence delimiters isolate memory content.
         - Identifies and surfaces unresolved conflicts between memory entries.
         - Enforces strict token and item limits; never fabricates context.
         """
         self._validate_identity_and_permissions(identity, "memory.read", request.plant_id)
         tenant_id = identity.tenant_id
+        workspace_id = identity.workspace_id
+
+        assigned = set(identity.assigned_plants or [])
+        if not assigned:
+            return MemoryContextResponse(
+                context_items=[],
+                item_count=0,
+                estimated_tokens=0,
+                formatted_prompt_block="[No applicable organizational memory context found for this operational scope.]",
+                is_sufficient=False,
+                unresolved_conflicts=[],
+            )
+
+        if request.plant_id and "*" not in assigned and request.plant_id not in assigned:
+            return MemoryContextResponse(
+                context_items=[],
+                item_count=0,
+                estimated_tokens=0,
+                formatted_prompt_block="[No applicable organizational memory context found for this operational scope.]",
+                is_sufficient=False,
+                unresolved_conflicts=[],
+            )
 
         # Search for candidate memory entries
         search_req = MemorySearchRequest(
@@ -891,14 +955,14 @@ class OrganizationalMemoryService:
         )
 
         allowed_plants: Optional[Set[str]] = None
-        assigned = identity.assigned_plants or []
         if "*" not in assigned:
-            allowed_plants = set(assigned)
+            allowed_plants = assigned
 
         max_classification = self._get_max_classification_for_user(identity)
 
         entries, _ = self.repository.search_entries(
             tenant_id=tenant_id,
+            workspace_id=workspace_id,
             search_req=search_req,
             allowed_plant_ids=allowed_plants,
             max_classification=max_classification,

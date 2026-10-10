@@ -148,7 +148,7 @@ class OrganizationalMemoryRepository:
                         superseded_by TEXT,
                         archived_by TEXT,
                         metadata_json TEXT NOT NULL,
-                        PRIMARY KEY (tenant_id, memory_id)
+                        PRIMARY KEY (tenant_id, workspace_id, memory_id)
                     )
                 """)
 
@@ -180,14 +180,16 @@ class OrganizationalMemoryRepository:
                     )
                 """)
 
-                # Performance and isolation indexes
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_tenant_type ON organizational_memory_entries (tenant_id, memory_type)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_tenant_status ON organizational_memory_entries (tenant_id, lifecycle_status)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_tenant_plant ON organizational_memory_entries (tenant_id, plant_id)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_tenant_asset ON organizational_memory_entries (tenant_id, asset_id)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_tenant_incident ON organizational_memory_entries (tenant_id, incident_reference)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_tenant_decision ON organizational_memory_entries (tenant_id, decision_reference)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_audit_tenant_mem ON organizational_memory_audit_ledger (tenant_id, memory_id)")
+                # Performance and workspace isolation indexes
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_tenant_ws ON organizational_memory_entries (tenant_id, workspace_id)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_tenant_ws_id ON organizational_memory_entries (tenant_id, workspace_id, memory_id)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_tenant_type ON organizational_memory_entries (tenant_id, workspace_id, memory_type)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_tenant_status ON organizational_memory_entries (tenant_id, workspace_id, lifecycle_status)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_tenant_plant ON organizational_memory_entries (tenant_id, workspace_id, plant_id)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_tenant_asset ON organizational_memory_entries (tenant_id, workspace_id, asset_id)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_tenant_incident ON organizational_memory_entries (tenant_id, workspace_id, incident_reference)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_tenant_decision ON organizational_memory_entries (tenant_id, workspace_id, decision_reference)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_audit_tenant_ws_mem ON organizational_memory_audit_ledger (tenant_id, workspace_id, memory_id)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_rel_target ON organizational_memory_relationships (tenant_id, target_memory_id)")
 
     # -------------------------------------------------------------------------
@@ -367,16 +369,16 @@ class OrganizationalMemoryRepository:
     ) -> bool:
         """
         Atomically updates an existing DRAFT memory entry and records an update audit log.
-        Fails if the entry is not in DRAFT status or does not exist under tenant_id.
+        Fails if the entry is not in DRAFT status or does not exist under (tenant_id, workspace_id).
         """
         with self._lock:
             conn = self._get_connection()
             try:
                 with conn:
-                    # Verify currently in DRAFT status
+                    # Verify currently in DRAFT status under tenant_id and workspace_id
                     cur = conn.execute(
-                        "SELECT lifecycle_status FROM organizational_memory_entries WHERE tenant_id = ? AND memory_id = ?",
-                        (entry.tenant_id, entry.memory_id),
+                        "SELECT lifecycle_status FROM organizational_memory_entries WHERE tenant_id = ? AND workspace_id = ? AND memory_id = ?",
+                        (entry.tenant_id, entry.workspace_id, entry.memory_id),
                     )
                     row = cur.fetchone()
                     if not row or row["lifecycle_status"] != MemoryLifecycleStatus.DRAFT.value:
@@ -385,7 +387,7 @@ class OrganizationalMemoryRepository:
                     row_data = self._entry_to_row(entry)
                     conn.execute("""
                         UPDATE organizational_memory_entries SET
-                            workspace_id = ?, plant_id = ?, asset_id = ?, process_id = ?, session_id = ?,
+                            plant_id = ?, asset_id = ?, process_id = ?, session_id = ?,
                             classification = ?, memory_type = ?, epistemic_status = ?, lifecycle_status = ?,
                             verification_status = ?, title = ?, summary = ?, content = ?, tags_json = ?,
                             source_references_json = ?, evidence_references_json = ?, decision_reference = ?,
@@ -395,8 +397,8 @@ class OrganizationalMemoryRepository:
                             hold_reason = ?, event_timestamp = ?, valid_from = ?, valid_until = ?, created_at = ?,
                             updated_at = ?, verified_at = ?, superseded_at = ?, archived_at = ?, created_by = ?,
                             verified_by = ?, superseded_by = ?, archived_by = ?, metadata_json = ?
-                        WHERE tenant_id = ? AND memory_id = ?
-                    """, row_data[2:] + (entry.tenant_id, entry.memory_id))
+                        WHERE tenant_id = ? AND workspace_id = ? AND memory_id = ?
+                    """, row_data[3:] + (entry.tenant_id, entry.workspace_id, entry.memory_id))
 
                     self._insert_audit_entry_conn(conn, audit)
                 return True
@@ -413,6 +415,7 @@ class OrganizationalMemoryRepository:
         """
         Atomically applies a lifecycle status transition, optional related entry update
         (e.g., superseding an older record), and writes mandatory audit logs in one transaction.
+        Enforces tenant_id and workspace_id boundaries.
         If any mutation or audit write fails, all changes are rolled back.
         """
         with self._lock:
@@ -423,7 +426,7 @@ class OrganizationalMemoryRepository:
                     row_data = self._entry_to_row(entry)
                     cursor = conn.execute("""
                         UPDATE organizational_memory_entries SET
-                            workspace_id = ?, plant_id = ?, asset_id = ?, process_id = ?, session_id = ?,
+                            plant_id = ?, asset_id = ?, process_id = ?, session_id = ?,
                             classification = ?, memory_type = ?, epistemic_status = ?, lifecycle_status = ?,
                             verification_status = ?, title = ?, summary = ?, content = ?, tags_json = ?,
                             source_references_json = ?, evidence_references_json = ?, decision_reference = ?,
@@ -433,8 +436,8 @@ class OrganizationalMemoryRepository:
                             hold_reason = ?, event_timestamp = ?, valid_from = ?, valid_until = ?, created_at = ?,
                             updated_at = ?, verified_at = ?, superseded_at = ?, archived_at = ?, created_by = ?,
                             verified_by = ?, superseded_by = ?, archived_by = ?, metadata_json = ?
-                        WHERE tenant_id = ? AND memory_id = ?
-                    """, row_data[2:] + (entry.tenant_id, entry.memory_id))
+                        WHERE tenant_id = ? AND workspace_id = ? AND memory_id = ?
+                    """, row_data[3:] + (entry.tenant_id, entry.workspace_id, entry.memory_id))
 
                     if cursor.rowcount == 0:
                         return False
@@ -447,7 +450,7 @@ class OrganizationalMemoryRepository:
                         extra_row = self._entry_to_row(extra_entry_to_update)
                         extra_cur = conn.execute("""
                             UPDATE organizational_memory_entries SET
-                                workspace_id = ?, plant_id = ?, asset_id = ?, process_id = ?, session_id = ?,
+                                plant_id = ?, asset_id = ?, process_id = ?, session_id = ?,
                                 classification = ?, memory_type = ?, epistemic_status = ?, lifecycle_status = ?,
                                 verification_status = ?, title = ?, summary = ?, content = ?, tags_json = ?,
                                 source_references_json = ?, evidence_references_json = ?, decision_reference = ?,
@@ -457,8 +460,8 @@ class OrganizationalMemoryRepository:
                                 hold_reason = ?, event_timestamp = ?, valid_from = ?, valid_until = ?, created_at = ?,
                                 updated_at = ?, verified_at = ?, superseded_at = ?, archived_at = ?, created_by = ?,
                                 verified_by = ?, superseded_by = ?, archived_by = ?, metadata_json = ?
-                            WHERE tenant_id = ? AND memory_id = ?
-                        """, extra_row[2:] + (extra_entry_to_update.tenant_id, extra_entry_to_update.memory_id))
+                            WHERE tenant_id = ? AND workspace_id = ? AND memory_id = ?
+                        """, extra_row[3:] + (extra_entry_to_update.tenant_id, extra_entry_to_update.workspace_id, extra_entry_to_update.memory_id))
                         if extra_cur.rowcount == 0:
                             raise RuntimeError(f"Failed to update superseded entry {extra_entry_to_update.memory_id}")
 
@@ -474,15 +477,23 @@ class OrganizationalMemoryRepository:
     # Retrieval & Search
     # -------------------------------------------------------------------------
 
-    def get_entry(self, tenant_id: str, memory_id: str) -> Optional[OrganizationalMemoryEntry]:
+    def get_entry(
+        self,
+        tenant_id: str,
+        workspace_id: str,
+        memory_id: str,
+    ) -> Optional[OrganizationalMemoryEntry]:
         """
-        Retrieves a single memory entry strictly partitioned by tenant_id.
+        Retrieves a single memory entry strictly partitioned by tenant_id and workspace_id.
         """
+        if not workspace_id or not workspace_id.strip():
+            raise ValueError("Authoritative workspace_id is required for memory entry retrieval.")
+
         with self._lock:
             with self._get_connection() as conn:
                 cur = conn.execute(
-                    "SELECT * FROM organizational_memory_entries WHERE tenant_id = ? AND memory_id = ?",
-                    (tenant_id, memory_id),
+                    "SELECT * FROM organizational_memory_entries WHERE tenant_id = ? AND workspace_id = ? AND memory_id = ?",
+                    (tenant_id, workspace_id, memory_id),
                 )
                 row = cur.fetchone()
                 if not row:
@@ -492,31 +503,42 @@ class OrganizationalMemoryRepository:
     def search_entries(
         self,
         tenant_id: str,
+        workspace_id: str,
         search_req: MemorySearchRequest,
         allowed_plant_ids: Optional[Set[str]] = None,
         max_classification: Optional[ClassificationLevel] = None,
     ) -> Tuple[List[OrganizationalMemoryEntry], int]:
         """
         Deterministic, bounded search query with strict server-side scoping:
-        - tenant_id filtering
-        - plant_id authorization filtering
+        - tenant_id and workspace_id mandatory filtering
+        - plant_id authorization filtering (strictly intersected with allowed_plant_ids)
         - classification ceiling filtering
         - optional metadata and lexical filters
         Returns (entries, total_matching_count).
         """
-        clauses = ["tenant_id = ?"]
-        params: List[Any] = [tenant_id]
+        if not workspace_id or not workspace_id.strip():
+            raise ValueError("Authoritative workspace_id is required for memory search.")
 
-        # Scope filters
-        if search_req.plant_id:
-            clauses.append("plant_id = ?")
-            params.append(search_req.plant_id)
-        elif allowed_plant_ids is not None:
+        clauses = ["tenant_id = ?", "workspace_id = ?"]
+        params: List[Any] = [tenant_id, workspace_id]
+
+        # Scope filters: strictly intersect requested plant with allowed_plant_ids
+        if allowed_plant_ids is not None:
             if not allowed_plant_ids:
                 return [], 0
-            placeholders = ",".join("?" for _ in allowed_plant_ids)
-            clauses.append(f"plant_id IN ({placeholders})")
-            params.extend(list(allowed_plant_ids))
+            if search_req.plant_id:
+                if search_req.plant_id not in allowed_plant_ids:
+                    # Client-supplied plant_id is outside authorized set -> intersection is empty!
+                    return [], 0
+                clauses.append("plant_id = ?")
+                params.append(search_req.plant_id)
+            else:
+                placeholders = ",".join("?" for _ in allowed_plant_ids)
+                clauses.append(f"plant_id IN ({placeholders})")
+                params.extend(list(allowed_plant_ids))
+        elif search_req.plant_id:
+            clauses.append("plant_id = ?")
+            params.append(search_req.plant_id)
 
         if search_req.asset_id:
             clauses.append("asset_id = ?")
@@ -632,23 +654,27 @@ class OrganizationalMemoryRepository:
     def get_audit_records(
         self,
         tenant_id: str,
+        workspace_id: str,
         memory_id: Optional[str] = None,
         limit: int = 50,
     ) -> List[MemoryAuditRecord]:
         """
-        Retrieves audit trail entries for a given tenant and optional memory_id.
+        Retrieves audit trail entries partitioned strictly by tenant_id and workspace_id.
         """
+        if not workspace_id or not workspace_id.strip():
+            raise ValueError("Authoritative workspace_id is required for audit retrieval.")
+
         with self._lock:
             with self._get_connection() as conn:
                 if memory_id:
                     cur = conn.execute(
-                        "SELECT * FROM organizational_memory_audit_ledger WHERE tenant_id = ? AND memory_id = ? ORDER BY timestamp DESC LIMIT ?",
-                        (tenant_id, memory_id, limit),
+                        "SELECT * FROM organizational_memory_audit_ledger WHERE tenant_id = ? AND workspace_id = ? AND memory_id = ? ORDER BY timestamp DESC LIMIT ?",
+                        (tenant_id, workspace_id, memory_id, limit),
                     )
                 else:
                     cur = conn.execute(
-                        "SELECT * FROM organizational_memory_audit_ledger WHERE tenant_id = ? ORDER BY timestamp DESC LIMIT ?",
-                        (tenant_id, limit),
+                        "SELECT * FROM organizational_memory_audit_ledger WHERE tenant_id = ? AND workspace_id = ? ORDER BY timestamp DESC LIMIT ?",
+                        (tenant_id, workspace_id, limit),
                     )
                 rows = cur.fetchall()
                 records: List[MemoryAuditRecord] = []
@@ -667,15 +693,19 @@ class OrganizationalMemoryRepository:
                     ))
                 return records
 
-    def clear_all_for_tenant(self, tenant_id: str) -> None:
+    def clear_all_for_tenant(self, tenant_id: str, workspace_id: Optional[str] = None) -> None:
         """
-        Purges memory and audit records for an explicit tenant (used for test teardown).
+        Purges memory and audit records for an explicit tenant (and optional workspace).
         """
         with self._lock:
             with self._get_connection() as conn:
                 with conn:
-                    conn.execute("DELETE FROM organizational_memory_entries WHERE tenant_id = ?", (tenant_id,))
-                    conn.execute("DELETE FROM organizational_memory_audit_ledger WHERE tenant_id = ?", (tenant_id,))
+                    if workspace_id:
+                        conn.execute("DELETE FROM organizational_memory_entries WHERE tenant_id = ? AND workspace_id = ?", (tenant_id, workspace_id))
+                        conn.execute("DELETE FROM organizational_memory_audit_ledger WHERE tenant_id = ? AND workspace_id = ?", (tenant_id, workspace_id))
+                    else:
+                        conn.execute("DELETE FROM organizational_memory_entries WHERE tenant_id = ?", (tenant_id,))
+                        conn.execute("DELETE FROM organizational_memory_audit_ledger WHERE tenant_id = ?", (tenant_id,))
                     conn.execute("DELETE FROM organizational_memory_relationships WHERE tenant_id = ?", (tenant_id,))
 
 

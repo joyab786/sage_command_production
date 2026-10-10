@@ -361,12 +361,12 @@ class TestMemoryRepositoryAndAtomicAuditing:
         saved = in_memory_repo.save_draft(entry, audit)
         assert saved.memory_id == "mem_repo_01"
 
-        retrieved = in_memory_repo.get_entry("tenant_alpha", "mem_repo_01")
+        retrieved = in_memory_repo.get_entry("tenant_alpha", "workspace_alpha", "mem_repo_01")
         assert retrieved is not None
         assert retrieved.title == entry.title
         assert retrieved.lifecycle_status == MemoryLifecycleStatus.DRAFT
 
-        audits = in_memory_repo.get_audit_records("tenant_alpha", "mem_repo_01")
+        audits = in_memory_repo.get_audit_records("tenant_alpha", "workspace_alpha", "mem_repo_01")
         assert len(audits) == 1
         assert audits[0].event_type == "ORGANIZATIONAL_MEMORY_CREATED"
 
@@ -403,7 +403,9 @@ class TestMemoryRepositoryAndAtomicAuditing:
         in_memory_repo.save_draft(entry, audit)
 
         # Tenant beta must NOT find entry
-        assert in_memory_repo.get_entry("tenant_beta", "mem_iso_01") is None
+        assert in_memory_repo.get_entry("tenant_beta", "workspace_alpha", "mem_iso_01") is None
+        # Workspace beta must NOT find entry
+        assert in_memory_repo.get_entry("tenant_alpha", "workspace_beta", "mem_iso_01") is None
 
     def test_atomic_mutation_rollback_on_audit_failure(self, in_memory_repo):
         """
@@ -468,7 +470,7 @@ class TestMemoryRepositoryAndAtomicAuditing:
             in_memory_repo.commit_lifecycle_mutation_atomic(updated_entry, colliding_audit)
 
         # Verify that entry in database remains in DRAFT status!
-        reloaded = in_memory_repo.get_entry("tenant_alpha", "mem_atomic_01")
+        reloaded = in_memory_repo.get_entry("tenant_alpha", "workspace_alpha", "mem_atomic_01")
         assert reloaded is not None
         assert reloaded.lifecycle_status == MemoryLifecycleStatus.DRAFT
         assert reloaded.verification_status == VerificationStatus.UNVERIFIED
@@ -647,7 +649,7 @@ class TestMemoryServiceLifecycleAndAuthorization:
         memory_service.verify_entry(entry.memory_id, MemoryVerifyRequest(activate_immediately=True), manager_identity)
 
         # Place hold directly via repository
-        reloaded = in_memory_repo.get_entry(entry.tenant_id, entry.memory_id)
+        reloaded = in_memory_repo.get_entry(entry.tenant_id, entry.workspace_id, entry.memory_id)
         reloaded_data = reloaded.model_dump()
         reloaded_data["is_hold"] = True
         reloaded_data["hold_reason"] = "OSHA Regulatory Inspection Hold"
@@ -1186,4 +1188,492 @@ class TestAdversarialAIContextInjection:
         # Excluded from search by default
         search_res = memory_service.search_memory(MemorySearchRequest(plant_id="plant_01"), manager_identity)
         assert not any(e.memory_id == entry.memory_id for e in search_res.entries)
+
+
+# =============================================================================
+# 9. PROMPT 34A NEGATIVE SECURITY & ISOLATION TESTS
+# =============================================================================
+
+class TestPrompt34ASecurityNegativeIsolation:
+    """
+    Prompt 34A Targeted Security Hardening Suite:
+    Proves strict workspace boundaries, plant assignment intersection,
+    canonical permission requirements, and transactional safety.
+    """
+
+    @pytest.fixture
+    def workspace_bravo_identity(self):
+        return Identity(
+            user_id="user_ws_bravo_01",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_bravo",
+            roles=["PLANT_MANAGER"],
+            permissions=["memory.read", "memory.write", "memory.verify", "memory.admin"],
+            assigned_plants=["plant_01"],
+            clearance_level=4,
+        )
+
+    @pytest.fixture
+    def plant_two_identity(self):
+        return Identity(
+            user_id="user_plant_two_01",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_alpha",
+            roles=["OPERATOR"],
+            permissions=["memory.read", "memory.write", "memory.verify"],
+            assigned_plants=["plant_02"],
+            clearance_level=4,
+        )
+
+    def test_workspace_a_cannot_retrieve_workspace_b_memory_same_tenant_plant(
+        self, memory_service, in_memory_repo, operator_identity, workspace_bravo_identity
+    ):
+        """
+        Workspace Alpha and Workspace Bravo share tenant_alpha and plant_01.
+        Workspace Bravo MUST NOT be able to retrieve Workspace Alpha's memory entries.
+        """
+        draft_req = MemoryDraftCreateRequest(
+            memory_type=MemoryType.LESSON_LEARNED,
+            title="Workspace Alpha specific operating parameter",
+            summary="Confidential to workspace alpha",
+            content="Critical operating parameters for plant_01 under workspace alpha.",
+            plant_id="plant_01",
+        )
+        entry_alpha = memory_service.create_draft(draft_req, operator_identity)
+        assert entry_alpha.workspace_id == "workspace_alpha"
+
+        # Service retrieval by Workspace Bravo user must fail closed (return None)
+        assert memory_service.get_entry(entry_alpha.memory_id, workspace_bravo_identity) is None
+
+        # Repository level retrieval with workspace_bravo must return None
+        assert in_memory_repo.get_entry("tenant_alpha", "workspace_bravo", entry_alpha.memory_id) is None
+
+        # Authoritative Workspace Alpha retrieval succeeds
+        retrieved = memory_service.get_entry(entry_alpha.memory_id, operator_identity)
+        assert retrieved is not None
+        assert retrieved.memory_id == entry_alpha.memory_id
+
+    def test_workspace_a_cannot_search_workspace_b_records(
+        self, memory_service, operator_identity, manager_identity, workspace_bravo_identity
+    ):
+        """
+        Searching within plant_01 must strictly exclude records from other workspaces.
+        """
+        # Create and activate entry in Workspace Alpha
+        draft_req = MemoryDraftCreateRequest(
+            memory_type=MemoryType.OPERATIONAL_DECISION,
+            title="Alpha Decision 441",
+            summary="Decision summary",
+            content="Decision content for plant_01.",
+            plant_id="plant_01",
+        )
+        entry_alpha = memory_service.create_draft(draft_req, operator_identity)
+        memory_service.verify_entry(
+            entry_alpha.memory_id,
+            MemoryVerifyRequest(activate_immediately=True),
+            manager_identity,
+        )
+
+        # Workspace Bravo search must find 0 entries
+        search_req = MemorySearchRequest(plant_id="plant_01", query="Decision 441")
+        bravo_res = memory_service.search_memory(search_req, workspace_bravo_identity)
+        assert bravo_res.total_count == 0
+        assert len(bravo_res.entries) == 0
+
+        # Workspace Alpha search finds the entry
+        alpha_res = memory_service.search_memory(search_req, manager_identity)
+        assert alpha_res.total_count == 1
+        assert alpha_res.entries[0].memory_id == entry_alpha.memory_id
+
+    def test_search_counts_do_not_disclose_inaccessible_workspace_records(
+        self, in_memory_repo
+    ):
+        """
+        Total search counts must strictly be scoped by (tenant_id, workspace_id).
+        """
+        now = datetime.now(timezone.utc)
+        # Populate 3 entries in workspace_alpha
+        for i in range(3):
+            e = OrganizationalMemoryEntry(
+                memory_id=f"mem_alpha_{i}",
+                tenant_id="tenant_alpha",
+                workspace_id="workspace_alpha",
+                plant_id="plant_01",
+                memory_type=MemoryType.LESSON_LEARNED,
+                epistemic_status=EpistemicStatus.REPORTED_CLAIM,
+                lifecycle_status=MemoryLifecycleStatus.ACTIVE,
+                verification_status=VerificationStatus.VERIFIED,
+                verified_by="user_01",
+                verified_at=now,
+                classification=ClassificationLevel.INTERNAL,
+                title=f"Alpha entry {i}",
+                summary="summary",
+                content="content",
+                created_by="user_01",
+                created_at=now,
+                updated_at=now,
+            )
+            aud = MemoryAuditRecord(
+                audit_id=f"aud_a_{i}",
+                event_type="ORGANIZATIONAL_MEMORY_CREATED",
+                memory_id=e.memory_id,
+                tenant_id=e.tenant_id,
+                workspace_id=e.workspace_id,
+                plant_id=e.plant_id,
+                actor_id="user_01",
+                outcome="SUCCESS",
+            )
+            in_memory_repo.save_draft(e, aud)
+
+        # Populate 2 entries in workspace_bravo
+        for i in range(2):
+            e = OrganizationalMemoryEntry(
+                memory_id=f"mem_bravo_{i}",
+                tenant_id="tenant_alpha",
+                workspace_id="workspace_bravo",
+                plant_id="plant_01",
+                memory_type=MemoryType.LESSON_LEARNED,
+                epistemic_status=EpistemicStatus.REPORTED_CLAIM,
+                lifecycle_status=MemoryLifecycleStatus.ACTIVE,
+                verification_status=VerificationStatus.VERIFIED,
+                verified_by="user_01",
+                verified_at=now,
+                classification=ClassificationLevel.INTERNAL,
+                title=f"Bravo entry {i}",
+                summary="summary",
+                content="content",
+                created_by="user_01",
+                created_at=now,
+                updated_at=now,
+            )
+            aud = MemoryAuditRecord(
+                audit_id=f"aud_b_{i}",
+                event_type="ORGANIZATIONAL_MEMORY_CREATED",
+                memory_id=e.memory_id,
+                tenant_id=e.tenant_id,
+                workspace_id=e.workspace_id,
+                plant_id=e.plant_id,
+                actor_id="user_01",
+                outcome="SUCCESS",
+            )
+            in_memory_repo.save_draft(e, aud)
+
+        # Search scoped to workspace_alpha
+        s_req = MemorySearchRequest()
+        _, total_alpha = in_memory_repo.search_entries(
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_alpha",
+            search_req=s_req,
+        )
+        assert total_alpha == 3
+
+        # Search scoped to workspace_bravo
+        _, total_bravo = in_memory_repo.search_entries(
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_bravo",
+            search_req=s_req,
+        )
+        assert total_bravo == 2
+
+    def test_workspace_a_cannot_mutate_workspace_b_entries(
+        self, memory_service, operator_identity, manager_identity, workspace_bravo_identity
+    ):
+        """
+        Lifecycle mutations (update, submit, verify, activate, supersede, archive, revoke)
+        initiated by an actor in Workspace Bravo against a Workspace Alpha entry MUST FAIL CLOSED (KeyError).
+        """
+        # Create draft in Workspace Alpha
+        draft_req = MemoryDraftCreateRequest(
+            memory_type=MemoryType.LESSON_LEARNED,
+            title="Alpha Draft Under Protection",
+            summary="Summary",
+            content="Protected content.",
+            plant_id="plant_01",
+        )
+        entry_alpha = memory_service.create_draft(draft_req, operator_identity)
+
+        # 1. Update draft
+        with pytest.raises(KeyError):
+            memory_service.update_draft(
+                entry_alpha.memory_id,
+                MemoryDraftUpdateRequest(title="Malicious update from Bravo"),
+                workspace_bravo_identity,
+            )
+
+        # 2. Submit for review
+        with pytest.raises(KeyError):
+            memory_service.submit_for_review(entry_alpha.memory_id, workspace_bravo_identity)
+
+        # 3. Verify entry
+        with pytest.raises(KeyError):
+            memory_service.verify_entry(
+                entry_alpha.memory_id,
+                MemoryVerifyRequest(verification_status=VerificationStatus.VERIFIED),
+                workspace_bravo_identity,
+            )
+
+        # 4. Activate entry
+        with pytest.raises(KeyError):
+            memory_service.activate_entry(entry_alpha.memory_id, workspace_bravo_identity)
+
+        # 5. Supersede entry
+        with pytest.raises(KeyError):
+            memory_service.supersede_entry(
+                entry_alpha.memory_id,
+                MemorySupersedeRequest(reason="Malicious supersession"),
+                workspace_bravo_identity,
+            )
+
+        # 6. Archive entry
+        with pytest.raises(KeyError):
+            memory_service.archive_entry(
+                entry_alpha.memory_id,
+                MemoryArchiveRequest(archive_reason="Malicious archive"),
+                workspace_bravo_identity,
+            )
+
+        # 7. Revoke entry
+        with pytest.raises(KeyError):
+            memory_service.revoke_entry(
+                entry_alpha.memory_id,
+                reason="Malicious revoke",
+                identity=workspace_bravo_identity,
+            )
+
+        # Ensure Workspace Alpha entry is still completely intact in DRAFT state
+        intact = memory_service.get_entry(entry_alpha.memory_id, operator_identity)
+        assert intact is not None
+        assert intact.title == "Alpha Draft Under Protection"
+        assert intact.lifecycle_status == MemoryLifecycleStatus.DRAFT
+
+    def test_user_assigned_plant_a_cannot_search_plant_b_by_supplying_plant_id(
+        self, memory_service, operator_identity, manager_identity, plant_two_identity
+    ):
+        """
+        A user assigned Plant 02 supplying plant_id='plant_01' MUST NEVER receive plant_01 records.
+        """
+        # Create active verified record in plant_01
+        draft_req = MemoryDraftCreateRequest(
+            memory_type=MemoryType.INCIDENT_LEARNING,
+            title="Plant 01 Boiler Flameout Analysis",
+            summary="Flameout root cause.",
+            content="Detailed burner failure analysis in plant_01.",
+            plant_id="plant_01",
+        )
+        entry = memory_service.create_draft(draft_req, operator_identity)
+        memory_service.verify_entry(entry.memory_id, MemoryVerifyRequest(activate_immediately=True), manager_identity)
+
+        # Plant 02 user attempts to search plant_01 by setting plant_id="plant_01"
+        search_req = MemorySearchRequest(plant_id="plant_01")
+        search_res = memory_service.search_memory(search_req, plant_two_identity)
+        assert search_res.total_count == 0
+        assert len(search_res.entries) == 0
+
+    def test_plant_b_content_and_counts_not_returned_in_context_assembly(
+        self, memory_service, operator_identity, manager_identity, plant_two_identity
+    ):
+        """
+        Context assembly for Plant 02 user MUST NOT return Plant 01 content or counts.
+        """
+        # Create active verified entry in plant_01
+        draft_req = MemoryDraftCreateRequest(
+            memory_type=MemoryType.INCIDENT_LEARNING,
+            title="Plant 01 Safety Isolation Rule",
+            summary="Lockout tagout rule for plant_01.",
+            content="Critical safety procedure for plant_01.",
+            plant_id="plant_01",
+        )
+        entry = memory_service.create_draft(draft_req, operator_identity)
+        memory_service.verify_entry(entry.memory_id, MemoryVerifyRequest(activate_immediately=True), manager_identity)
+
+        # Plant 02 caller specifies plant_id="plant_01" -> PermissionError (unauthorized plant)
+        ctx_req_explicit = MemoryContextAssemblyRequest(plant_id="plant_01")
+        with pytest.raises(PermissionError, match="lacks access to plant"):
+            memory_service.assemble_context(ctx_req_explicit, plant_two_identity)
+
+        # Plant 02 caller omits plant_id -> searches within caller's allowed plant (plant_02), returns 0 items and excludes plant_01
+        ctx_req_scoped = MemoryContextAssemblyRequest()
+        ctx_res = memory_service.assemble_context(ctx_req_scoped, plant_two_identity)
+        assert ctx_res.item_count == 0
+        assert ctx_res.is_sufficient is False
+        assert entry.memory_id not in ctx_res.formatted_prompt_block
+
+    def test_empty_plant_assignments_fail_closed(self, memory_service):
+        """
+        An authenticated identity with no assigned plants ([] or None) must fail closed.
+        """
+        unassigned_identity = Identity(
+            user_id="user_unassigned_01",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_alpha",
+            roles=["OPERATOR"],
+            permissions=["memory.read", "memory.write"],
+            assigned_plants=[],
+            clearance_level=2,
+        )
+
+        # Draft creation fails closed
+        draft_req = MemoryDraftCreateRequest(
+            memory_type=MemoryType.LESSON_LEARNED,
+            title="Draft by unassigned user",
+            summary="Summary",
+            content="Content",
+            plant_id="plant_01",
+        )
+        with pytest.raises(PermissionError, match="has no assigned plants"):
+            memory_service.create_draft(draft_req, unassigned_identity)
+
+        # Search fails closed
+        with pytest.raises(PermissionError, match="has no assigned plants"):
+            memory_service.search_memory(MemorySearchRequest(), unassigned_identity)
+
+        # Context assembly fails closed
+        with pytest.raises(PermissionError, match="has no assigned plants"):
+            memory_service.assemble_context(MemoryContextAssemblyRequest(), unassigned_identity)
+
+        # Get entry fails closed
+        with pytest.raises(PermissionError, match="has no assigned plants"):
+            memory_service.get_entry("mem_test_01", unassigned_identity)
+
+    def test_missing_authoritative_workspace_fails_closed(self, memory_service):
+        """
+        An identity missing workspace_id must fail closed immediately rather than
+        defaulting to 'workspace_default'.
+        """
+        no_ws_identity = Identity(
+            user_id="user_no_ws",
+            tenant_id="tenant_alpha",
+            workspace_id="",  # Missing workspace
+            roles=["OPERATOR"],
+            permissions=["memory.read", "memory.write"],
+            assigned_plants=["plant_01"],
+            clearance_level=2,
+        )
+
+        draft_req = MemoryDraftCreateRequest(
+            memory_type=MemoryType.LESSON_LEARNED,
+            title="Draft missing workspace",
+            summary="Summary",
+            content="Content",
+            plant_id="plant_01",
+        )
+        with pytest.raises(PermissionError, match="workspace_id is missing"):
+            memory_service.create_draft(draft_req, no_ws_identity)
+
+        with pytest.raises(PermissionError, match="workspace_id is missing"):
+            memory_service.get_entry("mem_test_01", no_ws_identity)
+
+        with pytest.raises(PermissionError, match="workspace_id is missing"):
+            memory_service.search_memory(MemorySearchRequest(), no_ws_identity)
+
+    def test_generic_role_strings_cannot_bypass_canonical_authorization(self, memory_service):
+        """
+        Generic strings like 'admin', 'administrator', 'system' must not grant memory authority.
+        Only explicit permissions ('memory.read', 'memory.write', 'memory.verify', 'memory.admin') are recognized.
+        """
+        spoofed_identity = Identity(
+            user_id="user_spoofed_admin",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_alpha",
+            roles=["admin", "administrator"],
+            permissions=["admin", "administrator", "system"],  # Lacks canonical memory.* perms
+            assigned_plants=["plant_01"],
+            clearance_level=4,
+        )
+
+        draft_req = MemoryDraftCreateRequest(
+            memory_type=MemoryType.LESSON_LEARNED,
+            title="Draft with generic admin role",
+            summary="Summary",
+            content="Content",
+            plant_id="plant_01",
+        )
+        with pytest.raises(PermissionError, match="lacks required permission 'memory.write'"):
+            memory_service.create_draft(draft_req, spoofed_identity)
+
+        with pytest.raises(PermissionError, match="lacks required permission 'memory.read'"):
+            memory_service.get_entry("mem_test_01", spoofed_identity)
+
+    def test_existing_authorized_same_workspace_plant_flow_intact(
+        self, memory_service, operator_identity, manager_identity
+    ):
+        """
+        Authorized full lifecycle flow within the same tenant, workspace, and plant succeeds seamlessly.
+        """
+        draft_req = MemoryDraftCreateRequest(
+            memory_type=MemoryType.OPERATIONAL_DECISION,
+            title="Authorized Turbine Trip Limit Adjustment",
+            summary="Adjusted overspeed trip threshold based on OEM bulletin.",
+            content="OEM Bulletin B-998 requires setting governor trip to 3300 RPM.",
+            plant_id="plant_01",
+            asset_id="turbine_t01",
+        )
+        entry = memory_service.create_draft(draft_req, operator_identity)
+        assert entry.workspace_id == "workspace_alpha"
+        assert entry.plant_id == "plant_01"
+
+        # Submit
+        submitted = memory_service.submit_for_review(entry.memory_id, operator_identity)
+        assert submitted.lifecycle_status == MemoryLifecycleStatus.PENDING_REVIEW
+
+        # Verify & Activate
+        verified = memory_service.verify_entry(
+            entry.memory_id,
+            MemoryVerifyRequest(activate_immediately=True),
+            manager_identity,
+        )
+        assert verified.lifecycle_status == MemoryLifecycleStatus.ACTIVE
+        assert verified.verification_status == VerificationStatus.VERIFIED
+
+        # Search finds it
+        s_res = memory_service.search_memory(
+            MemorySearchRequest(plant_id="plant_01", asset_id="turbine_t01"),
+            manager_identity,
+        )
+        assert s_res.total_count == 1
+        assert s_res.entries[0].memory_id == entry.memory_id
+
+    def test_api_route_workspace_isolation_for_audit_trail(
+        self, client, operator_identity, workspace_bravo_identity
+    ):
+        """
+        API endpoint /api/v3/memory/{memory_id}/audit must return 404/403 for callers
+        attempting to inspect audit trails of other workspaces.
+        """
+        app.dependency_overrides[get_current_identity] = lambda: operator_identity
+        try:
+            payload = {
+                "memory_type": "LESSON_LEARNED",
+                "title": "Alpha Audit Boundary Test",
+                "summary": "Summary",
+                "content": "Content",
+                "plant_id": "plant_01",
+            }
+            create_resp = client.post("/api/v3/memory/drafts", json=payload)
+            assert create_resp.status_code == 201
+            entry_id = create_resp.json()["memory_id"]
+        finally:
+            app.dependency_overrides.pop(get_current_identity, None)
+
+        # Caller from Workspace Bravo requests audit of entry created in Workspace Alpha
+        app.dependency_overrides[get_current_identity] = lambda: workspace_bravo_identity
+        try:
+            resp = client.get(f"/api/v3/memory/{entry_id}/audit")
+            # Must return 404 Not Found (entry does not exist in Workspace Bravo)
+            assert resp.status_code == 404
+        finally:
+            app.dependency_overrides.pop(get_current_identity, None)
+
+        # Authoritative Workspace Alpha caller receives the audit record
+        app.dependency_overrides[get_current_identity] = lambda: operator_identity
+        try:
+            resp_alpha = client.get(f"/api/v3/memory/{entry_id}/audit")
+            assert resp_alpha.status_code == 200
+            audits = resp_alpha.json()
+            assert len(audits) >= 1
+            assert audits[0]["memory_id"] == entry_id
+            assert audits[0]["workspace_id"] == "workspace_alpha"
+        finally:
+            app.dependency_overrides.pop(get_current_identity, None)
+
 

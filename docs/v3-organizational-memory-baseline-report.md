@@ -1,17 +1,20 @@
-# SageCommand V3 — Governed Organizational Memory Foundation Baseline Report (Prompt 34)
+# SageCommand V3 — Governed Organizational Memory Foundation Baseline Report (Prompt 34 & 34A)
 
 **Repository:** `joyab786/sage_command_production`  
 **Workspace:** `E:\js\sage_command_production`  
 **Branch:** `main`  
-**Starting Commit:** `262501450f2100b1b0eac7f709ab45de7843d642`  
-**Final Commit:** `94219fa22d410d31fd9f0b4e884f0010445afdb7`  
-**Baseline Verification:** Clean working tree confirmed against `origin/main` at start of prompt.
+
+### Commit Lineage
+- **Starting Baseline:** `262501450f2100b1b0eac7f709ab45de7843d642` (Prompt 33B completion)
+- **Prompt 34 Implementation Commit:** `94219fa22d410d31fd9f0b4e884f0010445afdb7` (`feat(v3): implement governed organizational memory foundation (Prompt 34)`)
+- **Prompt 34 Documentation Follow-up Commit:** `dafd1cf4eea0d77a7705e83b533123ea956db57e` (`docs(v3): record final commit SHA in Prompt 34 baseline report`)
+- **Prompt 34A Targeted Security Hardening Commit:** Current working tree (`fix(v3): enforce organizational memory workspace and plant isolation (Prompt 34A)`)
 
 ---
 
 ## 1. Executive Summary
 
-This report documents the implementation of the **Governed Organizational Memory Foundation** (Prompt 34) in SageCommand V3.
+This report documents the implementation of the **Governed Organizational Memory Foundation** (Prompt 34) and the targeted security hardening corrections (Prompt 34A) in SageCommand V3.
 
 Organizational memory preserves and retrieves institutional knowledge—such as human decisions, operational lessons learned, verified mitigation outcomes, and corrected engineering assumptions—across sessions and plants without confusing historical statements with authoritative execution commands.
 
@@ -19,6 +22,13 @@ Organizational memory preserves and retrieves institutional knowledge—such as 
 `ADVISORY ORGANIZATIONAL MEMORY CONTEXT ONLY — NEVER EXECUTES ACTIONS, MUTATES EQUIPMENT, OR BYPASSES OPERATIONAL GOVERNANCE.`
 
 All lifecycle mutations and mandatory audit records commit within atomic database transactions, preventing the audit atomicity defect previously remediated in Prompt 33B.
+
+### Prompt 34A Targeted Hardening Highlights
+1. **Authoritative Workspace Boundary:** All reads, searches, context assembly, mutations, and audit queries enforce server-derived `workspace_id`. Client-provided workspace identifiers are never trusted. Missing authoritative workspace fails closed (synthetic `workspace_default` eliminated).
+2. **Repository-Level Workspace Isolation:** Updated schema primary key to `(tenant_id, workspace_id, memory_id)` and added workspace predicates across lookups, mutation updates, and search counts.
+3. **Assigned Plant Intersection & Fail-Closed Scoping:** Client-supplied `plant_id` must intersect with caller's authorized plant set; client input can never expand plant access. Missing or empty plant assignments fail closed (synthetic `plant_default` eliminated).
+4. **Canonical Permission Enforcement:** Removed generic bypass strings (`admin`, `administrator`, `system`) from service-level validation. Exact canonical permissions (`memory.read`, `memory.write`, `memory.verify`, `memory.admin`) are required.
+5. **Mutation-Audit Atomicity Preserved:** Authorization checks precede any mutations; denied operations fail closed without state changes or success audit events.
 
 ---
 
@@ -49,17 +59,18 @@ All lifecycle mutations and mandatory audit records commit within atomic databas
 
 All tests executed successfully in the actual repository environment:
 
-### Focused Prompt 34 Suite
+### Focused Prompt 34 & 34A Suite
 - **Command:** `pytest backend/test_v3_organizational_memory.py -v`
-- **Result:** **51 passed**, 0 failed (100% pass rate).
+- **Result:** **62 passed**, 0 failed (100% pass rate, including 11 targeted Prompt 34A negative security and isolation tests).
 
 ### V3 Regression Suites
 - **SOP / RAG (Prompt 33/33A/33B):** `pytest backend/test_v3_sop_rag.py -q` -> **133 passed**
 - **Evidence & Confidence (Prompt 31/32):** `pytest backend/test_v3_evidence_explainability.py backend/test_v3_confidence_uncertainty.py -q` -> **292 passed**
 - **Security, Auth & Gateway:** `pytest backend/test_v3_authorization.py backend/test_v3_security.py backend/test_v3_execution_gateway.py backend/test_v3_decision_engine.py backend/test_v3_audit_ledger.py -q` -> **200 passed**
 - **Incident & RCA:** `pytest backend/test_v3_incident_management.py backend/test_v3_root_cause_analysis.py -q` -> **86 passed**
+- **Optimization:** `pytest backend/test_v3_optimization.py -q` -> **116 passed**
 
-**Total Passing Tests Across Verified Suites:** **762 passed**, 0 failed.
+**Total Passing Tests Across Verified Suites:** **889 passed**, 0 failed.
 
 ---
 

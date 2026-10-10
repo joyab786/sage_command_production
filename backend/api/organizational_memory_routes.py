@@ -386,11 +386,25 @@ async def get_memory_audit_trail(
     Requires 'memory.read' permission.
     """
     try:
+        if not user.workspace_id or not user.workspace_id.strip():
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Authoritative workspace_id is missing from identity context.",
+            )
+        entry = organizational_memory_service.get_entry(memory_id, user)
+        if not entry:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Organizational memory entry '{memory_id}' not found.",
+            )
         return organizational_memory_repository.get_audit_records(
             tenant_id=user.tenant_id,
+            workspace_id=user.workspace_id,
             memory_id=memory_id,
             limit=limit,
         )
+    except HTTPException:
+        raise
     except PermissionError as pe:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(pe))
     except Exception as e:
