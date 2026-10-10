@@ -90,6 +90,7 @@ class ConfidenceDimensionType(str, Enum):
     CONTEXT_COVERAGE = "CONTEXT_COVERAGE"
     MODEL_CALIBRATION = "MODEL_CALIBRATION"
     LINEAGE_INTEGRITY = "LINEAGE_INTEGRITY"
+    PROVENANCE = "PROVENANCE"
 
 
 class ConfidenceStatus(str, Enum):
@@ -570,6 +571,7 @@ class ConfidenceUncertaintyRequest(BaseModel):
     weights_override: Optional[Dict[str, float]] = Field(default=None, description="Custom dimension weights.")
     include_ranges: bool = Field(default=True, description="Whether to compute quantitative uncertainty ranges.")
     include_sensitivities: bool = Field(default=True, description="Whether to evaluate parameter sensitivities.")
+    calibration: Optional[ConfidenceCalibrationMetadata] = Field(default=None, description="Optional empirical calibration metadata.")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional context metadata.")
 
     @field_validator("target_type", "target_id", "tenant_id", "workspace_id")

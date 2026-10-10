@@ -439,7 +439,7 @@ class TestConfidenceDimensionsAndScoring:
             freshness_threshold=86400.0,
             plant_id="PLANT-01",
         )
-        assert len(dims) == 10
+        assert len(dims) == 11
         assert "MISSING_ALL_SUPPORTING_EVIDENCE" in defs
         comp_dim = next(d for d in dims if d.dimension_type == ConfidenceDimensionType.EVIDENCE_COMPLETENESS)
         assert comp_dim.is_assessed is False
@@ -454,7 +454,7 @@ class TestConfidenceDimensionsAndScoring:
             freshness_threshold=86400.0,
             plant_id="PLANT-01",
         )
-        assert len(dims) == 10
+        assert len(dims) == 11
         qual_dim = next(d for d in dims if d.dimension_type == ConfidenceDimensionType.EVIDENCE_QUALITY)
         assert qual_dim.score == pytest.approx(0.95, rel=1e-2)
 
@@ -487,11 +487,12 @@ class TestConfidenceDimensionsAndScoring:
         assert temp_dim.score == 0.0
         assert "FUTURE_DATED_EVIDENCE_LEAKAGE" in defs
 
-    def test_025_eval_dimensions_provenance_weighting(self, sample_evidence_record):
-        sim_ev = sample_evidence_record.model_copy()
-        sim_ev.provenance = EvidenceProvenance.SIMULATED
+    def test_025_eval_dimensions_source_reliability_metadata(self, sample_evidence_record):
+        # Provenance alone does not determine reliability; defensible metadata does
+        ev_with_meta = sample_evidence_record.model_copy()
+        ev_with_meta.metadata = {"source_reliability": 0.88, "historical_performance": 0.90}
         dims, _ = ConfidenceDimensionEvaluator.evaluate_dimensions(
-            evidence_items=[sim_ev],
+            evidence_items=[ev_with_meta],
             target_type="DECISION_ENGINE",
             target_id="dec_1",
             assessment_ts="2026-05-01T12:00:00Z",
@@ -499,7 +500,8 @@ class TestConfidenceDimensionsAndScoring:
             plant_id="PLANT-01",
         )
         rel_dim = next(d for d in dims if d.dimension_type == ConfidenceDimensionType.SOURCE_RELIABILITY)
-        assert rel_dim.score == 0.65  # SIMULATED weight is 0.65
+        assert rel_dim.score == 0.88
+        assert rel_dim.is_assessed is True
 
     def test_026_eval_dimensions_conflict_penalty(self, sample_evidence_record):
         conflicts = [{"conflict_id": "c1", "description": "Temperature contradiction"}]
@@ -545,7 +547,8 @@ class TestConfidenceDimensionsAndScoring:
         assert ctx_dim.score == 0.75
         assert "PLANT_SCOPE_UNSPECIFIED" in ctx_dim.deficiencies
 
-    def test_029_eval_dimensions_model_calibration_uncalibrated_notice(self, sample_evidence_record):
+    def test_029_eval_dimensions_model_calibration_uncalibrated_not_assessable(self, sample_evidence_record):
+        # Uncalibrated methods return score=None and NOT_ASSESSABLE, never an arbitrary 0.50
         dims, _ = ConfidenceDimensionEvaluator.evaluate_dimensions(
             evidence_items=[sample_evidence_record],
             target_type="DECISION_ENGINE",
@@ -555,8 +558,11 @@ class TestConfidenceDimensionsAndScoring:
             plant_id="PLANT-01",
         )
         cal_dim = next(d for d in dims if d.dimension_type == ConfidenceDimensionType.MODEL_CALIBRATION)
-        assert cal_dim.score == 0.50
-        assert "not a calibrated statistical probability" in cal_dim.explanation.lower()
+        assert cal_dim.score is None
+        assert cal_dim.is_assessed is False
+        assert cal_dim.status == "NOT_ASSESSABLE"
+        assert "cannot be interpreted as a probability" in cal_dim.explanation.lower()
+        assert "UNCALIBRATED_HEURISTIC" in cal_dim.deficiencies
 
     def test_030_eval_dimensions_lineage_unresolved_parents(self, sample_evidence_record):
         orphan_ev = sample_evidence_record.model_copy()
@@ -716,7 +722,7 @@ class TestConfidenceDimensionsAndScoring:
             evidence_items=[sample_evidence_record],
         )
         res = confidence_uncertainty_service.assess(req)
-        assert len(res.confidence.contributions) == 10
+        assert len(res.confidence.contributions) == 11
 
 
 # =============================================================================
@@ -2171,3 +2177,146 @@ class TestArchitecturalBoundariesAndAST:
         assert res1.fingerprint == res2.fingerprint
         assert res1.confidence.aggregate_score == res2.confidence.aggregate_score
         assert res1.confidence.status == res2.confidence.status
+
+    def test_146_provenance_alone_does_not_determine_reliability(self, sample_evidence_record):
+        """Verifies that provenance tier does NOT dictate reliability: a FORECAST with high validation outperforms an OBSERVED with poor metadata."""
+        # Faulty/degraded OBSERVED sensor telemetry
+        observed_faulty = sample_evidence_record.model_copy()
+        observed_faulty.provenance = EvidenceProvenance.OBSERVED
+        observed_faulty.confidence_score = None
+        observed_faulty.metadata = {"validation_status": "DEGRADED", "sensor_health": 0.25}
+
+        # Rigorously backtested, validated FORECAST
+        forecast_validated = sample_evidence_record.model_copy()
+        forecast_validated.provenance = EvidenceProvenance.FORECAST
+        forecast_validated.confidence_score = None
+        forecast_validated.metadata = {"validation_status": "VALID", "historical_performance": 0.96}
+
+        dims_obs, _ = ConfidenceDimensionEvaluator.evaluate_dimensions(
+            evidence_items=[observed_faulty], target_type="DECISION_ENGINE", target_id="d1",
+            assessment_ts="2026-05-01T12:00:00Z", freshness_threshold=86400.0, plant_id="PLANT-01",
+        )
+        dims_fc, _ = ConfidenceDimensionEvaluator.evaluate_dimensions(
+            evidence_items=[forecast_validated], target_type="DECISION_ENGINE", target_id="d1",
+            assessment_ts="2026-05-01T12:00:00Z", freshness_threshold=86400.0, plant_id="PLANT-01",
+        )
+
+        obs_rel = next(d for d in dims_obs if d.dimension_type == ConfidenceDimensionType.SOURCE_RELIABILITY)
+        fc_rel = next(d for d in dims_fc if d.dimension_type == ConfidenceDimensionType.SOURCE_RELIABILITY)
+
+        # Validated FORECAST has higher reliability than faulty OBSERVED
+        assert obs_rel.score == 0.25
+        assert fc_rel.score == 0.96
+        assert fc_rel.score > obs_rel.score
+
+    def test_147_unknown_provenance_is_limitation_not_arbitrary_score(self, sample_evidence_record):
+        """Verifies that UNKNOWN provenance produces a NOT_ASSESSABLE status and explicit limitation, never an invented score."""
+        unknown_ev = sample_evidence_record.model_copy()
+        unknown_ev.provenance = EvidenceProvenance.UNKNOWN
+
+        dims, blocking = ConfidenceDimensionEvaluator.evaluate_dimensions(
+            evidence_items=[unknown_ev], target_type="DECISION_ENGINE", target_id="d1",
+            assessment_ts="2026-05-01T12:00:00Z", freshness_threshold=86400.0, plant_id="PLANT-01",
+        )
+        prov_dim = next(d for d in dims if d.dimension_type == ConfidenceDimensionType.PROVENANCE)
+        assert prov_dim.score is None
+        assert prov_dim.is_assessed is False
+        assert prov_dim.status == "NOT_ASSESSABLE"
+        assert "UNKNOWN_PROVENANCE_LIMITATION" in blocking
+        assert "UNKNOWN_PROVENANCE_LIMITATION" in prov_dim.deficiencies
+
+    def test_148_provenance_dimension_evaluated_separately(self, sample_evidence_record):
+        """Verifies that provenance is tracked as its own independent dimension distinct from source reliability."""
+        ev = sample_evidence_record.model_copy()
+        ev.provenance = EvidenceProvenance.SIMULATED
+        ev.metadata = {"source_reliability": 0.92}
+
+        dims, _ = ConfidenceDimensionEvaluator.evaluate_dimensions(
+            evidence_items=[ev], target_type="DECISION_ENGINE", target_id="d1",
+            assessment_ts="2026-05-01T12:00:00Z", freshness_threshold=86400.0, plant_id="PLANT-01",
+        )
+        prov_dim = next(d for d in dims if d.dimension_type == ConfidenceDimensionType.PROVENANCE)
+        rel_dim = next(d for d in dims if d.dimension_type == ConfidenceDimensionType.SOURCE_RELIABILITY)
+
+        assert prov_dim.dimension_type == ConfidenceDimensionType.PROVENANCE
+        assert rel_dim.dimension_type == ConfidenceDimensionType.SOURCE_RELIABILITY
+        assert prov_dim.score == 1.0  # Documented SIMULATED provenance is valid
+        assert rel_dim.score == 0.92  # Evaluated from metadata
+
+    def test_149_uncalibrated_method_no_arbitrary_baseline(self, sample_evidence_record):
+        """Verifies that uncalibrated methods do NOT receive 0.50 or any arbitrary baseline; calibration is NOT_ASSESSABLE."""
+        req = ConfidenceUncertaintyRequest(
+            target_type="DECISION_ENGINE",
+            target_id="dec_uncal_01",
+            tenant_id="tenant_conf_1",
+            workspace_id="workspace_conf_1",
+            plant_id="PLANT-01",
+            evidence_items=[sample_evidence_record],
+            calibration=None,  # No empirical calibration
+        )
+        res = confidence_uncertainty_service.assess(req)
+        cal_dim = next(d for d in res.confidence.dimensions if d.dimension_type == ConfidenceDimensionType.MODEL_CALIBRATION)
+
+        assert cal_dim.score is None
+        assert cal_dim.is_assessed is False
+        assert cal_dim.status == "NOT_ASSESSABLE"
+        assert "UNCALIBRATED_HEURISTIC" in cal_dim.deficiencies
+        # Verified that no limitation claims a 50% probability baseline
+        assert any("NOT_STATISTICAL_PROBABILITY" in lim.code for lim in res.limitations)
+
+    def test_150_empirical_calibration_when_provided(self, sample_evidence_record):
+        """Verifies that when empirical calibration metadata is provided, calibration dimension is quantified."""
+        cal_meta = ConfidenceCalibrationMetadata(
+            is_calibrated=True,
+            calibration_status=CalibrationStatus.CALIBRATED,
+            calibration_method="IsotonicRegression",
+            sample_size=1000,
+            brier_score=0.12,  # Good calibration -> score = 1.0 - 0.12 = 0.88
+        )
+        dims, _ = ConfidenceDimensionEvaluator.evaluate_dimensions(
+            evidence_items=[sample_evidence_record], target_type="DECISION_ENGINE", target_id="d1",
+            assessment_ts="2026-05-01T12:00:00Z", freshness_threshold=86400.0, plant_id="PLANT-01",
+            calibration_metadata=cal_meta,
+        )
+        cal_dim = next(d for d in dims if d.dimension_type == ConfidenceDimensionType.MODEL_CALIBRATION)
+        assert cal_dim.score == 0.88
+        assert cal_dim.is_assessed is True
+        assert cal_dim.status == "ASSESSED"
+
+    def test_151_missing_evidence_not_assessable_no_arbitrary_scores(self):
+        """Verifies that missing evidence returns NOT_ASSESSABLE / INSUFFICIENT_EVIDENCE with no invented numerical scores."""
+        dims, _ = ConfidenceDimensionEvaluator.evaluate_dimensions(
+            evidence_items=[], target_type="DECISION_ENGINE", target_id="d1",
+            assessment_ts="2026-05-01T12:00:00Z", freshness_threshold=86400.0, plant_id="PLANT-01",
+        )
+        for dim_type in (
+            ConfidenceDimensionType.EVIDENCE_QUALITY,
+            ConfidenceDimensionType.FRESHNESS,
+            ConfidenceDimensionType.TEMPORAL_CONSISTENCY,
+            ConfidenceDimensionType.SOURCE_RELIABILITY,
+            ConfidenceDimensionType.CROSS_SOURCE_AGREEMENT,
+            ConfidenceDimensionType.LINEAGE_INTEGRITY,
+            ConfidenceDimensionType.PROVENANCE,
+            ConfidenceDimensionType.MODEL_CALIBRATION,
+        ):
+            dim = next(d for d in dims if d.dimension_type == dim_type)
+            assert dim.score is None
+            assert dim.is_assessed is False
+            assert dim.status == "NOT_ASSESSABLE"
+
+    def test_152_source_reliability_missing_metadata_not_assessable(self, sample_evidence_record):
+        """Verifies that evidence lacking defensible reliability metadata or source confidence returns NOT_ASSESSABLE."""
+        ev_no_meta = sample_evidence_record.model_copy()
+        ev_no_meta.metadata = {}
+        ev_no_meta.payload = {}
+        ev_no_meta.confidence_score = None
+
+        dims, _ = ConfidenceDimensionEvaluator.evaluate_dimensions(
+            evidence_items=[ev_no_meta], target_type="DECISION_ENGINE", target_id="d1",
+            assessment_ts="2026-05-01T12:00:00Z", freshness_threshold=86400.0, plant_id="PLANT-01",
+        )
+        rel_dim = next(d for d in dims if d.dimension_type == ConfidenceDimensionType.SOURCE_RELIABILITY)
+        assert rel_dim.score is None
+        assert rel_dim.is_assessed is False
+        assert rel_dim.status == "NOT_ASSESSABLE"
+        assert "SOURCE_RELIABILITY_METADATA_UNAVAILABLE" in rel_dim.deficiencies

@@ -58,9 +58,9 @@ The **Confidence and Uncertainty Intelligence Foundation** introduces a producti
 
 ---
 
-## 3. Ten Independent Confidence Dimensions
+## 3. Eleven Independent Confidence Dimensions
 
-Rather than collapsing all evidence indicators into an opaque single number, the engine evaluates 10 explicit dimensions:
+Rather than collapsing all evidence indicators into an opaque single number, the engine evaluates 11 explicit dimensions:
 
 | Dimension | Description | Required Inputs | Missing Data Behavior |
 | :--- | :--- | :--- | :--- |
@@ -68,12 +68,13 @@ Rather than collapsing all evidence indicators into an opaque single number, the
 | **Evidence Quality** | Mean data quality score across supporting evidence items. | Evidence quality scores | Quality < 0.3 triggers blocking deficiency cap |
 | **Freshness** | Age degradation relative to configured threshold and evaluation timestamp. | Timestamps & threshold | All stale -> Capped at 0.30 |
 | **Temporal Consistency** | Alignment within assessment window, absence of temporal gaps or future leakage. | Assessment timestamp | Future-dated evidence -> score 0.0 & blocked |
-| **Source Reliability** | Provenance trustworthiness (Observed: 1.0, Derived: 0.85, Forecast: 0.70, Simulated: 0.65, Estimated: 0.50, Unknown: 0.20). | Evidence Provenance | Unverified synthetic provenance penalized |
+| **Source Reliability** | Evaluated strictly via defensible metadata (validation status, historical performance, source calibration, sensor health). **Provenance tier is NEVER used as a reliability ranking.** | Defensible metadata | Missing reliability metadata -> NOT_ASSESSABLE |
 | **Cross-Source Agreement** | Corroboration across independent evidence sources; absence of contradictory values. | Conflict detection | Severe conflict -> Capped at 0.35 |
 | **Method Validity** | Verification that mathematical prerequisites and valid target entities are satisfied. | Target entity ID & type | Invalid target -> 0.0 |
 | **Context Coverage** | Presence of plant, asset, workspace metadata and operational dependencies. | Plant & workspace scope | Missing plant -> 0.75 |
-| **Model Calibration** | Evaluates empirical calibration metadata. Default analytical heuristics are labeled uncalibrated. | Calibration metadata | Uncalibrated heuristic -> 0.50 with explicit notice |
+| **Model Calibration** | Evaluates empirical statistical calibration (Brier score, ECE). **Uncalibrated heuristics return `NOT_ASSESSABLE` (`score=None`); no arbitrary 0.50 score is ever assigned.** | Empirical validation metrics | Uncalibrated -> NOT_ASSESSABLE (score=None) |
 | **Lineage Integrity** | Lineage graph validity, absence of directed cycles, and absence of unresolved parent references. | Lineage parent IDs | Unresolved parents penalize score |
+| **Provenance** | Verified origin tracking (Observed, Derived, Forecast, Simulated, Estimated). **UNKNOWN provenance is treated as an explicit limitation without inventing a score.** | Provenance classification | UNKNOWN provenance -> NOT_ASSESSABLE & blocked |
 
 ### Blocking Deficiency Capping Rule
 
@@ -81,7 +82,9 @@ A high score in one dimension (such as completeness) must never conceal a critic
 - **Future-Dated Evidence Leakage:** Score forced to `0.0`.
 - **All Evidence Stale:** Aggregate score capped at `0.30`.
 - **Critical Low Data Quality (< 0.3):** Aggregate score capped at `0.25`.
+- **Critical Low Source Reliability (< 0.4):** Aggregate score capped at `0.30`.
 - **Severe Source Conflicts:** Aggregate score capped at `0.35`.
+- **Unknown Provenance Limitation:** Aggregate score capped at `0.35`.
 
 ---
 

@@ -142,12 +142,13 @@ DEFAULT_DIMENSION_WEIGHTS: Dict[ConfidenceDimensionType, float] = {
     ConfidenceDimensionType.CONTEXT_COVERAGE: 0.8,
     ConfidenceDimensionType.MODEL_CALIBRATION: 0.6,
     ConfidenceDimensionType.LINEAGE_INTEGRITY: 0.8,
+    ConfidenceDimensionType.PROVENANCE: 1.0,
 }
 
 
 class ConfidenceDimensionEvaluator:
     """
-    Deterministic evaluation of the 10 canonical confidence dimensions.
+    Deterministic evaluation of canonical confidence dimensions.
     """
 
     @staticmethod
@@ -160,6 +161,7 @@ class ConfidenceDimensionEvaluator:
         plant_id: Optional[str],
         weights_override: Optional[Dict[str, float]] = None,
         conflicts: Optional[List[Dict[str, Any]]] = None,
+        calibration_metadata: Optional[ConfidenceCalibrationMetadata] = None,
     ) -> Tuple[List[ConfidenceDimension], List[str]]:
         """
         Evaluates each of the 10 independent confidence dimensions.
@@ -365,7 +367,7 @@ class ConfidenceDimensionEvaluator:
             )
 
         # ---------------------------------------------------------------------
-        # 5. SOURCE RELIABILITY
+        # 5. SOURCE RELIABILITY (Defensible metadata, NOT provenance tier)
         # ---------------------------------------------------------------------
         w_rel = weights_override.get(ConfidenceDimensionType.SOURCE_RELIABILITY.value, DEFAULT_DIMENSION_WEIGHTS[ConfidenceDimensionType.SOURCE_RELIABILITY]) if weights_override else DEFAULT_DIMENSION_WEIGHTS[ConfidenceDimensionType.SOURCE_RELIABILITY]
         if not evidence_items:
@@ -380,32 +382,87 @@ class ConfidenceDimensionEvaluator:
                 )
             )
         else:
-            provenance_weights = {
-                EvidenceProvenance.OBSERVED: 1.0,
-                EvidenceProvenance.DERIVED: 0.85,
-                EvidenceProvenance.FORECAST: 0.70,
-                EvidenceProvenance.SIMULATED: 0.65,
-                EvidenceProvenance.ESTIMATED: 0.50,
-                EvidenceProvenance.UNKNOWN: 0.20,
-            }
-            rel_scores = [provenance_weights.get(e.provenance, 0.5) for e in evidence_items]
-            avg_rel = sum(rel_scores) / len(rel_scores)
+            rel_scores: List[float] = []
+            unassessed_count = 0
             deficiencies = []
-            if any(e.provenance == EvidenceProvenance.UNKNOWN for e in evidence_items):
-                deficiencies.append("UNKNOWN_PROVENANCE_PRESENT")
+            for e in evidence_items:
+                score = None
+                # 1. Defensible source reliability in metadata or payload
+                for key in ("source_reliability", "reliability_score", "historical_performance", "sensor_health", "accuracy", "model_accuracy"):
+                    val = e.metadata.get(key) if e.metadata else None
+                    if val is None and e.payload:
+                        val = e.payload.get(key)
+                    if val is not None:
+                        try:
+                            f_val = float(val)
+                            if 0.0 <= f_val <= 1.0 and not math.isnan(f_val):
+                                score = f_val
+                                break
+                        except (ValueError, TypeError):
+                            pass
 
-            dimensions.append(
-                ConfidenceDimension(
-                    dimension_type=ConfidenceDimensionType.SOURCE_RELIABILITY,
-                    score=round(avg_rel, 3),
-                    weight=w_rel,
-                    is_assessed=True,
-                    status="ASSESSED",
-                    explanation=f"Mean provenance reliability is {round(avg_rel, 3)}.",
-                    deficiencies=deficiencies,
-                    metadata={"provenance_breakdown": [e.provenance.value for e in evidence_items]},
+                # 2. Upstream analytical confidence score if provided
+                if score is None and e.confidence_score is not None:
+                    try:
+                        f_conf = float(e.confidence_score)
+                        if 0.0 <= f_conf <= 1.0 and not math.isnan(f_conf):
+                            score = f_conf
+                    except (ValueError, TypeError):
+                        pass
+
+                # 3. Source validation status in metadata
+                if score is None and e.metadata:
+                    v_stat = str(e.metadata.get("validation_status", "")).upper()
+                    if v_stat == "VALID":
+                        score = 1.0
+                    elif v_stat in ("DEGRADED", "WARNING", "SUBOPTIMAL", "PARTIAL"):
+                        score = 0.60
+                    elif v_stat in ("INVALID", "REJECTED", "FAILED"):
+                        score = 0.0
+
+                if score is not None:
+                    rel_scores.append(score)
+                else:
+                    unassessed_count += 1
+
+            if not rel_scores:
+                dimensions.append(
+                    ConfidenceDimension(
+                        dimension_type=ConfidenceDimensionType.SOURCE_RELIABILITY,
+                        score=None,
+                        weight=w_rel,
+                        is_assessed=False,
+                        status="NOT_ASSESSABLE",
+                        explanation="Source reliability metadata (validation status, historical performance, source calibration) not established for evidence items.",
+                        deficiencies=["SOURCE_RELIABILITY_METADATA_UNAVAILABLE"],
+                    )
                 )
-            )
+            else:
+                avg_rel = sum(rel_scores) / len(rel_scores)
+                if unassessed_count > 0:
+                    deficiencies.append(f"{unassessed_count}_ITEMS_LACK_RELIABILITY_METADATA")
+                if avg_rel < 0.4:
+                    deficiencies.append("CRITICAL_LOW_SOURCE_RELIABILITY")
+                    blocking_deficiencies.append("CRITICAL_LOW_SOURCE_RELIABILITY")
+                elif avg_rel < 0.6:
+                    deficiencies.append("SUBOPTIMAL_SOURCE_RELIABILITY")
+
+                dimensions.append(
+                    ConfidenceDimension(
+                        dimension_type=ConfidenceDimensionType.SOURCE_RELIABILITY,
+                        score=round(avg_rel, 3),
+                        weight=w_rel,
+                        is_assessed=True,
+                        status="DEFICIENT" if deficiencies else "ASSESSED",
+                        explanation=f"Mean source reliability evaluated from defensible metadata is {round(avg_rel, 3)} across {len(rel_scores)} items with metadata.",
+                        deficiencies=deficiencies,
+                        metadata={
+                            "items_with_reliability_metadata": len(rel_scores),
+                            "items_lacking_metadata": unassessed_count,
+                            "evaluated_scores": [round(s, 3) for s in rel_scores],
+                        },
+                    )
+                )
 
         # ---------------------------------------------------------------------
         # 6. CROSS-SOURCE AGREEMENT
@@ -496,22 +553,45 @@ class ConfidenceDimensionEvaluator:
         )
 
         # ---------------------------------------------------------------------
-        # 9. MODEL CALIBRATION
+        # 9. MODEL CALIBRATION (Empirical validation only; no arbitrary default)
         # ---------------------------------------------------------------------
         w_cal = weights_override.get(ConfidenceDimensionType.MODEL_CALIBRATION.value, DEFAULT_DIMENSION_WEIGHTS[ConfidenceDimensionType.MODEL_CALIBRATION]) if weights_override else DEFAULT_DIMENSION_WEIGHTS[ConfidenceDimensionType.MODEL_CALIBRATION]
-        # Uncalibrated analytical heuristic by design; scores at 0.5 with explicit notice
-        dimensions.append(
-            ConfidenceDimension(
-                dimension_type=ConfidenceDimensionType.MODEL_CALIBRATION,
-                score=0.50,
-                weight=w_cal,
-                is_assessed=True,
-                status="ASSESSED",
-                explanation="Uncalibrated analytical heuristic. Score is not a calibrated statistical probability.",
-                deficiencies=["UNCALIBRATED_HEURISTIC"],
-                metadata={"is_calibrated": False},
+
+        cal_score = None
+        is_calibrated = False
+        if calibration_metadata and calibration_metadata.calibration_status == CalibrationStatus.CALIBRATED:
+            if calibration_metadata.brier_score is not None:
+                cal_score = max(0.0, min(1.0, 1.0 - calibration_metadata.brier_score))
+                is_calibrated = True
+            elif calibration_metadata.expected_calibration_error is not None:
+                cal_score = max(0.0, min(1.0, 1.0 - calibration_metadata.expected_calibration_error))
+                is_calibrated = True
+
+        if is_calibrated and cal_score is not None:
+            dimensions.append(
+                ConfidenceDimension(
+                    dimension_type=ConfidenceDimensionType.MODEL_CALIBRATION,
+                    score=round(cal_score, 3),
+                    weight=w_cal,
+                    is_assessed=True,
+                    status="ASSESSED",
+                    explanation=f"Empirical calibration verified against historical validation dataset (calibration score: {round(cal_score, 3)}).",
+                    metadata={"is_calibrated": True, "calibration_status": "CALIBRATED"},
+                )
             )
-        )
+        else:
+            dimensions.append(
+                ConfidenceDimension(
+                    dimension_type=ConfidenceDimensionType.MODEL_CALIBRATION,
+                    score=None,
+                    weight=w_cal,
+                    is_assessed=False,
+                    status="NOT_ASSESSABLE",
+                    explanation="No empirical calibration dataset or Brier/ECE validation metrics available. Analytical model operates as an uncalibrated heuristic; numerical calibration score is not assessable and cannot be interpreted as a probability.",
+                    deficiencies=["UNCALIBRATED_HEURISTIC", "NO_EMPIRICAL_CALIBRATION"],
+                    metadata={"is_calibrated": False, "calibration_status": "UNASSESSED"},
+                )
+            )
 
         # ---------------------------------------------------------------------
         # 10. LINEAGE INTEGRITY
@@ -553,6 +633,59 @@ class ConfidenceDimensionEvaluator:
                     metadata={"unresolved_parents_count": missing_parents},
                 )
             )
+
+        # ---------------------------------------------------------------------
+        # 11. PROVENANCE (Traceability dimension; UNKNOWN is a limitation, not a score)
+        # ---------------------------------------------------------------------
+        w_prov = weights_override.get(ConfidenceDimensionType.PROVENANCE.value, DEFAULT_DIMENSION_WEIGHTS[ConfidenceDimensionType.PROVENANCE]) if weights_override else DEFAULT_DIMENSION_WEIGHTS[ConfidenceDimensionType.PROVENANCE]
+        if not evidence_items:
+            dimensions.append(
+                ConfidenceDimension(
+                    dimension_type=ConfidenceDimensionType.PROVENANCE,
+                    score=None,
+                    weight=w_prov,
+                    is_assessed=False,
+                    status="NOT_ASSESSABLE",
+                    explanation="Provenance cannot be evaluated without evidence.",
+                )
+            )
+        else:
+            unknown_prov_items = [e for e in evidence_items if e.provenance == EvidenceProvenance.UNKNOWN]
+            prov_defs = []
+            if unknown_prov_items:
+                prov_defs.append(f"{len(unknown_prov_items)}_UNKNOWN_PROVENANCE_ITEMS")
+                prov_defs.append("UNKNOWN_PROVENANCE_LIMITATION")
+                blocking_deficiencies.append("UNKNOWN_PROVENANCE_LIMITATION")
+                dimensions.append(
+                    ConfidenceDimension(
+                        dimension_type=ConfidenceDimensionType.PROVENANCE,
+                        score=None,
+                        weight=w_prov,
+                        is_assessed=False,
+                        status="NOT_ASSESSABLE",
+                        explanation=f"{len(unknown_prov_items)} of {len(evidence_items)} evidence records have UNKNOWN provenance. Origin cannot be verified; score is not assessable.",
+                        deficiencies=prov_defs,
+                        metadata={
+                            "unknown_count": len(unknown_prov_items),
+                            "provenance_breakdown": [e.provenance.value for e in evidence_items],
+                        },
+                    )
+                )
+            else:
+                dimensions.append(
+                    ConfidenceDimension(
+                        dimension_type=ConfidenceDimensionType.PROVENANCE,
+                        score=1.0,
+                        weight=w_prov,
+                        is_assessed=True,
+                        status="ASSESSED",
+                        explanation=f"All {len(evidence_items)} evidence items have verified, documented provenance ({', '.join(sorted(set(e.provenance.value for e in evidence_items)))}).",
+                        deficiencies=[],
+                        metadata={
+                            "provenance_breakdown": [e.provenance.value for e in evidence_items],
+                        },
+                    )
+                )
 
         return dimensions, blocking_deficiencies
 
@@ -851,6 +984,7 @@ class ConfidenceUncertaintyService:
             plant_id=request.plant_id,
             weights_override=request.weights_override,
             conflicts=conflicts,
+            calibration_metadata=request.calibration,
         )
 
         # 4. Compute Aggregate Confidence with Blocking Deficiency Caps
@@ -888,7 +1022,11 @@ class ConfidenceUncertaintyService:
                     capped_score = min(raw_aggregate, 0.30)
                 elif "CRITICAL_LOW_DATA_QUALITY" in blocking_deficiencies:
                     capped_score = min(raw_aggregate, 0.25)
+                elif "CRITICAL_LOW_SOURCE_RELIABILITY" in blocking_deficiencies:
+                    capped_score = min(raw_aggregate, 0.30)
                 elif "SEVERE_SOURCE_CONFLICTS" in blocking_deficiencies:
+                    capped_score = min(raw_aggregate, 0.35)
+                elif "UNKNOWN_PROVENANCE_LIMITATION" in blocking_deficiencies:
                     capped_score = min(raw_aggregate, 0.35)
                 else:
                     capped_score = min(raw_aggregate, 0.40)
