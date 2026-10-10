@@ -189,7 +189,11 @@ class SOPRAGService:
         """
         now_ts = datetime.now(timezone.utc).isoformat()
         tenant_id = authoritative_tenant_id  # Strictly server-derived
-        effective_is_admin = is_admin or ("sop_rag.admin" in (user_permissions or []))
+        effective_is_admin = bool(
+            user_permissions
+            and isinstance(user_permissions, (list, set, tuple))
+            and "sop_rag.admin" in {p for p in user_permissions if isinstance(p, str)}
+        )
 
         # 1. Size & safety validation
         content_bytes = request.content.encode("utf-8")
@@ -543,8 +547,33 @@ class SOPRAGService:
         """
         now_ts = datetime.now(timezone.utc).isoformat()
 
-        # 1. Authority check: require sop_rag.admin permission
-        if user_permissions is not None and "sop_rag.admin" not in user_permissions:
+        # 1. Authority check: strictly require canonical sop_rag.admin permission from trusted authorization context
+        if user_permissions is None or not user_permissions:
+            err_msg = f"Actor '{actor_id}' lacks trusted administrative permission context required for lifecycle transitions."
+            self._record_audit(
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+                event_type="LIFECYCLE_TRANSITION_REJECTED",
+                document_id=document_id,
+                outcome="DENIED",
+                detail=err_msg,
+            )
+            raise PermissionError(err_msg)
+
+        if not isinstance(user_permissions, (list, set, tuple)):
+            err_msg = f"Actor '{actor_id}' provided malformed permission context; expected collection of permission strings."
+            self._record_audit(
+                tenant_id=tenant_id,
+                actor_id=actor_id,
+                event_type="LIFECYCLE_TRANSITION_REJECTED",
+                document_id=document_id,
+                outcome="DENIED",
+                detail=err_msg,
+            )
+            raise PermissionError(err_msg)
+
+        valid_perms = {p for p in user_permissions if isinstance(p, str)}
+        if "sop_rag.admin" not in valid_perms:
             err_msg = f"Actor '{actor_id}' lacks administrative permission 'sop_rag.admin' required for lifecycle transitions."
             self._record_audit(
                 tenant_id=tenant_id,
@@ -600,19 +629,7 @@ class SOPRAGService:
                 is_verified=True,
             )
 
-        # 5. Atomic persistence in repository
-        updated = self.repository.update_lifecycle_status(
-            tenant_id=tenant_id,
-            document_id=document_id,
-            version=version,
-            new_status=new_status,
-            approval_metadata=approval,
-        )
-        if not updated:
-            err_msg = f"Failed to persist lifecycle transition for '{document_id}' v{version}."
-            raise RuntimeError(err_msg)
-
-        # 6. Strict audit ledger persistence (fails operation if audit recording fails)
+        # 5. Prepare audit record before atomic transaction
         audit = SOPAuditRecord(
             audit_id=f"aud_sop_{uuid.uuid4().hex[:12]}",
             timestamp=now_ts,
@@ -623,10 +640,22 @@ class SOPRAGService:
             outcome="SUCCESS",
             detail=f"Successfully transitioned document '{document_id}' v{version} from {current_status.value} to {new_status.value}.",
         )
+
+        # 6. Atomic persistence of lifecycle state mutation, chunks sync, and audit ledger
         try:
-            self.repository.record_audit_strict(audit)
+            committed = self.repository.commit_lifecycle_transition_atomic(
+                tenant_id=tenant_id,
+                document_id=document_id,
+                version=version,
+                new_status=new_status,
+                audit=audit,
+                approval_metadata=approval,
+            )
+            if not committed:
+                err_msg = f"Failed to persist lifecycle transition for '{document_id}' v{version}."
+                raise RuntimeError(err_msg)
         except Exception as e:
-            logger.error("Lifecycle transition audit persistence failure: %s", e)
+            logger.error("Lifecycle transition atomic persistence failure: %s", e)
             raise RuntimeError(f"Lifecycle transition audit could not be persisted: {e}") from e
 
         return {

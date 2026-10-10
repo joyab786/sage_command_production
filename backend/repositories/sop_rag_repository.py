@@ -395,6 +395,62 @@ class SOPRAGRepository:
                 conn.commit()
                 return True
 
+    def commit_lifecycle_transition_atomic(
+        self,
+        tenant_id: str,
+        document_id: str,
+        version: str,
+        new_status: DocumentLifecycleStatus,
+        audit: SOPAuditRecord,
+        approval_metadata: Optional[DocumentApprovalMetadata] = None,
+    ) -> bool:
+        """
+        Atomically updates the document lifecycle status, synchronizes child chunks,
+        persists authoritative approval metadata if provided, and records the mandatory
+        audit log entry in the audit ledger within a single SQLite transaction.
+
+        Invariants:
+        - Either both the document/chunk lifecycle change and its required audit record commit, or neither commits.
+        - If the document or chunk updates fail, no audit record is committed.
+        - If the audit insert fails, all document and chunk updates are rolled back.
+        - Returns True only after the entire combined transaction commits.
+        """
+        now_ts = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                with conn:
+                    if approval_metadata is not None:
+                        approval_json = json.dumps(approval_metadata.model_dump())
+                        cursor = conn.execute("""
+                            UPDATE sop_documents
+                            SET lifecycle_status = ?, updated_at = ?, approval_metadata_json = ?
+                            WHERE tenant_id = ? AND document_id = ? AND version = ?
+                        """, (new_status.value, now_ts, approval_json, tenant_id, document_id, version))
+                    else:
+                        cursor = conn.execute("""
+                            UPDATE sop_documents
+                            SET lifecycle_status = ?, updated_at = ?
+                            WHERE tenant_id = ? AND document_id = ? AND version = ?
+                        """, (new_status.value, now_ts, tenant_id, document_id, version))
+
+                    if cursor.rowcount == 0:
+                        return False
+
+                    # Synchronize chunks
+                    conn.execute("""
+                        UPDATE sop_chunks
+                        SET lifecycle_status = ?
+                        WHERE tenant_id = ? AND document_id = ? AND document_version = ?
+                    """, (new_status.value, tenant_id, document_id, version))
+
+                    # Mandatory audit entry within the same transaction
+                    self._insert_audit_entry_conn(conn, audit)
+
+                return True
+            finally:
+                conn.close()
+
     # -------------------------------------------------------------------------
     # CHUNK RETRIEVAL
     # -------------------------------------------------------------------------
@@ -523,6 +579,29 @@ class SOPRAGRepository:
             # Best-effort logging avoids failing read/query operations
             pass
 
+    def _insert_audit_entry_conn(self, conn: sqlite3.Connection, audit: SOPAuditRecord) -> None:
+        """
+        Executes audit ledger row insertion on an existing SQLite connection.
+        Must be called within an active transaction boundary.
+        """
+        conn.execute("""
+            INSERT INTO sop_rag_audit_ledger (
+                audit_id, timestamp, event_type, tenant_id, actor_id,
+                document_id, query_hash, passage_count, outcome, detail
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            audit.audit_id,
+            audit.timestamp,
+            audit.event_type,
+            audit.tenant_id,
+            audit.actor_id,
+            audit.document_id,
+            audit.query_hash,
+            audit.passage_count,
+            audit.outcome,
+            audit.detail,
+        ))
+
     def record_audit_strict(self, audit: SOPAuditRecord) -> None:
         """
         Strictly persists an immutable audit log entry into the ledger.
@@ -530,25 +609,12 @@ class SOPRAGRepository:
         (such as lifecycle transitions and approvals) fail closed if auditing cannot be committed.
         """
         with self._lock:
-            with self._get_connection() as conn:
-                conn.execute("""
-                    INSERT INTO sop_rag_audit_ledger (
-                        audit_id, timestamp, event_type, tenant_id, actor_id,
-                        document_id, query_hash, passage_count, outcome, detail
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    audit.audit_id,
-                    audit.timestamp,
-                    audit.event_type,
-                    audit.tenant_id,
-                    audit.actor_id,
-                    audit.document_id,
-                    audit.query_hash,
-                    audit.passage_count,
-                    audit.outcome,
-                    audit.detail,
-                ))
-                conn.commit()
+            conn = self._get_connection()
+            try:
+                with conn:
+                    self._insert_audit_entry_conn(conn, audit)
+            finally:
+                conn.close()
 
     def get_audit_records(self, tenant_id: str, limit: int = 50) -> List[Dict[str, Any]]:
         """

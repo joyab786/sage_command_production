@@ -229,6 +229,7 @@ def ingest_and_publish(
         actor_id=actor_id,
         authoritative_tenant_id=authoritative_tenant_id,
         clearance_level=clearance_level,
+        user_permissions=["sop_rag.admin"],
         is_admin=True,
     )
     if res.lifecycle_status != DocumentLifecycleStatus.PUBLISHED:
@@ -2666,7 +2667,7 @@ class TestPrompt33ASecurityCorrections:
             actor_id=test_identity_admin.user_id,
             authoritative_tenant_id="tenant_sop_test",
         )
-        with patch.object(sop_rag_repository, "record_audit_strict", side_effect=sqlite3.OperationalError("disk I/O error on audit ledger")):
+        with patch.object(sop_rag_repository, "_insert_audit_entry_conn", side_effect=sqlite3.OperationalError("disk I/O error on audit ledger")):
             with pytest.raises(RuntimeError, match="Lifecycle transition audit could not be persisted"):
                 sop_rag_service.transition_lifecycle(
                     tenant_id="tenant_sop_test",
@@ -2676,6 +2677,12 @@ class TestPrompt33ASecurityCorrections:
                     actor_id=test_identity_admin.user_id,
                     user_permissions=["sop_rag.admin"],
                 )
+        # Verify atomicity and rollback: document and chunks MUST remain DRAFT in the database
+        doc = sop_rag_repository.get_document("tenant_sop_test", "SOP-P33A-AUDIT-FAIL-01", "1.0")
+        assert doc is not None
+        assert doc.lifecycle_status == DocumentLifecycleStatus.DRAFT
+        for chunk in doc.chunks:
+            assert chunk.lifecycle_status == DocumentLifecycleStatus.DRAFT
 
     def test_217_lifecycle_audit_records_privileged_transition_metadata(self, test_identity_admin):
         req = IngestionRequest(
@@ -2697,6 +2704,450 @@ class TestPrompt33ASecurityCorrections:
         assert "v1.0" in record["detail"]
         # Audit records must never contain the document body or secret tokens
         assert "Content for checking audit metadata" not in record["detail"]
+
+
+class TestPrompt33BLifecycleAuthorizationAndAuditAtomicity:
+    """
+    Prompt 33B Regression Suite: Close SOP/RAG Lifecycle Authorization and Audit Atomicity Gaps.
+
+    Verifies:
+    1. Fail-closed service-level authorization:
+       - user_permissions=None is denied.
+       - Empty permissions list is denied.
+       - Missing sop_rag.admin permission is denied.
+       - Malformed permission contexts (non-collection, integer, dict) are denied.
+       - Direct service invocation without permissions argument cannot bypass authorization.
+       - Client-supplied roles (e.g. ADMINISTRATOR) cannot substitute for canonical permissions.
+       - Unauthorized attempts leave document and chunk lifecycle states completely unchanged.
+       - Unauthorized attempts never produce a success audit entry.
+       - Ingestion publication fails closed when sop_rag.admin permission is missing.
+
+    2. Atomic persistence and rollback:
+       - Successful transition atomically commits parent document, all chunks, approval metadata, and audit entry.
+       - Simulated audit insertion failure rolls back parent document state and child chunks.
+       - Simulated failure creates no success audit record.
+       - Retrying after a rolled-back failure succeeds cleanly without inconsistent state.
+       - Rejected/invalid transitions never produce success audit records.
+       - Database remains fully usable and consistent after transaction rollback.
+       - Tenant isolation is strictly preserved.
+    """
+
+    def test_218_lifecycle_authorization_denies_none_permissions(self, test_identity_admin):
+        req = IngestionRequest(
+            document_id="SOP-P33B-AUTH-NONE-01",
+            title="None Permissions Auth Test",
+            content="Testing that user_permissions=None is denied fail-closed.",
+        )
+        sop_rag_service.ingest_document(
+            request=req,
+            actor_id=test_identity_admin.user_id,
+            authoritative_tenant_id="tenant_sop_test",
+        )
+        with pytest.raises(PermissionError, match="lacks trusted administrative permission context"):
+            sop_rag_service.transition_lifecycle(
+                tenant_id="tenant_sop_test",
+                document_id="SOP-P33B-AUTH-NONE-01",
+                version="1.0",
+                new_status=DocumentLifecycleStatus.PUBLISHED,
+                actor_id=test_identity_admin.user_id,
+                user_permissions=None,
+            )
+        # Database state must remain unchanged
+        doc = sop_rag_repository.get_document("tenant_sop_test", "SOP-P33B-AUTH-NONE-01", "1.0")
+        assert doc.lifecycle_status == DocumentLifecycleStatus.DRAFT
+        for chunk in doc.chunks:
+            assert chunk.lifecycle_status == DocumentLifecycleStatus.DRAFT
+        # Audit ledger must not contain a LIFECYCLE_TRANSITION_EXECUTED SUCCESS record; must contain DENIED record
+        audits = sop_rag_repository.get_audit_records("tenant_sop_test", limit=20)
+        assert not any(a.get("document_id") == "SOP-P33B-AUTH-NONE-01" and a.get("event_type") == "LIFECYCLE_TRANSITION_EXECUTED" for a in audits)
+        assert any(a.get("document_id") == "SOP-P33B-AUTH-NONE-01" and a.get("outcome") == "DENIED" for a in audits)
+
+    def test_219_lifecycle_authorization_denies_empty_permissions(self, test_identity_admin):
+        req = IngestionRequest(
+            document_id="SOP-P33B-AUTH-EMPTY-01",
+            title="Empty Permissions Auth Test",
+            content="Testing that empty permissions list is denied.",
+        )
+        sop_rag_service.ingest_document(
+            request=req,
+            actor_id=test_identity_admin.user_id,
+            authoritative_tenant_id="tenant_sop_test",
+        )
+        with pytest.raises(PermissionError, match="lacks trusted administrative permission context"):
+            sop_rag_service.transition_lifecycle(
+                tenant_id="tenant_sop_test",
+                document_id="SOP-P33B-AUTH-EMPTY-01",
+                version="1.0",
+                new_status=DocumentLifecycleStatus.PUBLISHED,
+                actor_id=test_identity_admin.user_id,
+                user_permissions=[],
+            )
+        doc = sop_rag_repository.get_document("tenant_sop_test", "SOP-P33B-AUTH-EMPTY-01", "1.0")
+        assert doc.lifecycle_status == DocumentLifecycleStatus.DRAFT
+        for chunk in doc.chunks:
+            assert chunk.lifecycle_status == DocumentLifecycleStatus.DRAFT
+
+    def test_220_lifecycle_authorization_denies_missing_admin_permission(self, test_identity_admin):
+        req = IngestionRequest(
+            document_id="SOP-P33B-AUTH-NOADMIN-01",
+            title="Missing Admin Permission Test",
+            content="Testing permissions lacking sop_rag.admin are denied.",
+        )
+        sop_rag_service.ingest_document(
+            request=req,
+            actor_id=test_identity_admin.user_id,
+            authoritative_tenant_id="tenant_sop_test",
+        )
+        with pytest.raises(PermissionError, match="lacks administrative permission 'sop_rag.admin'"):
+            sop_rag_service.transition_lifecycle(
+                tenant_id="tenant_sop_test",
+                document_id="SOP-P33B-AUTH-NOADMIN-01",
+                version="1.0",
+                new_status=DocumentLifecycleStatus.PUBLISHED,
+                actor_id=test_identity_admin.user_id,
+                user_permissions=["sop_rag.read", "sop_rag.ingest", "sop_rag.query"],
+            )
+        doc = sop_rag_repository.get_document("tenant_sop_test", "SOP-P33B-AUTH-NOADMIN-01", "1.0")
+        assert doc.lifecycle_status == DocumentLifecycleStatus.DRAFT
+        for chunk in doc.chunks:
+            assert chunk.lifecycle_status == DocumentLifecycleStatus.DRAFT
+
+    def test_221_lifecycle_authorization_denies_malformed_permission_context(self, test_identity_admin):
+        req = IngestionRequest(
+            document_id="SOP-P33B-AUTH-MALFORMED-01",
+            title="Malformed Permission Context Test",
+            content="Testing non-collection and malformed permissions are denied.",
+        )
+        sop_rag_service.ingest_document(
+            request=req,
+            actor_id=test_identity_admin.user_id,
+            authoritative_tenant_id="tenant_sop_test",
+        )
+        # Passing a raw string instead of a collection
+        with pytest.raises(PermissionError, match="malformed permission context"):
+            sop_rag_service.transition_lifecycle(
+                tenant_id="tenant_sop_test",
+                document_id="SOP-P33B-AUTH-MALFORMED-01",
+                version="1.0",
+                new_status=DocumentLifecycleStatus.PUBLISHED,
+                actor_id=test_identity_admin.user_id,
+                user_permissions="sop_rag.admin",  # type: ignore[arg-type]
+            )
+        # Passing an integer
+        with pytest.raises(PermissionError, match="malformed permission context"):
+            sop_rag_service.transition_lifecycle(
+                tenant_id="tenant_sop_test",
+                document_id="SOP-P33B-AUTH-MALFORMED-01",
+                version="1.0",
+                new_status=DocumentLifecycleStatus.PUBLISHED,
+                actor_id=test_identity_admin.user_id,
+                user_permissions=42,  # type: ignore[arg-type]
+            )
+        doc = sop_rag_repository.get_document("tenant_sop_test", "SOP-P33B-AUTH-MALFORMED-01", "1.0")
+        assert doc.lifecycle_status == DocumentLifecycleStatus.DRAFT
+
+    def test_222_direct_service_invocation_cannot_bypass_authorization_by_omitting_argument(self, test_identity_admin):
+        req = IngestionRequest(
+            document_id="SOP-P33B-AUTH-OMIT-01",
+            title="Omitted Argument Auth Test",
+            content="Testing direct call omitting user_permissions argument.",
+        )
+        sop_rag_service.ingest_document(
+            request=req,
+            actor_id=test_identity_admin.user_id,
+            authoritative_tenant_id="tenant_sop_test",
+        )
+        # Call transition_lifecycle without user_permissions argument
+        with pytest.raises(PermissionError, match="lacks trusted administrative permission context"):
+            sop_rag_service.transition_lifecycle(
+                tenant_id="tenant_sop_test",
+                document_id="SOP-P33B-AUTH-OMIT-01",
+                version="1.0",
+                new_status=DocumentLifecycleStatus.PUBLISHED,
+                actor_id=test_identity_admin.user_id,
+            )
+        doc = sop_rag_repository.get_document("tenant_sop_test", "SOP-P33B-AUTH-OMIT-01", "1.0")
+        assert doc.lifecycle_status == DocumentLifecycleStatus.DRAFT
+
+    def test_223_client_supplied_roles_cannot_substitute_for_permissions(self, test_identity_admin):
+        req = IngestionRequest(
+            document_id="SOP-P33B-AUTH-ROLES-01",
+            title="Client Roles Cannot Substitute Permissions",
+            content="Testing roles like ADMINISTRATOR cannot substitute for sop_rag.admin permission.",
+        )
+        sop_rag_service.ingest_document(
+            request=req,
+            actor_id=test_identity_admin.user_id,
+            authoritative_tenant_id="tenant_sop_test",
+        )
+        with pytest.raises(PermissionError, match="lacks trusted administrative permission context"):
+            sop_rag_service.transition_lifecycle(
+                tenant_id="tenant_sop_test",
+                document_id="SOP-P33B-AUTH-ROLES-01",
+                version="1.0",
+                new_status=DocumentLifecycleStatus.PUBLISHED,
+                actor_id=test_identity_admin.user_id,
+                user_roles=["ADMINISTRATOR", "SUPERADMIN"],
+                user_permissions=None,
+            )
+        doc = sop_rag_repository.get_document("tenant_sop_test", "SOP-P33B-AUTH-ROLES-01", "1.0")
+        assert doc.lifecycle_status == DocumentLifecycleStatus.DRAFT
+
+    def test_224_direct_ingestion_publication_fails_closed_without_sop_rag_admin(self, test_identity_admin):
+        req = IngestionRequest(
+            document_id="SOP-P33B-INGEST-PUB-01",
+            title="Direct Ingestion Publication Auth Test",
+            lifecycle_status=DocumentLifecycleStatus.PUBLISHED,
+            content="Attempting direct publication on ingestion.",
+        )
+        # Calling with is_admin=True but user_permissions=None must fail closed to DRAFT
+        res_no_perm = sop_rag_service.ingest_document(
+            request=req,
+            actor_id=test_identity_admin.user_id,
+            authoritative_tenant_id="tenant_sop_test",
+            is_admin=True,
+            user_permissions=None,
+        )
+        assert res_no_perm.lifecycle_status == DocumentLifecycleStatus.DRAFT
+        doc = sop_rag_repository.get_document("tenant_sop_test", "SOP-P33B-INGEST-PUB-01", "1.0")
+        assert doc.lifecycle_status == DocumentLifecycleStatus.DRAFT
+
+        # Calling with is_admin=True but lacking sop_rag.admin must also fail closed to DRAFT
+        req2 = IngestionRequest(
+            document_id="SOP-P33B-INGEST-PUB-02",
+            title="Direct Ingestion Publication Insufficient Perms",
+            lifecycle_status=DocumentLifecycleStatus.PUBLISHED,
+            content="Attempting direct publication with insufficient perms.",
+        )
+        res_wrong_perm = sop_rag_service.ingest_document(
+            request=req2,
+            actor_id=test_identity_admin.user_id,
+            authoritative_tenant_id="tenant_sop_test",
+            is_admin=True,
+            user_permissions=["sop_rag.ingest", "sop_rag.read"],
+        )
+        assert res_wrong_perm.lifecycle_status == DocumentLifecycleStatus.DRAFT
+
+        # Calling with valid sop_rag.admin authorizes publication
+        req3 = IngestionRequest(
+            document_id="SOP-P33B-INGEST-PUB-03",
+            title="Direct Ingestion Publication Authorized",
+            lifecycle_status=DocumentLifecycleStatus.PUBLISHED,
+            content="Direct publication with verified admin authority.",
+        )
+        res_authorized = sop_rag_service.ingest_document(
+            request=req3,
+            actor_id=test_identity_admin.user_id,
+            authoritative_tenant_id="tenant_sop_test",
+            user_permissions=["sop_rag.admin"],
+        )
+        assert res_authorized.lifecycle_status == DocumentLifecycleStatus.PUBLISHED
+        doc3 = sop_rag_repository.get_document("tenant_sop_test", "SOP-P33B-INGEST-PUB-03", "1.0")
+        assert doc3.lifecycle_status == DocumentLifecycleStatus.PUBLISHED
+        assert doc3.approval_metadata.is_verified is True
+
+    def test_225_atomic_success_commits_parent_chunks_approval_and_audit(self, test_identity_admin):
+        req = IngestionRequest(
+            document_id="SOP-P33B-ATOMIC-OK-01",
+            title="Atomic Success Test",
+            content="# Heading 1\nContent paragraph 1.\n# Heading 2\nContent paragraph 2.",
+        )
+        sop_rag_service.ingest_document(
+            request=req,
+            actor_id=test_identity_admin.user_id,
+            authoritative_tenant_id="tenant_sop_test",
+        )
+        res = sop_rag_service.transition_lifecycle(
+            tenant_id="tenant_sop_test",
+            document_id="SOP-P33B-ATOMIC-OK-01",
+            version="1.0",
+            new_status=DocumentLifecycleStatus.PUBLISHED,
+            actor_id=test_identity_admin.user_id,
+            user_permissions=["sop_rag.admin"],
+        )
+        assert res["new_status"] == DocumentLifecycleStatus.PUBLISHED.value
+        assert res["approval_metadata"] is not None
+        assert res["approval_metadata"]["is_verified"] is True
+
+        # Check database: parent document
+        doc = sop_rag_repository.get_document("tenant_sop_test", "SOP-P33B-ATOMIC-OK-01", "1.0")
+        assert doc.lifecycle_status == DocumentLifecycleStatus.PUBLISHED
+        assert doc.approval_metadata.is_verified is True
+        assert doc.approval_metadata.approved_by == test_identity_admin.user_id
+
+        # Check database: all chunks
+        assert len(doc.chunks) >= 2
+        for chunk in doc.chunks:
+            assert chunk.lifecycle_status == DocumentLifecycleStatus.PUBLISHED
+
+        # Check database: audit ledger
+        audits = sop_rag_repository.get_audit_records("tenant_sop_test", limit=20)
+        success_audit = next((a for a in audits if a.get("document_id") == "SOP-P33B-ATOMIC-OK-01" and a.get("outcome") == "SUCCESS"), None)
+        assert success_audit is not None
+        assert success_audit["event_type"] == "LIFECYCLE_TRANSITION_EXECUTED"
+        assert success_audit["actor_id"] == test_identity_admin.user_id
+
+    def test_226_simulated_audit_failure_rolls_back_parent_and_chunks(self, test_identity_admin):
+        req = IngestionRequest(
+            document_id="SOP-P33B-ROLLBACK-01",
+            title="Atomic Rollback Test",
+            content="# Section A\nTesting complete transaction rollback on audit ledger disk failure.\n# Section B\nAdditional content.",
+        )
+        sop_rag_service.ingest_document(
+            request=req,
+            actor_id=test_identity_admin.user_id,
+            authoritative_tenant_id="tenant_sop_test",
+        )
+        # Verify initial state is DRAFT
+        initial_doc = sop_rag_repository.get_document("tenant_sop_test", "SOP-P33B-ROLLBACK-01", "1.0")
+        assert initial_doc.lifecycle_status == DocumentLifecycleStatus.DRAFT
+        assert len(initial_doc.chunks) >= 2
+        for chunk in initial_doc.chunks:
+            assert chunk.lifecycle_status == DocumentLifecycleStatus.DRAFT
+
+        # Simulate audit insert failure inside the atomic transaction
+        with patch.object(sop_rag_repository, "_insert_audit_entry_conn", side_effect=sqlite3.OperationalError("simulated audit ledger disk I/O failure")):
+            with pytest.raises(RuntimeError, match="Lifecycle transition audit could not be persisted"):
+                sop_rag_service.transition_lifecycle(
+                    tenant_id="tenant_sop_test",
+                    document_id="SOP-P33B-ROLLBACK-01",
+                    version="1.0",
+                    new_status=DocumentLifecycleStatus.PUBLISHED,
+                    actor_id=test_identity_admin.user_id,
+                    user_permissions=["sop_rag.admin"],
+                )
+
+        # Invariant: Neither the parent document nor child chunks must have mutated
+        rolled_back_doc = sop_rag_repository.get_document("tenant_sop_test", "SOP-P33B-ROLLBACK-01", "1.0")
+        assert rolled_back_doc.lifecycle_status == DocumentLifecycleStatus.DRAFT
+        assert rolled_back_doc.approval_metadata is None or not rolled_back_doc.approval_metadata.is_verified
+        for chunk in rolled_back_doc.chunks:
+            assert chunk.lifecycle_status == DocumentLifecycleStatus.DRAFT
+
+        # Invariant: No LIFECYCLE_TRANSITION_EXECUTED success audit entry exists
+        audits = sop_rag_repository.get_audit_records("tenant_sop_test", limit=20)
+        assert not any(a.get("document_id") == "SOP-P33B-ROLLBACK-01" and a.get("event_type") == "LIFECYCLE_TRANSITION_EXECUTED" for a in audits)
+
+    def test_227_simulated_doc_update_failure_creates_no_success_audit(self, test_identity_admin):
+        # Attempting a lifecycle transition on a non-existent document
+        with pytest.raises(KeyError, match="not found in tenant partition"):
+            sop_rag_service.transition_lifecycle(
+                tenant_id="tenant_sop_test",
+                document_id="SOP-P33B-NONEXISTENT-DOC-99",
+                version="1.0",
+                new_status=DocumentLifecycleStatus.PUBLISHED,
+                actor_id=test_identity_admin.user_id,
+                user_permissions=["sop_rag.admin"],
+            )
+        # Must not create a SUCCESS audit record
+        audits = sop_rag_repository.get_audit_records("tenant_sop_test", limit=20)
+        assert not any(a.get("document_id") == "SOP-P33B-NONEXISTENT-DOC-99" and a.get("outcome") == "SUCCESS" for a in audits)
+
+    def test_228_database_remains_usable_and_retry_succeeds_after_rollback(self, test_identity_admin):
+        req = IngestionRequest(
+            document_id="SOP-P33B-RETRY-01",
+            title="Retry After Rollback Test",
+            content="# Heading\nVerifying database health and clean retry after rollback.",
+        )
+        sop_rag_service.ingest_document(
+            request=req,
+            actor_id=test_identity_admin.user_id,
+            authoritative_tenant_id="tenant_sop_test",
+        )
+
+        # 1. First attempt fails due to simulated audit failure
+        with patch.object(sop_rag_repository, "_insert_audit_entry_conn", side_effect=sqlite3.OperationalError("transient lock error")):
+            with pytest.raises(RuntimeError):
+                sop_rag_service.transition_lifecycle(
+                    tenant_id="tenant_sop_test",
+                    document_id="SOP-P33B-RETRY-01",
+                    version="1.0",
+                    new_status=DocumentLifecycleStatus.PUBLISHED,
+                    actor_id=test_identity_admin.user_id,
+                    user_permissions=["sop_rag.admin"],
+                )
+
+        # State after rollback is clean DRAFT
+        doc = sop_rag_repository.get_document("tenant_sop_test", "SOP-P33B-RETRY-01", "1.0")
+        assert doc.lifecycle_status == DocumentLifecycleStatus.DRAFT
+
+        # 2. Second attempt without failure succeeds completely
+        res = sop_rag_service.transition_lifecycle(
+            tenant_id="tenant_sop_test",
+            document_id="SOP-P33B-RETRY-01",
+            version="1.0",
+            new_status=DocumentLifecycleStatus.PUBLISHED,
+            actor_id=test_identity_admin.user_id,
+            user_permissions=["sop_rag.admin"],
+        )
+        assert res["new_status"] == DocumentLifecycleStatus.PUBLISHED.value
+
+        # State after successful retry
+        doc_retry = sop_rag_repository.get_document("tenant_sop_test", "SOP-P33B-RETRY-01", "1.0")
+        assert doc_retry.lifecycle_status == DocumentLifecycleStatus.PUBLISHED
+        assert doc_retry.approval_metadata.is_verified is True
+        for chunk in doc_retry.chunks:
+            assert chunk.lifecycle_status == DocumentLifecycleStatus.PUBLISHED
+
+        audits = sop_rag_repository.get_audit_records("tenant_sop_test", limit=20)
+        assert any(a.get("document_id") == "SOP-P33B-RETRY-01" and a.get("outcome") == "SUCCESS" for a in audits)
+
+    def test_229_invalid_and_rejected_transitions_never_create_success_audit(self, test_identity_admin):
+        req = IngestionRequest(
+            document_id="SOP-P33B-INVALID-MATRIX-01",
+            title="Invalid Transition Matrix Test",
+            content="Testing that matrix policy rejection does not commit success audit.",
+        )
+        sop_rag_service.ingest_document(
+            request=req,
+            actor_id=test_identity_admin.user_id,
+            authoritative_tenant_id="tenant_sop_test",
+        )
+        # Attempt invalid direct transition: DRAFT -> REVOKED (invalid policy path)
+        with pytest.raises(ValueError, match="Invalid lifecycle transition"):
+            sop_rag_service.transition_lifecycle(
+                tenant_id="tenant_sop_test",
+                document_id="SOP-P33B-INVALID-MATRIX-01",
+                version="1.0",
+                new_status=DocumentLifecycleStatus.REVOKED,
+                actor_id=test_identity_admin.user_id,
+                user_permissions=["sop_rag.admin"],
+            )
+        doc = sop_rag_repository.get_document("tenant_sop_test", "SOP-P33B-INVALID-MATRIX-01", "1.0")
+        assert doc.lifecycle_status == DocumentLifecycleStatus.DRAFT
+
+        # Rejection recorded with REJECTED outcome, never SUCCESS
+        audits = sop_rag_repository.get_audit_records("tenant_sop_test", limit=20)
+        assert not any(a.get("document_id") == "SOP-P33B-INVALID-MATRIX-01" and a.get("event_type") == "LIFECYCLE_TRANSITION_EXECUTED" for a in audits)
+        assert any(a.get("document_id") == "SOP-P33B-INVALID-MATRIX-01" and a.get("outcome") == "REJECTED" for a in audits)
+
+    def test_230_tenant_isolation_preserved_during_lifecycle_transitions(self, test_identity_admin):
+        req = IngestionRequest(
+            document_id="SOP-P33B-TENANT-ISO-01",
+            title="Tenant Isolation Transition Test",
+            content="Document strictly belonging to tenant_sop_test.",
+        )
+        sop_rag_service.ingest_document(
+            request=req,
+            actor_id=test_identity_admin.user_id,
+            authoritative_tenant_id="tenant_sop_test",
+        )
+        # Foreign tenant administrator attempts to transition this document
+        with pytest.raises(KeyError, match="not found in tenant partition"):
+            sop_rag_service.transition_lifecycle(
+                tenant_id="tenant_alien_99",
+                document_id="SOP-P33B-TENANT-ISO-01",
+                version="1.0",
+                new_status=DocumentLifecycleStatus.PUBLISHED,
+                actor_id="foreign_admin_99",
+                user_permissions=["sop_rag.admin"],
+            )
+        # Document in original tenant remains DRAFT
+        doc = sop_rag_repository.get_document("tenant_sop_test", "SOP-P33B-TENANT-ISO-01", "1.0")
+        assert doc.lifecycle_status == DocumentLifecycleStatus.DRAFT
+        for chunk in doc.chunks:
+            assert chunk.lifecycle_status == DocumentLifecycleStatus.DRAFT
+
 
 
 
