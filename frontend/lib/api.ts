@@ -346,3 +346,54 @@ export async function listConfidenceAssessments(
   if (targetType) params.append("target_type", targetType);
   return fetchSage(`/api/v3/confidence-uncertainty?${params.toString()}`);
 }
+
+// --- SOP / RAG INTELLIGENCE API (Prompt 33 — ADVISORY KNOWLEDGE ONLY) ---
+
+export async function ingestSOPDocument(payload: any) {
+  return fetchSage("/api/v3/sop-rag/documents/ingest", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getSOPDocument(documentId: string, version?: string) {
+  const q = version ? `?version=${encodeURIComponent(version)}` : "";
+  return fetchSage(`/api/v3/sop-rag/documents/${encodeURIComponent(documentId)}${q}`);
+}
+
+export async function listSOPDocuments(params?: { plant_id?: string; status?: string; limit?: number }) {
+  const query = new URLSearchParams();
+  if (params?.plant_id) query.append("plant_id", params.plant_id);
+  if (params?.status) query.append("status", params.status);
+  if (params?.limit) query.append("limit", String(params.limit));
+  const qs = query.toString() ? `?${query.toString()}` : "";
+  return fetchSage(`/api/v3/sop-rag/documents${qs}`);
+}
+
+export async function updateSOPLifecycle(documentId: string, newStatus: string, version: string) {
+  return fetchSage(
+    `/api/v3/sop-rag/documents/${encodeURIComponent(documentId)}/lifecycle?new_status=${encodeURIComponent(newStatus)}&version=${encodeURIComponent(version)}`,
+    {
+      method: "PATCH",
+    }
+  );
+}
+
+export async function retrieveSOPPassages(payload: any) {
+  return fetchSage("/api/v3/sop-rag/retrieve", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function querySOPRAG(payload: any) {
+  return fetchSage("/api/v3/sop-rag/query", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getSOPAudits(limit: number = 50) {
+  return fetchSage(`/api/v3/sop-rag/audits?limit=${limit}`);
+}
+

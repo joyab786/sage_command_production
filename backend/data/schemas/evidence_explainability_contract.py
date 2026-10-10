@@ -97,6 +97,8 @@ class EvidenceSourceType(str, Enum):
     INDUSTRIAL_ONTOLOGY = "INDUSTRIAL_ONTOLOGY"
     MANUAL_OPERATOR = "MANUAL_OPERATOR"
     EXTERNAL_SYSTEM = "EXTERNAL_SYSTEM"
+    SOP_DOCUMENT = "SOP_DOCUMENT"
+    SOP_RAG = "SOP_RAG"
 
 
 class EvidenceValidationStatus(str, Enum):
