@@ -193,6 +193,12 @@ CANONICAL_PERMISSIONS: List[Permission] = [
     Permission(permission_id="sop_rag.query", resource="sop_rag", action="query", description="Execute scoped SOP retrieval and evidence-backed RAG queries"),
     Permission(permission_id="sop_rag.admin", resource="sop_rag", action="admin", description="Administrative authority over SOP lifecycle, retention, and RAG configuration", is_sensitive=True),
 
+    # Governed Organizational Memory Foundation (Prompt 34)
+    Permission(permission_id="memory.read", resource="memory", action="read", description="View organizational memory records, source references, and search outcomes"),
+    Permission(permission_id="memory.write", resource="memory", action="write", description="Draft and update organizational memory entries, lessons learned, and context"),
+    Permission(permission_id="memory.verify", resource="memory", action="verify", description="Review and formally verify organizational memory entries and outcome assessments", is_sensitive=True),
+    Permission(permission_id="memory.admin", resource="memory", action="admin", description="Administrative authority over organizational memory lifecycle, supersession, holds, and retention", is_sensitive=True),
+
     # System Administration (Strictly Non-Operational)
     Permission(permission_id="user.manage", resource="user", action="manage", description="Create, update, or suspend user identities", is_sensitive=True),
     Permission(permission_id="system.config", resource="system", action="config", description="Configure platform infrastructure and endpoints", is_sensitive=True),
@@ -229,7 +235,7 @@ SYSTEM_ROLES: List[Role] = [
         role_id="VIEWER",
         name="Viewer",
         scope_type=RoleScopeType.SYSTEM,
-        permissions=["telemetry.read", "database.read", "action.read", "policy.read", "transaction.read", "ontology.read", "knowledge_graph.read", "digital_twin.read", "data_quality.read", "incidents.read", "rca.read", "blast_radius.read", "demand_forecasting.read", "supplier_risk.read", "sensor_fusion.read", "what_if_simulation.read", "optimization.read", "decision_engine.read", "evidence_explainability.read", "confidence_uncertainty.read", "sop_rag.read"],
+        permissions=["telemetry.read", "database.read", "action.read", "policy.read", "transaction.read", "ontology.read", "knowledge_graph.read", "digital_twin.read", "data_quality.read", "incidents.read", "rca.read", "blast_radius.read", "demand_forecasting.read", "supplier_risk.read", "sensor_fusion.read", "what_if_simulation.read", "optimization.read", "decision_engine.read", "evidence_explainability.read", "confidence_uncertainty.read", "sop_rag.read", "memory.read"],
         inherits_from=[],
         description="Read-only observer access to telemetry, action states, and policy rules.",
         is_system_role=True
@@ -252,7 +258,7 @@ SYSTEM_ROLES: List[Role] = [
             "transaction.plan", "transaction.cancel", "action.execute", "transaction.execute",
             "incidents.create", "incidents.acknowledge", "incidents.transition", "incidents.update",
             "incidents.assign", "incidents.evidence.write", "incidents.notes.write", "rca.analyze",
-            "blast_radius.analyze", "sop_rag.ingest"
+            "blast_radius.analyze", "sop_rag.ingest", "memory.write"
         ],
         inherits_from=["ANALYST"],
         description="Line operator authorized to propose and execute structured operational actions on assigned plant lines.",
@@ -289,7 +295,7 @@ SYSTEM_ROLES: List[Role] = [
         role_id="PLANT_MANAGER",
         name="Plant Manager",
         scope_type=RoleScopeType.PLANT,
-        permissions=["action.approve", "production.schedule", "transaction.rollback", "ontology.manage", "knowledge_graph.manage", "digital_twin.manage", "data_quality.manage", "incidents.admin", "rca.admin", "blast_radius.admin", "sop_rag.ingest", "sop_rag.admin"],
+        permissions=["action.approve", "production.schedule", "transaction.rollback", "ontology.manage", "knowledge_graph.manage", "digital_twin.manage", "data_quality.manage", "incidents.admin", "rca.admin", "blast_radius.admin", "sop_rag.ingest", "sop_rag.admin", "memory.verify", "memory.admin"],
         inherits_from=["OPERATOR", "SAFETY_MANAGER", "SUPPLY_CHAIN_MANAGER"],
         description="Senior plant authority responsible for approving high-risk actions, production schedules, and transaction rollbacks.",
         is_system_role=True
@@ -309,7 +315,7 @@ SYSTEM_ROLES: List[Role] = [
         scope_type=RoleScopeType.SYSTEM,
         permissions=[
             "user.manage", "system.config", "tenant.admin", "role.assign",
-            "database.connection.create", "database.connection.admin", "ontology.manage", "knowledge_graph.manage", "digital_twin.manage", "data_quality.manage", "incidents.admin", "rca.admin", "blast_radius.admin", "demand_forecasting.admin", "supplier_risk.admin", "sensor_fusion.admin", "what_if_simulation.admin", "optimization.admin", "decision_engine.admin", "evidence_explainability.admin", "confidence_uncertainty.admin", "sop_rag.ingest", "sop_rag.admin"
+            "database.connection.create", "database.connection.admin", "ontology.manage", "knowledge_graph.manage", "digital_twin.manage", "data_quality.manage", "incidents.admin", "rca.admin", "blast_radius.admin", "demand_forecasting.admin", "supplier_risk.admin", "sensor_fusion.admin", "what_if_simulation.admin", "optimization.admin", "decision_engine.admin", "evidence_explainability.admin", "confidence_uncertainty.admin", "sop_rag.ingest", "sop_rag.admin", "memory.write", "memory.verify", "memory.admin"
         ],
         inherits_from=["VIEWER"],
         description="Platform administrator. Strictly non-operational; cannot propose or approve factory actions.",
