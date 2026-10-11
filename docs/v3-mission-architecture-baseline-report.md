@@ -19,7 +19,7 @@
 - **Prompt 35B Baseline Final Commit:** `3a2154921a861e8bf33bc86b38ff37859736623d` (`docs(v3): record final commit SHAs in Prompt 35B baseline report`)
 - **Prompt 35B Pushed Baseline Update:** `84d52a6f29a81ccf2624916e7157395e0cbc7e12` (`docs(v3): update baseline report with pushed commit SHA`)
 - **Prompt 35C Starting Baseline HEAD:** `84d52a6f29a81ccf2624916e7157395e0cbc7e12`
-- **Prompt 35C Reconciliation Documentation Commit:** `PENDING_COMMIT` (to be recorded upon creation)
+- **Prompt 35C Reconciliation Documentation Commit:** `22632d21ad0fd77f71126a91830029b2fc10cc3c` (`docs(v3): reconcile mission architecture baseline with implementation (Prompt 35C)`)
 
 ---
 
