@@ -1060,10 +1060,9 @@ class TestPrompt35APlantAuthorizationHardening:
         with pytest.raises(MissionPermissionError, match="has no assigned plants"):
             temp_service.get_mission(empty_plants_user, m.mission_id)
 
-        # List returns 0 results
-        missions, total = temp_service.list_missions(empty_plants_user)
-        assert missions == []
-        assert total == 0
+        # List fails closed
+        with pytest.raises(MissionPermissionError, match="has no assigned plants"):
+            temp_service.list_missions(empty_plants_user)
 
         # Update draft fails closed
         with pytest.raises(MissionPermissionError, match="has no assigned plants"):
@@ -1335,7 +1334,7 @@ class TestPrompt35AResourceReferenceValidation:
             related_resources={"actions": ["act_phantom_9999"]},
             origin_reason="Setup with phantom",
         )
-        with pytest.raises(MissionValidationError, match="not found"):
+        with pytest.raises(MissionValidationError, match="invalid or inaccessible in the authorized scope"):
             temp_service.create_mission_draft(operator_identity, req)
 
     def test_cross_tenant_resource_reference_rejected(self, temp_service, operator_identity):
@@ -1450,7 +1449,7 @@ class TestPrompt35AResourceReferenceValidation:
             ],
             origin_reason="Setup missing evidence",
         )
-        with pytest.raises(MissionValidationError, match="not found"):
+        with pytest.raises(MissionValidationError, match="invalid or inaccessible in the authorized scope"):
             temp_service.create_mission_draft(operator_identity, req)
 
     def test_unverified_evidence_warns_and_does_not_certify_success(self, temp_service, operator_identity):
@@ -1665,4 +1664,490 @@ class TestPrompt35APersistenceAndAuditIntegrity:
         assert latest_audit.event_type == "MISSION_VALIDATION_FAILED"
         assert latest_audit.result == "FAILURE"
         assert "act_missing_phantom" in str(latest_audit.details.get("errors", []))
+
+
+# =============================================================================
+# 7. PROMPT 35B REGRESSION TESTS: OUTCOME INTEGRITY, SCOPED LOOKUP, INPUT SAFETY
+# =============================================================================
+
+class TestPrompt35BOutcomeStatusIntegrity:
+    """
+    Verifies that mission outcome statuses are strictly server-authoritative:
+    - Criteria: Only UNKNOWN is accepted; SATISFIED, NOT_SATISFIED, NOT_APPLICABLE rejected.
+    - Evaluation notes: Client-supplied notes rejected on criteria.
+    - Steps: Only PLANNED or PENDING accepted; SKIPPED, BLOCKED, CANCELLED, etc. rejected.
+    - Service layer enforces all status checks against direct programmatic calls.
+    """
+
+    def test_not_applicable_criterion_status_rejected_on_create(self):
+        """NOT_APPLICABLE criterion status is rejected on creation."""
+        with pytest.raises(ValueError, match="Only 'UNKNOWN' status is permitted"):
+            MissionCreateRequest(
+                title="Criterion Status Test",
+                description="Testing status validation",
+                mission_type=MissionType.INVESTIGATION,
+                objective="Test criteria integrity",
+                plant_id="plant_01",
+                success_criteria=[
+                    MissionSuccessCriterion(
+                        criterion_id="crit_na",
+                        description="Benchmark",
+                        status=CriterionStatus.NOT_APPLICABLE,
+                    )
+                ],
+                origin_reason="Test check",
+            )
+
+    def test_not_applicable_criterion_status_rejected_on_update(self):
+        """NOT_APPLICABLE criterion status is rejected on draft update."""
+        with pytest.raises(ValueError, match="Only 'UNKNOWN' status is permitted"):
+            MissionUpdateRequest(
+                success_criteria=[
+                    MissionSuccessCriterion(
+                        criterion_id="crit_na",
+                        description="Benchmark",
+                        status=CriterionStatus.NOT_APPLICABLE,
+                    )
+                ],
+                update_reason="Attempt NOT_APPLICABLE update",
+            )
+
+    def test_all_non_unknown_criteria_statuses_rejected_on_create_and_update(self):
+        """Every criterion status other than UNKNOWN is rejected on create and update."""
+        for invalid_status in (CriterionStatus.SATISFIED, CriterionStatus.NOT_SATISFIED, CriterionStatus.NOT_APPLICABLE):
+            with pytest.raises(ValueError, match="Only 'UNKNOWN' status is permitted"):
+                MissionCreateRequest(
+                    title="Criterion Status Rejection",
+                    description="Testing status rejection",
+                    mission_type=MissionType.INVESTIGATION,
+                    objective="Test criteria integrity",
+                    plant_id="plant_01",
+                    success_criteria=[
+                        MissionSuccessCriterion(
+                            criterion_id="crit_inv",
+                            description="Benchmark",
+                            status=invalid_status,
+                        )
+                    ],
+                    origin_reason="Test check",
+                )
+
+            with pytest.raises(ValueError, match="Only 'UNKNOWN' status is permitted"):
+                MissionUpdateRequest(
+                    success_criteria=[
+                        MissionSuccessCriterion(
+                            criterion_id="crit_inv",
+                            description="Benchmark",
+                            status=invalid_status,
+                        )
+                    ],
+                    update_reason="Attempt invalid criterion status",
+                )
+
+    def test_client_supplied_evaluation_notes_rejected_on_create_and_update(self):
+        """Client-supplied evaluation notes cannot act as authoritative verification."""
+        with pytest.raises(ValueError, match="Client-supplied evaluation notes are not permitted"):
+            MissionCreateRequest(
+                title="Client Notes Forgery",
+                description="Testing notes rejection",
+                mission_type=MissionType.INVESTIGATION,
+                objective="Test notes rejection",
+                plant_id="plant_01",
+                success_criteria=[
+                    MissionSuccessCriterion(
+                        criterion_id="crit_notes",
+                        description="Benchmark",
+                        status=CriterionStatus.UNKNOWN,
+                        evaluation_notes="Client claiming: Verified by operator inspection.",
+                    )
+                ],
+                origin_reason="Test check",
+            )
+
+        with pytest.raises(ValueError, match="Client-supplied evaluation notes are not permitted"):
+            MissionUpdateRequest(
+                success_criteria=[
+                    MissionSuccessCriterion(
+                        criterion_id="crit_notes",
+                        description="Benchmark",
+                        status=CriterionStatus.UNKNOWN,
+                        evaluation_notes="Client claiming: Verified in update.",
+                    )
+                ],
+                update_reason="Attempt evaluation notes injection",
+            )
+
+    def test_step_skipped_blocked_cancelled_rejected_on_create(self):
+        """Planned steps cannot be initialized with SKIPPED, BLOCKED, or CANCELLED."""
+        for invalid_status in (StepStatus.SKIPPED, StepStatus.BLOCKED, StepStatus.CANCELLED):
+            with pytest.raises(ValueError, match=f"cannot be initialized to '{invalid_status.value}'"):
+                MissionCreateRequest(
+                    title="Step Status Test",
+                    description="Testing step status restrictions",
+                    mission_type=MissionType.INVESTIGATION,
+                    objective="Test step integrity",
+                    plant_id="plant_01",
+                    planned_steps=[
+                        MissionPlannedStep(
+                            step_id="step_01",
+                            title="Inspection",
+                            description="Step inspection",
+                            step_type=StepType.INVESTIGATION,
+                            status=invalid_status,
+                        )
+                    ],
+                    origin_reason="Test check",
+                )
+
+    def test_step_skipped_blocked_cancelled_rejected_on_update(self):
+        """Draft updates reject steps marked SKIPPED, BLOCKED, or CANCELLED."""
+        for invalid_status in (StepStatus.SKIPPED, StepStatus.BLOCKED, StepStatus.CANCELLED):
+            with pytest.raises(ValueError, match="Only 'PLANNED' or 'PENDING' status is permitted"):
+                MissionUpdateRequest(
+                    planned_steps=[
+                        MissionPlannedStep(
+                            step_id="step_01",
+                            title="Inspection",
+                            description="Step inspection",
+                            step_type=StepType.INVESTIGATION,
+                            status=invalid_status,
+                        )
+                    ],
+                    update_reason="Attempt invalid step status update",
+                )
+
+    def test_direct_service_call_cannot_bypass_status_validation(self, temp_service, operator_identity):
+        """Calling service methods directly without Pydantic cannot bypass status constraints."""
+        # 1. Bypass attempt on creation with non-UNKNOWN criterion
+        req = MissionCreateRequest(
+            title="Direct Service Bypass Test",
+            description="Testing service boundary enforcement",
+            mission_type=MissionType.INVESTIGATION,
+            objective="Service boundary validation",
+            plant_id="plant_01",
+            origin_reason="Boundary check",
+        )
+        # Manually alter the criterion object post-Pydantic validation
+        bad_criterion = MissionSuccessCriterion(
+            criterion_id="crit_bypassed",
+            description="Bypassed check",
+            status=CriterionStatus.UNKNOWN,
+        )
+        bad_criterion.status = CriterionStatus.SATISFIED  # Direct mutation
+        req.success_criteria = [bad_criterion]
+
+        with pytest.raises(MissionValidationError, match="cannot be self-certified as 'SATISFIED'"):
+            temp_service.create_mission_draft(operator_identity, req)
+
+        # 2. Bypass attempt on creation with non-PLANNED/PENDING step
+        req.success_criteria = []
+        bad_step = MissionPlannedStep(
+            step_id="step_bypassed",
+            title="Bypassed Step",
+            description="Directly mutated step",
+            step_type=StepType.INVESTIGATION,
+            status=StepStatus.PLANNED,
+        )
+        bad_step.status = StepStatus.COMPLETED  # Direct mutation
+        req.planned_steps = [bad_step]
+
+        with pytest.raises(MissionValidationError, match="status cannot be initialized to 'COMPLETED'"):
+            temp_service.create_mission_draft(operator_identity, req)
+
+        # 3. Bypass attempt on update
+        valid_req = MissionCreateRequest(
+            title="Valid Mission for Update",
+            description="Valid description",
+            mission_type=MissionType.INVESTIGATION,
+            objective="Valid objective",
+            plant_id="plant_01",
+            origin_reason="Setup",
+        )
+        mission = temp_service.create_mission_draft(operator_identity, valid_req)
+
+        up_req = MissionUpdateRequest(update_reason="Attempt direct update bypass")
+        up_req.success_criteria = [bad_criterion]
+        with pytest.raises(MissionValidationError, match="cannot be self-certified as 'SATISFIED'"):
+            temp_service.update_mission_draft(operator_identity, mission.mission_id, up_req)
+
+
+class TestPrompt35BScopedResourceLookupAndNonDisclosure:
+    """
+    Verifies canonical scope-aware resource lookup, information disclosure protection,
+    and elimination of private database connections in resource validation.
+    """
+
+    def test_nonexistent_and_cross_scope_produce_identical_error(self, temp_service, operator_identity):
+        """Treats nonexistent, cross-tenant, cross-workspace, and cross-plant references identically."""
+        # 1. Nonexistent reference
+        req_nonexistent = MissionCreateRequest(
+            title="Nonexistent Reference Test",
+            description="Testing error message uniformity",
+            mission_type=MissionType.INVESTIGATION,
+            objective="Uniform error verification",
+            plant_id="plant_01",
+            related_resources={"actions": ["act_phantom_00000000"]},
+            origin_reason="Uniformity check",
+        )
+        with pytest.raises(MissionValidationError) as exc_nonexistent:
+            temp_service.create_mission_draft(operator_identity, req_nonexistent)
+
+        # 2. Cross-tenant reference
+        cross_tenant_id = f"act_cross_t_{uuid.uuid4().hex[:8]}"
+        action_store.save(Action(
+            action_id=cross_tenant_id,
+            action_type=ActionType.SCHEDULE_MAINTENANCE,
+            tenant_id="tenant_foreign_xyz",
+            workspace_id="workspace_prod",
+            session_id="session_1",
+            target=ActionTarget(resource_type=ResourceType.MACHINE, resource_id="M-101", plant_id="plant_01"),
+            parameters={"interval": "weekly"},
+            reason=ActionReason(reason_code="MAINT_SCHEDULE", summary="Foreign tenant action"),
+        ))
+        req_cross_tenant = MissionCreateRequest(
+            title="Cross Tenant Reference Test",
+            description="Testing error message uniformity",
+            mission_type=MissionType.INVESTIGATION,
+            objective="Uniform error verification",
+            plant_id="plant_01",
+            related_resources={"actions": [cross_tenant_id]},
+            origin_reason="Uniformity check",
+        )
+        with pytest.raises(MissionValidationError) as exc_cross_tenant:
+            temp_service.create_mission_draft(operator_identity, req_cross_tenant)
+
+        # 3. Cross-workspace reference
+        cross_ws_id = f"act_cross_ws_{uuid.uuid4().hex[:8]}"
+        action_store.save(Action(
+            action_id=cross_ws_id,
+            action_type=ActionType.SCHEDULE_MAINTENANCE,
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_foreign_xyz",
+            session_id="session_1",
+            target=ActionTarget(resource_type=ResourceType.MACHINE, resource_id="M-101", plant_id="plant_01"),
+            parameters={"interval": "weekly"},
+            reason=ActionReason(reason_code="MAINT_SCHEDULE", summary="Foreign workspace action"),
+        ))
+        req_cross_ws = MissionCreateRequest(
+            title="Cross Workspace Reference Test",
+            description="Testing error message uniformity",
+            mission_type=MissionType.INVESTIGATION,
+            objective="Uniform error verification",
+            plant_id="plant_01",
+            related_resources={"actions": [cross_ws_id]},
+            origin_reason="Uniformity check",
+        )
+        with pytest.raises(MissionValidationError) as exc_cross_ws:
+            temp_service.create_mission_draft(operator_identity, req_cross_ws)
+
+        # 4. Cross-plant reference
+        cross_plant_id = f"act_cross_p_{uuid.uuid4().hex[:8]}"
+        action_store.save(Action(
+            action_id=cross_plant_id,
+            action_type=ActionType.SCHEDULE_MAINTENANCE,
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            session_id="session_1",
+            target=ActionTarget(resource_type=ResourceType.MACHINE, resource_id="M-101", plant_id="plant_99"),
+            parameters={"interval": "weekly"},
+            reason=ActionReason(reason_code="MAINT_SCHEDULE", summary="Foreign plant action"),
+        ))
+        req_cross_plant = MissionCreateRequest(
+            title="Cross Plant Reference Test",
+            description="Testing error message uniformity",
+            mission_type=MissionType.INVESTIGATION,
+            objective="Uniform error verification",
+            plant_id="plant_01",
+            related_resources={"actions": [cross_plant_id]},
+            origin_reason="Uniformity check",
+        )
+        with pytest.raises(MissionValidationError) as exc_cross_plant:
+            temp_service.create_mission_draft(operator_identity, req_cross_plant)
+
+        # Assert identical error structure: None discloses whether the record exists in another scope
+        assert "invalid or inaccessible in the authorized scope" in str(exc_nonexistent.value)
+        assert "invalid or inaccessible in the authorized scope" in str(exc_cross_tenant.value)
+        assert "invalid or inaccessible in the authorized scope" in str(exc_cross_ws.value)
+        assert "invalid or inaccessible in the authorized scope" in str(exc_cross_plant.value)
+        assert str(exc_nonexistent.value).endswith("is invalid or inaccessible in the authorized scope.")
+
+    def test_missing_plant_metadata_on_plant_sensitive_resource_fails_closed(self, temp_service, operator_identity):
+        """Untagged plant-sensitive resource fails closed and cannot be referenced across boundaries."""
+        untagged_act_id = f"act_untagged_{uuid.uuid4().hex[:8]}"
+        action_store.save(Action(
+            action_id=untagged_act_id,
+            action_type=ActionType.SCHEDULE_MAINTENANCE,
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            session_id="session_1",
+            target=ActionTarget(resource_type=ResourceType.MACHINE, resource_id="M-101", plant_id=None),
+            parameters={"interval": "weekly"},
+            reason=ActionReason(reason_code="MAINT_SCHEDULE", summary="Untagged legacy action"),
+        ))
+
+        req = MissionCreateRequest(
+            title="Untagged Resource Reference",
+            description="Referencing untagged action",
+            mission_type=MissionType.INVESTIGATION,
+            objective="Verify untagged resources fail closed",
+            plant_id="plant_01",
+            related_resources={"actions": [untagged_act_id]},
+            origin_reason="Fail closed verification",
+        )
+        with pytest.raises(MissionValidationError, match="invalid or inaccessible in the authorized scope"):
+            temp_service.create_mission_draft(operator_identity, req)
+
+    def test_ast_resource_validation_has_zero_private_connection_calls(self):
+        """AST audit confirms _validate_single_resource does not call private connection methods."""
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        target_path = os.path.join(current_dir, "services", "mission_service.py")
+        with open(target_path, "r", encoding="utf-8") as f:
+            source = f.read()
+
+        tree = ast.parse(source, filename="mission_service.py")
+        target_func = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "_validate_single_resource":
+                target_func = node
+                break
+
+        assert target_func is not None, "Method '_validate_single_resource' must exist in mission_service.py"
+
+        private_conn_calls = []
+        for sub in ast.walk(target_func):
+            if isinstance(sub, ast.Attribute) and sub.attr in ("_get_connection", "_get_conn"):
+                private_conn_calls.append(sub.attr)
+
+        assert len(private_conn_calls) == 0, (
+            f"Found forbidden private connection calls in _validate_single_resource: {private_conn_calls}"
+        )
+
+
+class TestPrompt35BIdentifierAndSecretProtection:
+    """
+    Verifies that plant identifiers and text fields strictly validate formats,
+    reject credentials and tokens, and ensure wildcards cannot bypass validation.
+    """
+
+    def test_malformed_plant_ids_rejected(self):
+        """Malformed plant IDs fail canonical regex validation."""
+        malformed_examples = [
+            "",                       # Empty
+            "a",                      # Too short (< 2 chars)
+            "plant with space",       # Space not allowed
+            "plant/with/slashes",     # Slashes not allowed
+            "../../etc/passwd",       # Directory traversal
+            "plant@domain.com",       # Special chars
+            "P" * 65,                 # Too long (> 64 chars)
+        ]
+        for bad_id in malformed_examples:
+            with pytest.raises(ValueError):
+                MissionCreateRequest(
+                    title="Malformed Plant Mission",
+                    description="Testing plant ID regex",
+                    mission_type=MissionType.INVESTIGATION,
+                    objective="Test identifier safety",
+                    plant_id=bad_id,
+                    origin_reason="Setup check",
+                )
+
+    def test_credential_bearing_url_as_plant_id_rejected(self):
+        """Credential-bearing URL in plant_id is rejected by secret scan and format regex."""
+        with pytest.raises(ValueError):
+            MissionCreateRequest(
+                title="Credential Plant Mission",
+                description="Testing credential URL detection",
+                mission_type=MissionType.INVESTIGATION,
+                objective="Test identifier safety",
+                plant_id="http://admin:secretPass123@cluster.internal:8080/plant-01",
+                origin_reason="Setup check",
+            )
+
+    def test_wildcard_identity_does_not_bypass_plant_id_validation(self, temp_service, plant_manager_identity):
+        """Explicit wildcard plant assignment on identity does not bypass plant_id validation."""
+        # plant_manager_identity has assigned_plants=["*"]
+        with pytest.raises(ValueError):
+            temp_service.create_mission_draft(
+                plant_manager_identity,
+                MissionCreateRequest(
+                    title="Wildcard Bypass Attempt",
+                    description="Attempting to smuggle malformed plant under wildcard identity",
+                    mission_type=MissionType.INVESTIGATION,
+                    objective="Verify wildcard does not bypass validation",
+                    plant_id="malformed plant id with spaces!",
+                    origin_reason="Setup check",
+                ),
+            )
+
+    def test_secret_patterns_in_text_fields_rejected(self):
+        """Untrusted text fields reject tokens, private keys, and credential URLs."""
+        # 1. JWT in title
+        with pytest.raises(ValueError, match="contains potential secret"):
+            MissionCreateRequest(
+                title="Mission eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abc123def456ghi7890",
+                description="Normal description",
+                mission_type=MissionType.INVESTIGATION,
+                objective="Normal objective",
+                plant_id="plant_01",
+                origin_reason="Normal reason",
+            )
+
+        # 2. Private key in origin_reason
+        with pytest.raises(ValueError, match="contains potential secret"):
+            MissionCreateRequest(
+                title="Normal Title",
+                description="Normal description",
+                mission_type=MissionType.INVESTIGATION,
+                objective="Normal objective",
+                plant_id="plant_01",
+                origin_reason="Key: -----BEGIN EC PRIVATE KEY-----\nMHQCAQEEIB...",
+            )
+
+        # 3. API key in step title
+        with pytest.raises(ValueError, match="contains potential secret"):
+            MissionPlannedStep(
+                step_id="step_secret",
+                title="Configure sk_live_1234567890abcdef123456",
+                description="Normal step description",
+                step_type=StepType.INVESTIGATION,
+            )
+
+
+class TestPrompt35BAuthorizationConsistency:
+    """
+    Verifies consistent fail-closed authorization behavior across listing,
+    filtering, and scope boundaries.
+    """
+
+    def test_empty_or_missing_plants_fail_closed_on_listing(self, temp_service):
+        """Caller with empty or missing assigned_plants fails closed with 403 on list_missions."""
+        empty_plants_user = Identity(
+            user_id="op_empty",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            roles=["OPERATOR"],
+            permissions=["mission.read"],
+            assigned_plants=[],
+        )
+        with pytest.raises(MissionPermissionError, match="has no assigned plants"):
+            temp_service.list_missions(empty_plants_user)
+
+    def test_unauthorized_plant_filter_raises_permission_error(self, temp_service):
+        """Caller filtering for a plant outside assigned scope receives permission error."""
+        p1_op = Identity(
+            user_id="op_plant1",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            roles=["OPERATOR"],
+            permissions=["mission.read"],
+            assigned_plants=["plant_01"],
+        )
+        with pytest.raises(MissionPermissionError, match="not authorized for plant 'plant_99'"):
+            temp_service.list_missions(p1_op, plant_id="plant_99")
+
+    def test_malformed_plant_filter_rejected(self, temp_service, plant_manager_identity):
+        """Filtering missions with malformed plant identifier raises validation error."""
+        with pytest.raises(ValueError, match="Invalid plant identifier format"):
+            temp_service.list_missions(plant_manager_identity, plant_id="malformed filter with spaces")
+
 

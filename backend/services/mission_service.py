@@ -65,6 +65,7 @@ try:
         VALID_LIFECYCLE_TRANSITIONS,
         SUPPORTED_RESOURCE_CATEGORIES,
         _validate_safe_text,
+        validate_plant_identifier,
         is_valid_lifecycle_transition,
         validate_mission_dependencies,
     )
@@ -121,6 +122,7 @@ except (ImportError, ModuleNotFoundError):
         VALID_LIFECYCLE_TRANSITIONS,
         SUPPORTED_RESOURCE_CATEGORIES,
         _validate_safe_text,
+        validate_plant_identifier,
         is_valid_lifecycle_transition,
         validate_mission_dependencies,
     )
@@ -187,12 +189,15 @@ class MissionService:
         return set(raw)
 
     def _is_plant_authorized(self, identity: Identity, plant_id: Optional[str]) -> bool:
-        """Determines if a target plant is within caller's authorized scope."""
+        """
+        Determines if a target plant is within caller's authorized scope.
+        Missing or empty plant fails closed.
+        """
         assigned = self._get_authorized_plants(identity)
         if not assigned:
             return False
         if not plant_id or not plant_id.strip():
-            return True
+            return False
         if "*" in assigned:
             return True
         return plant_id in assigned
@@ -203,6 +208,7 @@ class MissionService:
         - Workspace ID must not be empty or null (fail closed).
         - Tenant ID must not be empty or null (fail closed).
         - Caller must have at least one assigned plant (fail closed).
+        - Requested plant ID (if specified) must be validated for format and secrets (wildcard does not bypass).
         - Requested plant ID (if specified) must be in caller's assigned plants or wildcard.
         """
         if not identity.workspace_id or not identity.workspace_id.strip():
@@ -219,6 +225,9 @@ class MissionService:
             raise MissionPermissionError("Caller has no assigned plants. Access denied (fail-closed).")
 
         if requested_plant_id:
+            # Validate format and scan for secrets (wildcard plant assignment does NOT bypass identifier validation)
+            validate_plant_identifier(requested_plant_id)
+
             if "*" not in assigned and requested_plant_id not in assigned:
                 logger.warning(
                     f"Scope denial: caller '{identity.user_id}' assigned to {assigned} attempted access to plant '{requested_plant_id}'."
@@ -259,110 +268,129 @@ class MissionService:
         identity: Identity,
         category: str,
         res_id: str,
+        mission_plant_id: str,
         errors: List[str],
         warnings: List[str],
         context: str = "Resource",
     ) -> None:
-        """Validates a single resource reference against its canonical repository."""
+        """
+        Validates a single resource reference using canonical scoped repository methods.
+        Enforces tenant, workspace, and plant matching with fail-closed behavior for
+        missing plant metadata on plant-sensitive resources.
+
+        Treats nonexistent and inaccessible references identically to prevent
+        information disclosure across tenants, workspaces, and plants.
+        """
         caller_tenant = identity.tenant_id
         caller_ws = identity.workspace_id
 
+        generic_error = f"{context} reference '{res_id}' is invalid or inaccessible in the authorized scope."
+
         cat = category.lower()
         if cat in ("actions", "action_proposals"):
-            act = action_store.get_by_id(res_id, caller_tenant)
+            # 1. Scoped lookup via ActionStore
+            act = action_store.get_by_scope(res_id, caller_tenant, caller_ws)
             if not act:
-                with action_store._get_connection() as conn:
-                    row = conn.execute("SELECT tenant_id, workspace_id FROM actions_v3 WHERE action_id = ?", (res_id,)).fetchone()
-                if row:
-                    errors.append(f"{context} reference '{res_id}' is invalid or inaccessible in the authorized scope.")
-                else:
-                    errors.append(f"{context} reference '{res_id}' in category '{category}' not found.")
-            else:
-                if act.workspace_id and act.workspace_id != caller_ws:
-                    errors.append(f"{context} reference '{res_id}' is invalid or inaccessible in the authorized scope.")
-                elif act.target and act.target.plant_id and not self._is_plant_authorized(identity, act.target.plant_id):
-                    errors.append(f"{context} reference '{res_id}' is invalid or inaccessible in the authorized scope.")
+                errors.append(generic_error)
+                return
+
+            res_plant = act.target.plant_id if act.target else getattr(act, "plant_id", None)
+            if not res_plant:
+                # Missing plant on plant-sensitive action: fail closed!
+                errors.append(generic_error)
+                return
+
+            if res_plant != mission_plant_id or not self._is_plant_authorized(identity, res_plant):
+                errors.append(generic_error)
+                return
 
         elif cat == "decisions":
+            # 2. Scoped lookup via DecisionEngineRepository
             dec_repo = DecisionEngineRepository()
-            dec = dec_repo.get_by_id(res_id, caller_tenant)
+            dec = dec_repo.get_by_id(res_id, caller_tenant, workspace_id=caller_ws)
             if not dec:
-                with dec_repo._get_connection() as conn:
-                    row = conn.execute("SELECT tenant_id, workspace_id, plant_id FROM decision_evaluations WHERE decision_id = ?", (res_id,)).fetchone()
-                if row:
-                    errors.append(f"{context} reference '{res_id}' is invalid or inaccessible in the authorized scope.")
-                else:
-                    errors.append(f"{context} reference '{res_id}' in category '{category}' not found.")
-            else:
-                if dec.workspace_id and dec.workspace_id != caller_ws:
-                    errors.append(f"{context} reference '{res_id}' is invalid or inaccessible in the authorized scope.")
-                elif dec.plant_id and not self._is_plant_authorized(identity, dec.plant_id):
-                    errors.append(f"{context} reference '{res_id}' is invalid or inaccessible in the authorized scope.")
+                errors.append(generic_error)
+                return
+
+            res_plant = dec.plant_id
+            if not res_plant:
+                errors.append(generic_error)
+                return
+
+            if res_plant != mission_plant_id or not self._is_plant_authorized(identity, res_plant):
+                errors.append(generic_error)
+                return
 
         elif cat == "evidence":
-            with evidence_explainability_repository._get_connection() as conn:
-                row = conn.execute(
-                    "SELECT tenant_id, workspace_id, plant_id, validation_status FROM evidence_records WHERE evidence_id = ?",
-                    (res_id,),
-                ).fetchone()
-                if not row:
-                    row = conn.execute(
-                        "SELECT tenant_id, workspace_id, plant_id, NULL as validation_status FROM evidence_explanations WHERE explanation_id = ?",
-                        (res_id,),
-                    ).fetchone()
+            # 3. Scoped lookup via EvidenceExplainabilityRepository
+            row = evidence_explainability_repository.get_evidence_or_explanation_scope(res_id, caller_tenant, caller_ws)
             if not row:
-                errors.append(f"{context} reference '{res_id}' in category '{category}' not found.")
-            else:
-                if row["tenant_id"] != caller_tenant or (row["workspace_id"] and row["workspace_id"] != caller_ws) or not self._is_plant_authorized(identity, row["plant_id"]):
-                    errors.append(f"{context} reference '{res_id}' is invalid or inaccessible in the authorized scope.")
-                elif row["validation_status"] and row["validation_status"] != "VALID":
-                    warnings.append(f"Referenced evidence '{res_id}' is unverified (status: {row['validation_status']}).")
+                errors.append(generic_error)
+                return
+
+            res_plant = row.get("plant_id")
+            if not res_plant:
+                errors.append(generic_error)
+                return
+
+            if res_plant != mission_plant_id or not self._is_plant_authorized(identity, res_plant):
+                errors.append(generic_error)
+                return
+
+            if row.get("validation_status") and row["validation_status"] != "VALID":
+                warnings.append(f"Referenced evidence '{res_id}' is unverified (status: {row['validation_status']}).")
 
         elif cat == "incidents":
+            # 4. Scoped lookup via IncidentRepository
             inc_repo = IncidentRepository()
-            inc = inc_repo.get_incident(res_id, caller_tenant)
+            inc = inc_repo.get_incident_scoped(res_id, caller_tenant, caller_ws)
             if not inc:
-                with inc_repo._get_conn() as conn:
-                    row = conn.execute("SELECT tenant_id, workspace_id, plant_id FROM incidents WHERE incident_id = ?", (res_id,)).fetchone()
-                if row:
-                    errors.append(f"{context} reference '{res_id}' is invalid or inaccessible in the authorized scope.")
-                else:
-                    errors.append(f"{context} reference '{res_id}' in category '{category}' not found.")
-            else:
-                if inc.workspace_id and inc.workspace_id != caller_ws:
-                    errors.append(f"{context} reference '{res_id}' is invalid or inaccessible in the authorized scope.")
-                elif inc.plant_id and not self._is_plant_authorized(identity, inc.plant_id):
-                    errors.append(f"{context} reference '{res_id}' is invalid or inaccessible in the authorized scope.")
+                errors.append(generic_error)
+                return
+
+            res_plant = inc.plant_id
+            if not res_plant:
+                errors.append(generic_error)
+                return
+
+            if res_plant != mission_plant_id or not self._is_plant_authorized(identity, res_plant):
+                errors.append(generic_error)
+                return
 
         elif cat == "rcas":
+            # 5. Scoped lookup via RcaRepository
             rca_repo = RcaRepository()
-            rca = rca_repo.get_analysis(res_id, caller_tenant)
+            rca = rca_repo.get_analysis_scoped(res_id, caller_tenant, caller_ws)
             if not rca:
-                with rca_repo._get_connection() as conn:
-                    row = conn.execute("SELECT tenant_id, workspace_id, plant_id FROM rca_analyses WHERE analysis_id = ?", (res_id,)).fetchone()
-                if row:
-                    errors.append(f"{context} reference '{res_id}' is invalid or inaccessible in the authorized scope.")
-                else:
-                    errors.append(f"{context} reference '{res_id}' in category '{category}' not found.")
-            else:
-                if rca.workspace_id and rca.workspace_id != caller_ws:
-                    errors.append(f"{context} reference '{res_id}' is invalid or inaccessible in the authorized scope.")
-                elif rca.plant_id and not self._is_plant_authorized(identity, rca.plant_id):
-                    errors.append(f"{context} reference '{res_id}' is invalid or inaccessible in the authorized scope.")
+                errors.append(generic_error)
+                return
+
+            res_plant = rca.plant_id
+            if not res_plant:
+                errors.append(generic_error)
+                return
+
+            if res_plant != mission_plant_id or not self._is_plant_authorized(identity, res_plant):
+                errors.append(generic_error)
+                return
 
         elif cat == "memories":
+            # 6. Scoped lookup via OrganizationalMemoryRepository
             mem_repo = OrganizationalMemoryRepository()
             mem = mem_repo.get_entry(caller_tenant, caller_ws, res_id)
             if not mem:
-                with mem_repo._get_connection() as conn:
-                    row = conn.execute("SELECT tenant_id, workspace_id, plant_id FROM organizational_memory_entries WHERE memory_id = ?", (res_id,)).fetchone()
-                if row:
-                    errors.append(f"{context} reference '{res_id}' is invalid or inaccessible in the authorized scope.")
-                else:
-                    errors.append(f"{context} reference '{res_id}' in category '{category}' not found.")
-            else:
-                if mem.plant_id and not self._is_plant_authorized(identity, mem.plant_id):
-                    errors.append(f"{context} reference '{res_id}' is invalid or inaccessible in the authorized scope.")
+                errors.append(generic_error)
+                return
+
+            res_plant = mem.plant_id
+            if not res_plant:
+                errors.append(generic_error)
+                return
+
+            if res_plant != mission_plant_id or not self._is_plant_authorized(identity, res_plant):
+                errors.append(generic_error)
+                return
+
         else:
             errors.append(f"Resource category '{category}' is unsupported for canonical reference validation.")
 
@@ -384,6 +412,7 @@ class MissionService:
         """
         errors: List[str] = []
         warnings: List[str] = []
+        mission_plant_id = mission.scope.plant_id
 
         # 1. Parent incident reference
         if mission.provenance.parent_incident_id:
@@ -391,6 +420,7 @@ class MissionService:
                 identity,
                 "incidents",
                 mission.provenance.parent_incident_id,
+                mission_plant_id,
                 errors,
                 warnings,
                 context="Parent incident",
@@ -402,6 +432,7 @@ class MissionService:
                 identity,
                 "rcas",
                 mission.provenance.parent_rca_id,
+                mission_plant_id,
                 errors,
                 warnings,
                 context="Parent RCA",
@@ -414,6 +445,7 @@ class MissionService:
                     identity,
                     "evidence",
                     ev_req.linked_evidence_id,
+                    mission_plant_id,
                     errors,
                     warnings,
                     context=f"Requirement '{ev_req.requirement_id}' linked evidence",
@@ -429,6 +461,7 @@ class MissionService:
                     identity,
                     cat,
                     res_id,
+                    mission_plant_id,
                     errors,
                     warnings,
                     context=f"Related resource ({cat})",
@@ -445,6 +478,7 @@ class MissionService:
                         identity,
                         detected_cat,
                         res_id,
+                        mission_plant_id,
                         errors,
                         warnings,
                         context=f"Step '{step.step_id}' resource",
@@ -523,8 +557,28 @@ class MissionService:
         Creates a new industrial mission draft.
         Enforces authoritative scope, initial DRAFT state, bounds, and deterministic validation.
         """
-        # Validate caller scope
+        # Validate caller scope (including plant ID format and secret detection)
         self._validate_scope_authority(identity, request.plant_id)
+
+        # Enforce server-authoritative criterion and step statuses at domain/service boundary
+        for crit in request.success_criteria:
+            if crit.status != CriterionStatus.UNKNOWN:
+                raise MissionValidationError(
+                    f"Success criterion '{crit.criterion_id}' status cannot be self-certified as '{crit.status.value}'. "
+                    "Only 'UNKNOWN' status is permitted for ordinary create and draft updates."
+                )
+            if crit.evaluation_notes and crit.evaluation_notes.strip():
+                raise MissionValidationError(
+                    f"Client-supplied evaluation notes are not permitted on criterion '{crit.criterion_id}'. "
+                    "Evaluation notes are server-authoritative."
+                )
+
+        for step in request.planned_steps:
+            if step.status not in (StepStatus.PLANNED, StepStatus.PENDING):
+                raise MissionValidationError(
+                    f"Planned step '{step.step_id}' status cannot be initialized to '{step.status.value}'. "
+                    "Planned steps must begin in 'PLANNED' or 'PENDING' status."
+                )
 
         scope = MissionScope(
             tenant_id=identity.tenant_id,
@@ -641,11 +695,13 @@ class MissionService:
 
         assigned = self._get_authorized_plants(identity)
         if not assigned:
-            # Caller has no authorized plants: fail closed, return 0 records immediately
-            return [], 0
+            # Caller has no authorized plants: fail closed (raise MissionPermissionError)
+            raise MissionPermissionError("Caller has no assigned plants. Access denied (fail-closed).")
 
         if plant_id:
-            # Caller requested a specific plant filter
+            # Caller requested a specific plant filter: validate format and secrets
+            validate_plant_identifier(plant_id)
+
             if "*" not in assigned and plant_id not in assigned:
                 raise MissionPermissionError(f"Caller is not authorized for plant '{plant_id}'.")
             allowed_plants = {plant_id}
@@ -683,6 +739,28 @@ class MissionService:
                 f"Mission '{mission_id}' in status '{current.status.value}' cannot be edited directly. "
                 "Only DRAFT, PROPOSED, or REJECTED missions may be updated."
             )
+
+        # Enforce server-authoritative criterion and step statuses at domain/service boundary
+        if request.success_criteria is not None:
+            for crit in request.success_criteria:
+                if crit.status != CriterionStatus.UNKNOWN:
+                    raise MissionValidationError(
+                        f"Success criterion '{crit.criterion_id}' status cannot be self-certified as '{crit.status.value}'. "
+                        "Only 'UNKNOWN' status is permitted for ordinary create and draft updates."
+                    )
+                if crit.evaluation_notes and crit.evaluation_notes.strip():
+                    raise MissionValidationError(
+                        f"Client-supplied evaluation notes are not permitted on criterion '{crit.criterion_id}'. "
+                        "Evaluation notes are server-authoritative."
+                    )
+
+        if request.planned_steps is not None:
+            for step in request.planned_steps:
+                if step.status not in (StepStatus.PLANNED, StepStatus.PENDING):
+                    raise MissionValidationError(
+                        f"Planned step '{step.step_id}' status cannot claim unverified execution outcome status '{step.status.value}'. "
+                        "Only 'PLANNED' or 'PENDING' status is permitted for ordinary draft updates."
+                    )
 
         # Apply updates
         if request.title is not None:

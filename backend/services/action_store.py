@@ -176,6 +176,13 @@ class ActionStore:
 
             return None
 
+    def get_by_scope(self, action_id: str, tenant_id: str, workspace_id: str) -> Optional[Action]:
+        """Retrieves an action by ID, strictly enforcing tenant and workspace isolation."""
+        act = self.get_by_id(action_id, tenant_id)
+        if act and act.workspace_id == workspace_id:
+            return act
+        return None
+
     def get(self, action_id: str, tenant_id: Optional[str] = None) -> Optional[Action]:
         """Convenience accessor to retrieve action by ID with optional tenant isolation."""
         if tenant_id:

@@ -185,6 +185,15 @@ class RcaRepository:
                 rel.relationship_type.value, rel.description
             ))
 
+    def get_analysis_scoped(self, analysis_id: str, tenant_id: str, workspace_id: str) -> Optional[RcaAnalysis]:
+        """Fetch RCA analysis verifying both authoritative tenant and workspace ownership."""
+        analysis = self.get_analysis(analysis_id, tenant_id)
+        if not analysis:
+            return None
+        if analysis.workspace_id != workspace_id:
+            return None
+        return analysis
+
     def get_analysis(self, analysis_id: str, tenant_id: str) -> Optional[RcaAnalysis]:
         conn = self._get_connection()
         try:

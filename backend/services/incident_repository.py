@@ -225,6 +225,19 @@ class IncidentRepository:
                 return None
             return self._row_to_incident(row)
 
+    def get_incident_scoped(self, incident_id: str, tenant_id: str, workspace_id: str) -> Optional[IncidentContract]:
+        """Retrieves incident strictly enforcing tenant and workspace isolation."""
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT * FROM incidents WHERE incident_id = ? AND tenant_id = ? AND workspace_id = ?",
+                (incident_id, tenant_id, workspace_id),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            return self._row_to_incident(row)
+
     def list_incidents(self, tenant_id: str, limit: int = 100) -> List[IncidentContract]:
         with self._get_conn() as conn:
             cur = conn.cursor()

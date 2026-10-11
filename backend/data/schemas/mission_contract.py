@@ -52,10 +52,13 @@ _DISALLOWED_PATTERNS = re.compile(
 _SECRET_PATTERNS = re.compile(
     r"(?i)("
     r"-----BEGIN [A-Z ]*PRIVATE KEY-----|"
-    r"\b[a-z][a-z0-9+.-]*:\/\/[^\/\s:@]+:[^\/\s:@]+@|"  # URI with embedded user:password@
-    r"\bbearer\s+[A-Za-z0-9_\-\.]{16,}\b|"
+    r"[a-z][a-z0-9+.-]*:\/\/[^\/\s:@]+:[^\/\s:@]+@|"  # URI with embedded user:password@
+    r"\b(bearer|token)\s+[A-Za-z0-9_\-\.]{16,}\b|"
     r"\b(password|passwd|secret_key|api_key|access_token|private_key|auth_token)\s*[:=]\s*[\"']?[A-Za-z0-9_\-\.]{6,}[\"']?|"
-    r"\bAKIA[0-9A-Z]{16}\b"
+    r"\bAKIA[0-9A-Z]{16}\b|"
+    r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\b|"
+    r"\beyJ[A-Za-z0-9_\-\.]{20,}\b|"
+    r"\b(sk_live|sk_test|ghp_|glpat-|xoxb-|xoxp-)[A-Za-z0-9_\-]{10,}\b"
     r")"
 )
 
@@ -76,6 +79,8 @@ SUPPORTED_RESOURCE_CATEGORIES = {
     "memories",
 }
 
+CANONICAL_PLANT_ID_REGEX = re.compile(r"^[A-Za-z0-9_\-\.]{2,64}$")
+
 
 def _scan_for_secrets(value: Optional[str], field_name: str) -> None:
     """Detects raw credentials, tokens, passwords, connection strings, and private keys."""
@@ -85,6 +90,19 @@ def _scan_for_secrets(value: Optional[str], field_name: str) -> None:
         raise ValueError(
             f"Field '{field_name}' contains potential secret, credential, token, or connection string."
         )
+
+
+def validate_plant_identifier(v: str) -> str:
+    """Validates plant identifier format and scans for secrets."""
+    if not v or not isinstance(v, str):
+        raise ValueError("Plant identifier must be a non-empty string.")
+    v = v.strip()
+    _scan_for_secrets(v, "plant_id")
+    if not CANONICAL_PLANT_ID_REGEX.match(v):
+        raise ValueError(
+            f"Invalid plant identifier format '{v}'. Must be 2-64 alphanumeric characters, underscores, dashes, or dots."
+        )
+    return v
 
 
 def _validate_safe_text(value: Optional[str], field_name: str) -> Optional[str]:
@@ -115,6 +133,7 @@ def _validate_related_resources(v: Optional[Dict[str, List[str]]]) -> Optional[D
             raise ValueError(f"Resource category '{cat}' ID count ({len(id_list)}) exceeds maximum allowed (25).")
         total_ids += len(id_list)
         for res_id in id_list:
+            _scan_for_secrets(res_id, "resource_id")
             if not re.match(r"^[A-Za-z0-9_\-\.]{1,64}$", res_id):
                 raise ValueError(f"Invalid resource ID format '{res_id}' in category '{cat}'.")
     if total_ids > 50:
@@ -260,6 +279,18 @@ class MissionScope(BaseModel):
     plant_id: str = Field(..., min_length=1, max_length=128, description="Authoritative plant ID")
     session_id: Optional[str] = Field(default=None, max_length=128, description="Optional caller session ID")
 
+    @field_validator("plant_id")
+    @classmethod
+    def validate_scope_plant_id(cls, v: str) -> str:
+        return validate_plant_identifier(v)
+
+    @field_validator("tenant_id", "workspace_id", "session_id")
+    @classmethod
+    def validate_scope_identifiers(cls, v: Optional[str], info) -> Optional[str]:
+        if v is not None:
+            _scan_for_secrets(v, info.field_name)
+        return v
+
 
 class MissionConstraint(BaseModel):
     """Bounded, reviewable operational constraint."""
@@ -279,6 +310,7 @@ class MissionConstraint(BaseModel):
     @field_validator("constraint_id")
     @classmethod
     def validate_constraint_id(cls, v: str) -> str:
+        _scan_for_secrets(v, "constraint_id")
         if not re.match(r"^[A-Za-z0-9_\-\.]{1,64}$", v):
             raise ValueError(f"Invalid constraint ID format '{v}'.")
         return v
@@ -365,6 +397,7 @@ class MissionSuccessCriterion(BaseModel):
     @field_validator("criterion_id")
     @classmethod
     def validate_criterion_id(cls, v: str) -> str:
+        _scan_for_secrets(v, "criterion_id")
         if not re.match(r"^[A-Za-z0-9_\-\.]{1,64}$", v):
             raise ValueError(f"Invalid criterion ID format '{v}'.")
         return v
@@ -393,6 +426,7 @@ class MissionEvidenceRequirement(BaseModel):
     @field_validator("requirement_id")
     @classmethod
     def validate_requirement_id(cls, v: str) -> str:
+        _scan_for_secrets(v, "requirement_id")
         if not re.match(r"^[A-Za-z0-9_\-\.]{1,64}$", v):
             raise ValueError(f"Invalid requirement ID format '{v}'.")
         return v
@@ -400,8 +434,10 @@ class MissionEvidenceRequirement(BaseModel):
     @field_validator("linked_evidence_id")
     @classmethod
     def validate_linked_evidence_id(cls, v: Optional[str]) -> Optional[str]:
-        if v is not None and not re.match(r"^[A-Za-z0-9_\-\.]{1,128}$", v):
-            raise ValueError(f"Invalid linked evidence ID format '{v}'.")
+        if v is not None:
+            _scan_for_secrets(v, "linked_evidence_id")
+            if not re.match(r"^[A-Za-z0-9_\-\.]{1,128}$", v):
+                raise ValueError(f"Invalid linked evidence ID format '{v}'.")
         return v
 
     @field_validator("description", "evidence_type")
@@ -431,6 +467,7 @@ class MissionPlannedStep(BaseModel):
     @classmethod
     def validate_step_id(cls, v: str) -> str:
         v = v.strip()
+        _scan_for_secrets(v, "step_id")
         if not re.match(r"^[A-Za-z0-9_-]+$", v):
             raise ValueError(f"Step ID '{v}' must be alphanumeric with dashes or underscores only.")
         return v
@@ -441,6 +478,7 @@ class MissionPlannedStep(BaseModel):
         if len(v) > 20:
             raise ValueError(f"Step related_resource_ids count ({len(v)}) exceeds maximum allowed (20).")
         for res_id in v:
+            _scan_for_secrets(res_id, "related_resource_id")
             if not re.match(r"^[A-Za-z0-9_\-\.]{1,64}$", res_id):
                 raise ValueError(f"Invalid resource ID format '{res_id}'.")
         return v
@@ -477,14 +515,21 @@ class MissionProvenance(BaseModel):
     @field_validator("parent_incident_id", "parent_rca_id")
     @classmethod
     def validate_parent_ids(cls, v: Optional[str], info) -> Optional[str]:
-        if v is not None and not re.match(r"^[A-Za-z0-9_\-\.]{1,128}$", v):
-            raise ValueError(f"Invalid identifier format for '{info.field_name}': '{v}'.")
+        if v is not None:
+            _scan_for_secrets(v, info.field_name)
+            if not re.match(r"^[A-Za-z0-9_\-\.]{1,128}$", v):
+                raise ValueError(f"Invalid identifier format for '{info.field_name}': '{v}'.")
         return v
 
     @field_validator("origin_reason")
     @classmethod
     def validate_origin_reason(cls, v: str) -> str:
         return _validate_safe_text(v, "origin_reason") or v
+
+    @field_validator("created_by", "created_by_role", "source_system")
+    @classmethod
+    def validate_provenance_text(cls, v: Optional[str], info) -> Optional[str]:
+        return _validate_safe_text(v, info.field_name)
 
 
 # =============================================================================
@@ -650,6 +695,11 @@ class MissionCreateRequest(BaseModel):
     parent_rca_id: Optional[str] = Field(default=None, max_length=128)
     idempotency_key: Optional[str] = Field(default=None, max_length=128)
 
+    @field_validator("plant_id")
+    @classmethod
+    def validate_request_plant_id(cls, v: str) -> str:
+        return validate_plant_identifier(v)
+
     @field_validator("title", "description", "objective", "origin_reason")
     @classmethod
     def validate_request_text(cls, v: str, info) -> str:
@@ -658,8 +708,10 @@ class MissionCreateRequest(BaseModel):
     @field_validator("parent_incident_id", "parent_rca_id", "idempotency_key")
     @classmethod
     def validate_request_ids(cls, v: Optional[str], info) -> Optional[str]:
-        if v is not None and not re.match(r"^[A-Za-z0-9_\-\.]{1,128}$", v):
-            raise ValueError(f"Invalid identifier format for '{info.field_name}': '{v}'.")
+        if v is not None:
+            _scan_for_secrets(v, info.field_name)
+            if not re.match(r"^[A-Za-z0-9_\-\.]{1,128}$", v):
+                raise ValueError(f"Invalid identifier format for '{info.field_name}': '{v}'.")
         return v
 
     @field_validator("related_resources")
@@ -673,10 +725,15 @@ class MissionCreateRequest(BaseModel):
         if len(v) > 20:
             raise ValueError(f"Success criteria count ({len(v)}) exceeds maximum allowed (20).")
         for crit in v:
-            if crit.status in (CriterionStatus.SATISFIED, CriterionStatus.NOT_SATISFIED):
+            if crit.status != CriterionStatus.UNKNOWN:
                 raise ValueError(
                     f"Success criterion '{crit.criterion_id}' status cannot be self-certified as '{crit.status.value}'. "
-                    "Initial criteria must have status 'UNKNOWN'."
+                    "Only 'UNKNOWN' status is permitted for ordinary create and draft updates."
+                )
+            if crit.evaluation_notes and crit.evaluation_notes.strip():
+                raise ValueError(
+                    f"Client-supplied evaluation notes are not permitted on criterion '{crit.criterion_id}'. "
+                    "Evaluation notes are server-authoritative."
                 )
         return v
 
@@ -726,10 +783,15 @@ class MissionUpdateRequest(BaseModel):
         if len(v) > 20:
             raise ValueError(f"Success criteria count ({len(v)}) exceeds maximum allowed (20).")
         for crit in v:
-            if crit.status in (CriterionStatus.SATISFIED, CriterionStatus.NOT_SATISFIED):
+            if crit.status != CriterionStatus.UNKNOWN:
                 raise ValueError(
                     f"Success criterion '{crit.criterion_id}' status cannot be self-certified as '{crit.status.value}'. "
-                    "Criterion completion requires authoritative verification."
+                    "Only 'UNKNOWN' status is permitted for ordinary create and draft updates."
+                )
+            if crit.evaluation_notes and crit.evaluation_notes.strip():
+                raise ValueError(
+                    f"Client-supplied evaluation notes are not permitted on criterion '{crit.criterion_id}'. "
+                    "Evaluation notes are server-authoritative."
                 )
         return v
 
@@ -741,9 +803,10 @@ class MissionUpdateRequest(BaseModel):
         if len(v) > 50:
             raise ValueError(f"Planned steps count ({len(v)}) exceeds maximum allowed (50).")
         for step in v:
-            if step.status in (StepStatus.IN_PROGRESS, StepStatus.COMPLETED, StepStatus.FAILED):
+            if step.status not in (StepStatus.PLANNED, StepStatus.PENDING):
                 raise ValueError(
-                    f"Planned step '{step.step_id}' cannot claim unverified execution outcome status '{step.status.value}'."
+                    f"Planned step '{step.step_id}' status cannot claim unverified execution outcome status '{step.status.value}'. "
+                    "Only 'PLANNED' or 'PENDING' status is permitted for ordinary draft updates."
                 )
         return v
 

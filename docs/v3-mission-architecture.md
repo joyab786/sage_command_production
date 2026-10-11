@@ -8,6 +8,7 @@
 **Prompt 35A Implementation Commit:** `76f3b3297a3a3c7efb4e7bc2400f834e465f4378`  
 **Prompt 35A Documentation Commit:** `08fc1738d35eafcc618596fcd3ef3b8353aad840`  
 **Prompt 35A Test Teardown Commit:** `36de22416ec1a533ad03eeb0c169c9b139db080d`  
+**Prompt 35B Starting Baseline:** `6dc4c1bbbbc19f8657071231c89b90e25303d55e`  
 
 ## 1. Mission Domain and Purpose
 
@@ -326,3 +327,30 @@ The following are strictly deferred to future prompts:
 - Closed-loop learning.
 - Direct ExecutionGateway invocation from mission steps.
 - Distributed sagas or distributed transactions.
+
+---
+
+## 19. Prompt 35B Outcome Integrity, Scoped Resource Lookup, and Input-Safety Corrections
+
+1. **Server-Authoritative Outcome Status:**
+   - **Criteria:** Only `UNKNOWN` may be supplied as the initial criterion status. `SATISFIED`, `NOT_SATISFIED`, and `NOT_APPLICABLE` are rejected on create and draft-update requests. Client-supplied `evaluation_notes` are rejected on create and draft updates.
+   - **Steps:** Only `PLANNED` or `PENDING` may be accepted on create and draft-update requests. `SKIPPED`, `BLOCKED`, `CANCELLED`, `COMPLETED`, `IN_PROGRESS`, and `FAILED` are strictly rejected.
+   - Enforced at both Pydantic request validation and domain/service boundaries to prevent direct programmatic bypass.
+
+2. **Canonical Scoped Resource Lookup & Information Non-Disclosure:**
+   - Zero private repository connections: removed all direct connection calls (`_get_connection()`, `_get_conn()`) from `_validate_single_resource`.
+   - Scoped repository APIs used across all 6 categories: `action_store.get_by_scope()`, `DecisionEngineRepository.get_by_id(..., workspace_id=...)`, `evidence_explainability_repository.get_evidence_or_explanation_scope()`, `IncidentRepository.get_incident_scoped()`, `RcaRepository.get_analysis_scoped()`, and `OrganizationalMemoryRepository.get_entry()`.
+   - Non-disclosure requirement: nonexistent and inaccessible references produce the identical generic error message (`reference '{id}' is invalid or inaccessible in the authorized scope`), exposing zero cross-scope metadata.
+
+3. **Explicit Fail-Closed Plant Scope Policy:**
+   - All 6 operational resource categories in SageCommand are site/plant-scoped.
+   - Missing or untagged plant metadata on plant-sensitive resources fails closed immediately. Global scope is never silently inferred.
+   - Referenced resource plant must match the mission's authorized plant (`mission.scope.plant_id`) AND the caller's assigned plants.
+
+4. **Plant Identifier Validation & Secret Prevention:**
+   - Canonical plant ID regex `^[A-Za-z0-9_\-\.]{2,64}$` strictly enforced on `MissionCreateRequest.plant_id`, `MissionScope.plant_id`, and `list_missions(plant_id=...)`.
+   - Credential-bearing URLs, tokens, private keys, and passwords rejected in plant IDs and free-text fields.
+   - Wildcard plant assignments (`["*"]`) on caller identities cannot bypass identifier validation.
+
+5. **Fail-Closed Missing/Empty Plant Authorization:**
+   - `list_missions()` fails closed with `MissionPermissionError` (HTTP 403 Forbidden) when caller has missing or empty assigned plants, preventing unauthorized existence discovery.

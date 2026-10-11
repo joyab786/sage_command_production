@@ -325,6 +325,53 @@ class EvidenceExplainabilityRepository:
             data = json.loads(row["payload_json"])
             return ExplanationResult.model_validate(data)
 
+    def get_evidence_or_explanation_scope(
+        self,
+        identifier: str,
+        tenant_id: str,
+        workspace_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Retrieves the scope metadata of an evidence record or explanation by ID,
+        enforcing strict tenant and workspace isolation.
+        Returns None if not found or if inaccessible within the given scope.
+        """
+        with self._lock, self._get_connection() as conn:
+            cursor = conn.cursor()
+            # 1. Check evidence_records
+            cursor.execute(
+                "SELECT evidence_id, tenant_id, workspace_id, plant_id, validation_status "
+                "FROM evidence_records WHERE evidence_id = ? AND tenant_id = ? AND workspace_id = ?",
+                (identifier, tenant_id, workspace_id),
+            )
+            row = cursor.fetchone()
+            if row:
+                return {
+                    "id": row["evidence_id"],
+                    "tenant_id": row["tenant_id"],
+                    "workspace_id": row["workspace_id"],
+                    "plant_id": row["plant_id"],
+                    "validation_status": row["validation_status"],
+                    "type": "evidence_record",
+                }
+            # 2. Check evidence_explanations
+            cursor.execute(
+                "SELECT explanation_id, tenant_id, workspace_id, plant_id "
+                "FROM evidence_explanations WHERE explanation_id = ? AND tenant_id = ? AND workspace_id = ?",
+                (identifier, tenant_id, workspace_id),
+            )
+            row = cursor.fetchone()
+            if row:
+                return {
+                    "id": row["explanation_id"],
+                    "tenant_id": row["tenant_id"],
+                    "workspace_id": row["workspace_id"],
+                    "plant_id": row["plant_id"],
+                    "validation_status": "VALID",
+                    "type": "explanation",
+                }
+            return None
+
     def get_by_fingerprint(self, fingerprint: str, tenant_id: str) -> Optional[ExplanationResult]:
         """
         Retrieves explanation by input fingerprint with tenant isolation.
