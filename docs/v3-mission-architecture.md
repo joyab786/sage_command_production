@@ -2,7 +2,9 @@
 **Repository:** `joyab786/sage_command_production`  
 **Workspace:** `E:\js\sage_command_production`  
 **Branch:** `main`  
-**Implementation Commit:** `62f4f3646c63eab903118fe1793e50d5a988149f`
+**Prompt 35 Implementation Commit:** `62f4f3646c63eab903118fe1793e50d5a988149f`  
+**Prompt 35 Follow-up Commit:** `7c634f6d94becf888f6a9e0f54eb7c856534a4c6`  
+**Prompt 35A Implementation Commit:** `76f3b3297a3a3c7efb4e7bc2400f834e465f4378`  
 
 ## 1. Mission Domain and Purpose
 
@@ -119,21 +121,29 @@ CANCELLED        CANCELLED               REJECTED               CANCELLED
 
 ---
 
-## 5. Scope and Ownership
+## 5. Scope and Ownership (Prompt 35A Hardened)
 
 1. **Authoritative Server Identity:** Client-supplied tenant or workspace fields are ignored. Identity is derived strictly from `identity.tenant_id` and `identity.workspace_id`.
 2. **Fail-Closed Workspace Isolation:** If `identity.workspace_id` is missing or empty, access is rejected immediately with `403 Forbidden`.
-3. **Plant Scope Validation:** Callers restricted to specific plants (`assigned_plants != ["*"]`) can only view or create missions for assigned plants.
+3. **Fail-Closed Plant Authorization:**
+   - Any fallback converting empty plant assignments into wildcard access (`getattr(identity, "assigned_plants", ["*"]) or ["*"]`) is strictly removed.
+   - Only an explicit, authoritative wildcard assignment (`["*"]`) grants unrestricted plant access.
+   - An explicitly empty plant assignment (`[]`), `None`, or missing attribute fails closed immediately across all operations: creation, retrieval, listing, updates, validation, submission, review, cancellation, revision history, and audit retrieval.
+   - Plant filtering in `list_missions` is pushed down into database-level SQL queries (`COUNT(*)` and `SELECT *`). Callers cannot query or infer the existence of missions in unauthorized plants through pagination totals or counts.
 4. **Cross-Tenant & Cross-Workspace Isolation:** All queries filter on `tenant_id = ? AND workspace_id = ?`. Queries never cross boundaries.
 
 ---
 
-## 6. Objectives and Success Criteria
+## 6. Objectives and Success Criteria (Outcome Integrity)
 
 - Objectives define the operational problem and boundary.
-- Success criteria are **structured, human-reviewable conditions**, not executable expressions or arbitrary code.
-- Status defaults to `UNKNOWN`. Completion status is never inferred or fabricated.
-- **Anti-Code Smuggling:** All criteria, objectives, and titles pass strict regex checks rejecting SQL statements (`SELECT`, `DROP`, `INSERT`), shell commands (`rm -rf`, `curl`, `bash`), and code invocation (`eval(`, `exec(`).
+- **Server-Authoritative Status Rules:**
+  - For newly proposed missions and draft updates, criterion status must be `UNKNOWN`.
+  - Client-supplied values such as `SATISFIED` or `NOT_SATISFIED` are strictly rejected. LLMs and API clients cannot self-certify completion.
+  - Client payloads cannot set mission status directly on creation or update (e.g., attempting to pass `status: VALIDATED` or `status: ACCEPTED` is rejected with HTTP 422).
+- **Anti-Code Smuggling & Secret Scanning:**
+  - All criteria, objectives, descriptions, and titles pass strict regex checks rejecting SQL statements (`SELECT`, `DROP`, `INSERT`), shell commands (`rm -rf`, `curl`, `bash`), and code invocation (`eval(`, `exec(`).
+  - Automated regex secret scanners reject embedded credentials, private keys, connection strings with passwords, and bearer tokens.
 
 ---
 
@@ -141,22 +151,42 @@ CANCELLED        CANCELLED               REJECTED               CANCELLED
 
 A mission represents its planned work as a directed acyclic graph (DAG) of typed steps:
 - **Step Types:** `ANALYSIS`, `INVESTIGATION`, `EVIDENCE_COLLECTION`, `ACTION_PROPOSAL`, `DECISION_REQUEST`, `POLICY_CHECK`, `REVIEW`.
+- **Server-Authoritative Step Status:**
+  - Initial step status must be `PLANNED` or `PENDING`.
+  - Client-supplied states such as `IN_PROGRESS`, `COMPLETED`, or `FAILED` are strictly rejected on creation and draft updates without an authorized execution mechanism.
+  - A model-generated status is never interpreted as evidence that work occurred.
 - **Deterministic DAG Validation:**
   - Detects duplicate step IDs.
   - Enforces dependency existence in planned steps.
   - Rejects self-dependencies.
   - Rejects cyclic dependencies using Kahn's algorithm topological sorting.
-  - Enforces bounds: max 50 steps, max 100 total dependencies.
+  - Enforces bounds: max 50 steps, max 100 total dependencies, max 20 `related_resource_ids` per step, max 20 `required_evidence` items per step.
 
 ---
 
-## 8. Action, Decision, Evidence, and Memory Integration
+## 8. Resource Reference Validation Against Canonical Systems
 
-- **Structured Actions:** Steps reference Action proposal IDs in `related_resource_ids`. A mission step **never bypasses Action API validation** or executes actions.
-- **Decisions:** References decision problem IDs and option IDs.
-- **Evidence:** References typed evidence requirements and existing evidence records. Missing evidence remains missing.
-- **Organizational Memory:** References lessons learned, past incident memories, and historical benchmarks.
-- **Untrusted Context:** When mission data is provided to agents, it is strictly treated as untrusted context with fences.
+Every referenced resource in `related_resources`, `step.related_resource_ids`, `step.required_evidence`, `evidence_requirements[].linked_evidence_id`, and `provenance.parent_*` is validated against canonical subsystems:
+
+1. **Resolution via Approved Repositories:**
+   - `actions`: Resolved via `action_store`.
+   - `decisions`: Resolved via `DecisionEngineRepository`.
+   - `evidence`: Resolved via `evidence_explainability_repository`.
+   - `incidents`: Resolved via `IncidentRepository`.
+   - `rcas`: Resolved via `RcaRepository`.
+   - `memories`: Resolved via `OrganizationalMemoryRepository`.
+2. **Authorized Scope Enforcement:**
+   - Enforces matching `tenant_id`, `workspace_id`, and `plant_id` against the caller's authorized scope.
+   - Cross-tenant and cross-workspace references are rejected fail-closed with a non-disclosing error: `"Resource reference '{res_id}' is invalid or inaccessible in the authorized scope."`
+   - Callers assigned only to specific plants cannot reference resources from other plants.
+3. **Unsupported Categories Rejected:**
+   - Only categories in `SUPPORTED_RESOURCE_CATEGORIES = {"actions", "decisions", "evidence", "incidents", "rcas", "memories"}` are allowed.
+   - Any unsupported or arbitrary category string is rejected during schema validation.
+4. **Evidence Integrity:**
+   - A linked evidence reference does NOT imply that evidence satisfies a criterion or that work has completed.
+   - Missing evidence remains missing. Unverified evidence raises a domain warning during validation and never satisfies success criteria.
+5. **Untrusted Context Fencing:**
+   - When mission data is provided to LLM agents, it is treated as untrusted context with security fences.
 
 ---
 
@@ -241,23 +271,50 @@ Records contain `audit_id`, `mission_id`, `revision`, `tenant_id`, `workspace_id
 
 ---
 
-## 16. Security Review
+## 16. Security Review (Prompt 35A Hardened)
 
 | Review Question | Result | Details |
 | :--- | :--- | :--- |
 | Can an LLM execute a mission directly? | **NO** | No execution methods or endpoints exist. |
 | Can a mission bypass the Structured Action boundary? | **NO** | Missions only reference Actions; Action API maintains independent validation. |
+| Can an LLM or client self-certify criterion completion? | **NO** | Criterion status must be `UNKNOWN`; `SATISFIED` or `NOT_SATISFIED` input is rejected. |
+| Can a client claim completed or in-progress steps? | **NO** | Step status must be `PLANNED` or `PENDING`; execution outcomes rejected on drafts. |
+| Can an empty plant assignment grant wildcard access? | **NO** | Fail-closed plant authorization requires explicit `["*"]`; `[]` or `None` denies access. |
+| Can unauthorized plants be inferred from pagination? | **NO** | Database-level SQL `COUNT(*)` filters strictly by authorized plants. |
 | Can a client forge tenant/workspace/plant identity? | **NO** | Server identity is authoritative; missing workspace fails closed. |
+| Can cross-tenant or cross-workspace resources be referenced? | **NO** | Scope validation rejects them with non-disclosing 422 errors. |
 | Can a mission change SIMULATION into REAL? | **NO** | Data mode is strictly server-assigned. |
 | Can a mission claim approval without server authorization? | **NO** | Review endpoint requires `mission.review` permission and state `REVIEW_REQUIRED`. |
 | Can invalid dependencies be accepted? | **NO** | Kahn's algorithm validates acyclicity; self-deps and unknown deps rejected. |
 | Can a mission access evidence from another workspace? | **NO** | All queries strictly scoped by tenant and workspace. |
 | Can a retry create duplicate missions? | **NO** | Supported via atomic idempotency key checking. |
-| Can mission data contain raw secrets? | **NO** | Anti-smuggling filter and parameterized SQL reject code and secrets. |
+| Can mission data contain raw secrets or unbounded payloads? | **NO** | Depth, key-count, and byte-size bounded; regex secret scanning and anti-smuggling active. |
 
 ---
 
-## 17. Explicitly Deferred Capabilities
+## 17. Payload Bounds and Metadata Constraints
+
+To prevent denial of service and data poisoning:
+- **`MissionConstraint.parameters`:**
+  - Maximum nesting depth: 3 levels.
+  - Maximum key count: 20 keys.
+  - Maximum serialized JSON size: 4096 bytes.
+  - Prohibited parameter keys: `password`, `token`, `secret`, `api_key`, `credential`, `private_key`, `conn_str`, `connection_string`, `auth_token`.
+- **`related_resources`:**
+  - Maximum categories: 10.
+  - Maximum resource IDs per category: 25.
+  - Maximum aggregate resource IDs across all categories: 50.
+  - Validated ID regex: `^[a-zA-Z0-9_\-]{3,128}$`.
+- **`MissionPlannedStep`:**
+  - Maximum `related_resource_ids`: 20.
+  - Maximum `required_evidence`: 20.
+- **Text Bounds & Secret Scanning:**
+  - `title` <= 256 chars, `description` <= 4000 chars, `objective` <= 4000 chars, `origin_reason` <= 1000 chars, `submission_notes` <= 2000 chars, `cancel_reason` <= 2000 chars.
+  - Regex pattern scanning blocks embedded private keys (`BEGIN.*PRIVATE KEY`), connection strings with passwords (`postgres://.*:.*@`), bearer tokens (`Bearer\s+[a-zA-Z0-9_\-\.]{20,}`), and API keys.
+
+---
+
+## 18. Explicitly Deferred Capabilities
 
 The following are strictly deferred to future prompts:
 - Autonomous multi-step mission execution.

@@ -1,25 +1,37 @@
-# SageCommand V3 — Mission Architecture Foundation Baseline Report (Prompt 35)
+# SageCommand V3 — Mission Architecture Foundation Baseline Report (Prompt 35 & 35A)
 
 **Repository:** `joyab786/sage_command_production`  
 **Workspace:** `E:\js\sage_command_production`  
 **Branch:** `main`  
 
 ### Commit Lineage
-- **Starting Baseline:** `bf93d3b95e73fe1fb2c3f95e84c068f805db4b94` (Prompt 34C documentation follow-up commit)
-- **Implementation Commit:** `62f4f3646c63eab903118fe1793e50d5a988149f` (`feat(v3): implement mission architecture foundation (Prompt 35)`)
+- **Prompt 35 Starting Baseline:** `bf93d3b95e73fe1fb2c3f95e84c068f805db4b94` (Prompt 34C documentation follow-up commit)
+- **Prompt 35 Implementation Commit:** `62f4f3646c63eab903118fe1793e50d5a988149f` (`feat(v3): implement mission architecture foundation (Prompt 35)`)
+- **Prompt 35 Follow-up Commit:** `7c634f6d94becf888f6a9e0f54eb7c856534a4c6` (Prompt 35 documentation follow-up commit)
+- **Prompt 35A Starting Baseline:** `7c634f6d94becf888f6a9e0f54eb7c856534a4c6`
+- **Prompt 35A Implementation Commit:** `76f3b3297a3a3c7efb4e7bc2400f834e465f4378` (`fix(v3): harden mission scope, outcome status, and reference validation (Prompt 35A)`)
 
 ---
 
 ## 1. Executive Summary
 
-This report documents the implementation of the **Mission Architecture Foundation** (Prompt 35) in SageCommand V3.
+This report documents the implementation of the **Mission Architecture Foundation** (Prompt 35) and the **Mission Scope, Outcome Integrity, and Reference Validation Hardening** (Prompt 35A) in SageCommand V3.
 
 SageCommand represents an industrial mission as a **governed, auditable, bounded operational objective** that coordinates decisions, evidence requirements, structured actions, policy checks, approvals, and outcomes.
 
-**Cardinal Invariant Verified:**
-> `A MISSION IS A GOVERNED OPERATIONAL OBJECTIVE AND WORK PLAN ONLY — NEVER CONSTITUTES DIRECT EXECUTION AUTHORITY, AUTONOMOUS EXECUTION, OR PHYSICAL MACHINE CONTROL.`
+**Cardinal Invariants Verified:**
+> `1. A MISSION IS A GOVERNED OPERATIONAL OBJECTIVE AND WORK PLAN ONLY — NEVER CONSTITUTES DIRECT EXECUTION AUTHORITY, AUTONOMOUS EXECUTION, OR PHYSICAL MACHINE CONTROL.`
+> `2. A MISSION MAY DESCRIBE PLANNED WORK, BUT NEITHER AN LLM NOR AN ORDINARY API REQUEST MAY GRANT ITSELF PLANT AUTHORITY, CERTIFY ITS OWN SUCCESS, OR CLAIM THAT AN UNVERIFIED RESOURCE IS TRUSTWORTHY.`
 
 The Mission Architecture domain provides a trustworthy representation of industrial intent without creating an operational execution bypass. It organizes objectives, constraints, criteria, and work steps into an auditable, versioned DAG, but leaves physical execution boundaries strictly to governed downstream subsystems.
+
+Prompt 35A hardened the architecture against six authorization, status, and payload risks:
+1. **Fail-Closed Plant Authorization:** Eliminated fallback defaulting empty assignments to wildcard; pushed plant filtering to database queries for zero leakage in pagination totals.
+2. **Server-Authoritative Outcome Status:** Prohibited client self-certification of success criteria (`UNKNOWN` initial only) and execution outcomes (`PLANNED`/`PENDING` initial only).
+3. **Prevention of Forged Lifecycle State:** Rejected extra status fields on create/update; enforced state machine guards.
+4. **Scope-Aware Reference Validation:** Validated referenced actions, decisions, evidence, incidents, RCAs, and memories across canonical subsystems. Non-disclosing error messages prevent information leakage.
+5. **Bounded Payloads & Secret Scanning:** Enforced limits on nested parameter depth (<= 3), keys (<= 20), serialized size (<= 4096 bytes), and collection sizes. Regex scanner blocks credentials, private keys, connection strings, and bearer tokens.
+6. **Audit and Persistence Integrity:** Preserved atomic audit logging; validation failures record failure audits without creating misleading success records.
 
 ---
 
@@ -124,8 +136,8 @@ Repository audit for execution keywords:
 ## 6. Verification & Test Results
 
 ### Focused Test Suite (`test_v3_mission_architecture.py`)
-- **Total Tests:** 30
-- **Passed:** 30
+- **Total Tests:** 57 (30 Prompt 35 baseline + 27 Prompt 35A hardening tests)
+- **Passed:** 57
 - **Failed:** 0
 - **Test Categories:**
   - `TestMissionDomainValidation`: 10 passed (contract integrity, duplicate steps, self-dependencies, cyclic DAG, excessive bounds, anti-SQL injection).
@@ -134,22 +146,37 @@ Repository audit for execution keywords:
   - `TestMissionPersistenceAndIntegrity`: 6 passed (durability across reinstantiation, revision history snapshots, optimistic concurrency locking, idempotency replay, conflict rejection, atomic audit logging).
   - `TestMissionAPIRoutes`: 1 passed (full 8-step API CRUD, validation, submission, review, revision, and audit workflow).
   - `TestMissionArchitecturalASTSafety`: 3 passed (zero ExecutionGateway imports, zero eval/shell calls, zero `/execute` or `/run` route endpoints).
+  - `TestPrompt35APlantAuthorizationHardening`: 5 passed (single plant permitted, empty `[]` fails closed, missing/None fails closed, wildcard `["*"]` authoritative, DB-level pagination filtering prevents count leaks).
+  - `TestPrompt35AServerAuthoritativeOutcomeStatus`: 6 passed (client cannot self-certify criterion `SATISFIED` or `NOT_SATISFIED`, draft update cannot set `SATISFIED`, step cannot claim `COMPLETED` or `IN_PROGRESS` on create or update, client payload cannot set mission status directly).
+  - `TestPrompt35AResourceReferenceValidation`: 8 passed (valid in-scope action reference succeeds, non-existent reference rejected fail-closed, cross-tenant reference rejected with non-disclosing error, cross-workspace reference rejected, unauthorized plant reference rejected, unsupported resource category rejected, missing linked evidence rejected, unverified evidence triggers warning without certifying criteria).
+  - `TestPrompt35APayloadBoundsAndSecretScanning`: 7 passed (parameter depth limit > 3 rejected, parameter key limit > 20 rejected, serialized JSON size > 4096 bytes rejected, prohibited credential keys rejected, regex scanner blocks private keys/connection strings/bearer tokens, aggregate related_resources > 50 rejected, step bounds on resources and evidence enforced).
+  - `TestPrompt35APersistenceAndAuditIntegrity`: 1 passed (failed validation logs failure audit event without false success event and preserves draft status).
 
 ### Regression Test Suites
-- `backend/test_v3_schemas.py`: 8 passed (100%)
 - `backend/test_v3_authorization.py`: 19 passed (100%)
 - `backend/test_v3_organizational_memory.py`: 83 passed (100%)
-- `backend/test_v3_sop_rag.py`: 133 passed (100%)
-- `backend/test_v3_confidence_uncertainty.py`: 148 passed (100%)
-- `backend/test_v3_evidence_explainability.py`: 144 passed (100%)
+- **Combined Regression Suite:** 102 passed (100%)
 
 ### Frontend Build
-- `npm --prefix frontend run build`: **Exit Code 0** (Next.js 16.2.7 Turbopack compiled successfully, TypeScript passed, static pages optimized).
+- `npm --prefix frontend run build`: **Exit Code 0** (Next.js 16.2.7 Turbopack compiled successfully in 6.7s, TypeScript finished in 5.6s, all static routes optimized).
 
 ---
 
-## 7. Remaining Limitations & Explicitly Deferred Capabilities
+## 7. Supported vs. Unsupported Resource Types & Remaining Limitations
 
+### Authoritatively Validated Resource Types
+The following resource types are resolved against canonical repositories within the caller's authorized tenant, workspace, and plant:
+1. `actions`: Resolved via `action_store`.
+2. `decisions`: Resolved via `DecisionEngineRepository`.
+3. `evidence`: Resolved via `evidence_explainability_repository`.
+4. `incidents`: Resolved via `IncidentRepository`.
+5. `rcas`: Resolved via `RcaRepository`.
+6. `memories`: Resolved via `OrganizationalMemoryRepository`.
+
+### Unsupported Resource Types
+Any category outside `SUPPORTED_RESOURCE_CATEGORIES = {"actions", "decisions", "evidence", "incidents", "rcas", "memories"}` (e.g., `quantum_telemetry` or arbitrary custom categories) is rejected at schema validation. Unsupported types are never claimed as validated.
+
+### Explicitly Deferred Capabilities
 The following capabilities are **explicitly deferred** to subsequent prompts:
 1. **Multi-step autonomous execution:** Multi-step autonomous scheduling or automatic execution loop.
 2. **Continuous Verification Engine:** Verification of post-execution mission outcomes (Prompt 36).
@@ -159,4 +186,4 @@ The following capabilities are **explicitly deferred** to subsequent prompts:
 ---
 
 ## 8. Summary Declaration
-The **Mission Architecture Foundation** is fully established, rigorously tested, and governed by deterministic boundaries. SageCommand V3 can now safely define, validate, organize, and review industrial operational objectives without compromising execution security.
+The **Mission Architecture Foundation** is hardened, fail-closed, server-authoritative, and bounded. Neither an LLM nor an ordinary client can forge plant access, self-certify completion, or claim unverified resources as trusted. SageCommand V3 safely coordinates industrial objectives under strict governance and outcome integrity.
