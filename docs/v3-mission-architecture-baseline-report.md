@@ -10,6 +10,8 @@
 - **Prompt 35 Follow-up Commit:** `7c634f6d94becf888f6a9e0f54eb7c856534a4c6` (Prompt 35 documentation follow-up commit)
 - **Prompt 35A Starting Baseline:** `7c634f6d94becf888f6a9e0f54eb7c856534a4c6`
 - **Prompt 35A Implementation Commit:** `76f3b3297a3a3c7efb4e7bc2400f834e465f4378` (`fix(v3): harden mission scope, outcome status, and reference validation (Prompt 35A)`)
+- **Prompt 35A Documentation Commit:** `08fc1738d35eafcc618596fcd3ef3b8353aad840` (`docs(v3): document mission scope, outcome integrity, and reference validation hardening (Prompt 35A)`)
+- **Prompt 35A Test Teardown Commit:** `36de22416ec1a533ad03eeb0c169c9b139db080d` (`test(v3): ensure dependency overrides teardown in mission tests`)
 
 ---
 
