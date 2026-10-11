@@ -48,16 +48,78 @@ _DISALLOWED_PATTERNS = re.compile(
     r"rm\s+-rf|format\s+[a-z]:|powershell\s+-enc|cmd\.exe\s+/c|sh\s+-c|curl\s+.*\|\s*sh)"
 )
 
+# Raw credentials, connection strings, bearer tokens, and private key detection
+_SECRET_PATTERNS = re.compile(
+    r"(?i)("
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----|"
+    r"\b[a-z][a-z0-9+.-]*:\/\/[^\/\s:@]+:[^\/\s:@]+@|"  # URI with embedded user:password@
+    r"\bbearer\s+[A-Za-z0-9_\-\.]{16,}\b|"
+    r"\b(password|passwd|secret_key|api_key|access_token|private_key|auth_token)\s*[:=]\s*[\"']?[A-Za-z0-9_\-\.]{6,}[\"']?|"
+    r"\bAKIA[0-9A-Z]{16}\b"
+    r")"
+)
+
+PROHIBITED_METADATA_KEYS = {
+    "password", "passwd", "secret", "secret_key", "api_key", "apikey",
+    "token", "access_token", "private_key", "credentials", "conn_str",
+    "connection_string", "auth_token"
+}
+
+# Allowlisted resource categories for canonical reference validation
+SUPPORTED_RESOURCE_CATEGORIES = {
+    "actions",
+    "action_proposals",
+    "decisions",
+    "evidence",
+    "incidents",
+    "rcas",
+    "memories",
+}
+
+
+def _scan_for_secrets(value: Optional[str], field_name: str) -> None:
+    """Detects raw credentials, tokens, passwords, connection strings, and private keys."""
+    if not value:
+        return
+    if _SECRET_PATTERNS.search(value):
+        raise ValueError(
+            f"Field '{field_name}' contains potential secret, credential, token, or connection string."
+        )
+
 
 def _validate_safe_text(value: Optional[str], field_name: str) -> Optional[str]:
-    """Ensures string does not contain executable code, SQL smuggling, or shell scripts."""
+    """Ensures string does not contain executable code, SQL smuggling, shell scripts, or raw secrets."""
     if not value:
         return value
+    _scan_for_secrets(value, field_name)
     if _DISALLOWED_PATTERNS.search(value):
         raise ValueError(
             f"Field '{field_name}' contains disallowed executable pattern, script, or SQL command."
         )
     return value
+
+
+def _validate_related_resources(v: Optional[Dict[str, List[str]]]) -> Optional[Dict[str, List[str]]]:
+    """Bounds and validates related_resources categories and ID formats."""
+    if v is None:
+        return v
+    if len(v) > 10:
+        raise ValueError(f"related_resources category count ({len(v)}) exceeds maximum allowed (10).")
+    total_ids = 0
+    for cat, id_list in v.items():
+        if cat.lower() not in SUPPORTED_RESOURCE_CATEGORIES:
+            raise ValueError(
+                f"Unsupported resource category '{cat}'. Supported categories are: {sorted(list(SUPPORTED_RESOURCE_CATEGORIES))}."
+            )
+        if len(id_list) > 25:
+            raise ValueError(f"Resource category '{cat}' ID count ({len(id_list)}) exceeds maximum allowed (25).")
+        total_ids += len(id_list)
+        for res_id in id_list:
+            if not re.match(r"^[A-Za-z0-9_\-\.]{1,64}$", res_id):
+                raise ValueError(f"Invalid resource ID format '{res_id}' in category '{cat}'.")
+    if total_ids > 50:
+        raise ValueError(f"Aggregate related_resources count ({total_ids}) exceeds maximum allowed (50).")
+    return v
 
 
 # =============================================================================
@@ -214,10 +276,74 @@ class MissionConstraint(BaseModel):
     is_hard: bool = Field(default=True, description="Whether constraint is hard (violating halts) or soft")
     parameters: Dict[str, Any] = Field(default_factory=dict, description="Typed constraint parameters")
 
+    @field_validator("constraint_id")
+    @classmethod
+    def validate_constraint_id(cls, v: str) -> str:
+        if not re.match(r"^[A-Za-z0-9_\-\.]{1,64}$", v):
+            raise ValueError(f"Invalid constraint ID format '{v}'.")
+        return v
+
     @field_validator("description")
     @classmethod
     def validate_description_safe(cls, v: str) -> str:
         return _validate_safe_text(v, "description") or v
+
+    @field_validator("parameters")
+    @classmethod
+    def validate_parameters_bounds_and_safety(cls, v: Dict[str, Any]) -> Dict[str, Any]:
+        if not v:
+            return v
+
+        # 1. Nesting depth check (max depth 3)
+        def _check_depth(obj: Any, current: int = 1) -> None:
+            if current > 3:
+                raise ValueError("Constraint parameters nesting depth exceeds maximum allowed (depth 3).")
+            if isinstance(obj, dict):
+                for val in obj.values():
+                    _check_depth(val, current + 1)
+            elif isinstance(obj, list):
+                for item in obj:
+                    _check_depth(item, current + 1)
+
+        _check_depth(v)
+
+        # 2. Total key count check (max 20 keys)
+        def _count_keys(obj: Any) -> int:
+            cnt = 0
+            if isinstance(obj, dict):
+                cnt += len(obj)
+                for val in obj.values():
+                    cnt += _count_keys(val)
+            elif isinstance(obj, list):
+                for item in obj:
+                    cnt += _count_keys(item)
+            return cnt
+
+        if _count_keys(v) > 20:
+            raise ValueError(f"Constraint parameters total key count exceeds maximum allowed (20 keys).")
+
+        # 3. Serialized size check (max 4096 bytes)
+        dumped = json.dumps(v, default=str)
+        if len(dumped.encode("utf-8")) > 4096:
+            raise ValueError("Constraint parameters serialized size exceeds maximum allowed (4096 bytes).")
+
+        # 4. Secret scanning and prohibited keys
+        def _scan_obj(obj: Any, path: str = "parameters") -> None:
+            if isinstance(obj, dict):
+                for k, val in obj.items():
+                    k_str = str(k).lower()
+                    if k_str in PROHIBITED_METADATA_KEYS:
+                        raise ValueError(f"Prohibited secret metadata key '{k}' detected in parameters.")
+                    _validate_safe_text(str(k), f"{path}.key")
+                    _scan_obj(val, f"{path}.{k}")
+            elif isinstance(obj, list):
+                for idx, item in enumerate(obj):
+                    _scan_obj(item, f"{path}[{idx}]")
+            elif isinstance(obj, str):
+                _validate_safe_text(obj, path)
+
+        _scan_obj(v)
+        return v
 
 
 class MissionSuccessCriterion(BaseModel):
@@ -236,7 +362,14 @@ class MissionSuccessCriterion(BaseModel):
     required_evidence_type: Optional[str] = Field(default=None, max_length=128, description="Expected evidence record type")
     evaluation_notes: Optional[str] = Field(default=None, max_length=2000, description="Auditable reviewer evaluation notes")
 
-    @field_validator("description", "target_metric", "evaluation_notes")
+    @field_validator("criterion_id")
+    @classmethod
+    def validate_criterion_id(cls, v: str) -> str:
+        if not re.match(r"^[A-Za-z0-9_\-\.]{1,64}$", v):
+            raise ValueError(f"Invalid criterion ID format '{v}'.")
+        return v
+
+    @field_validator("description", "target_metric", "required_evidence_type", "evaluation_notes")
     @classmethod
     def validate_safe_text(cls, v: Optional[str], info) -> Optional[str]:
         return _validate_safe_text(v, info.field_name)
@@ -257,10 +390,24 @@ class MissionEvidenceRequirement(BaseModel):
     is_mandatory: bool = Field(default=True, description="Whether this evidence is strictly mandatory")
     linked_evidence_id: Optional[str] = Field(default=None, max_length=128, description="ID of linked evidence record if attached")
 
-    @field_validator("description")
+    @field_validator("requirement_id")
     @classmethod
-    def validate_description_safe(cls, v: str) -> str:
-        return _validate_safe_text(v, "description") or v
+    def validate_requirement_id(cls, v: str) -> str:
+        if not re.match(r"^[A-Za-z0-9_\-\.]{1,64}$", v):
+            raise ValueError(f"Invalid requirement ID format '{v}'.")
+        return v
+
+    @field_validator("linked_evidence_id")
+    @classmethod
+    def validate_linked_evidence_id(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and not re.match(r"^[A-Za-z0-9_\-\.]{1,128}$", v):
+            raise ValueError(f"Invalid linked evidence ID format '{v}'.")
+        return v
+
+    @field_validator("description", "evidence_type")
+    @classmethod
+    def validate_description_safe(cls, v: str, info) -> str:
+        return _validate_safe_text(v, info.field_name) or v
 
 
 class MissionPlannedStep(BaseModel):
@@ -272,12 +419,13 @@ class MissionPlannedStep(BaseModel):
     description: str = Field(..., min_length=1, max_length=2000, description="Detailed step description")
     step_type: StepType = Field(..., description="Classification of work for this step")
     status: StepStatus = Field(default=StepStatus.PLANNED, description="Current execution or planning status")
-    depends_on: List[str] = Field(default_factory=list, description="List of step_ids that must complete before this step")
+    depends_on: List[str] = Field(default_factory=list, max_length=20, description="List of step_ids that must complete before this step")
     related_resource_ids: List[str] = Field(
         default_factory=list,
+        max_length=20,
         description="References to Action proposals, Decisions, Incidents, RCAs, or Memories"
     )
-    required_evidence: List[str] = Field(default_factory=list, description="Evidence requirements for this step")
+    required_evidence: List[str] = Field(default_factory=list, max_length=20, description="Evidence requirements for this step")
 
     @field_validator("step_id")
     @classmethod
@@ -285,6 +433,27 @@ class MissionPlannedStep(BaseModel):
         v = v.strip()
         if not re.match(r"^[A-Za-z0-9_-]+$", v):
             raise ValueError(f"Step ID '{v}' must be alphanumeric with dashes or underscores only.")
+        return v
+
+    @field_validator("related_resource_ids")
+    @classmethod
+    def validate_related_resource_ids(cls, v: List[str]) -> List[str]:
+        if len(v) > 20:
+            raise ValueError(f"Step related_resource_ids count ({len(v)}) exceeds maximum allowed (20).")
+        for res_id in v:
+            if not re.match(r"^[A-Za-z0-9_\-\.]{1,64}$", res_id):
+                raise ValueError(f"Invalid resource ID format '{res_id}'.")
+        return v
+
+    @field_validator("required_evidence")
+    @classmethod
+    def validate_required_evidence(cls, v: List[str]) -> List[str]:
+        if len(v) > 20:
+            raise ValueError(f"Step required_evidence count ({len(v)}) exceeds maximum allowed (20).")
+        for ev in v:
+            if len(ev) > 128:
+                raise ValueError(f"Required evidence name '{ev[:20]}...' exceeds maximum length (128 characters).")
+            _validate_safe_text(ev, "required_evidence")
         return v
 
     @field_validator("title", "description")
@@ -304,6 +473,13 @@ class MissionProvenance(BaseModel):
     parent_rca_id: Optional[str] = Field(default=None, max_length=128, description="Associated RCA ID if applicable")
     source_system: str = Field(default="sagecommand_v3", max_length=64, description="Originating subsystem")
     confidence_score: Optional[float] = Field(default=None, ge=0.0, le=1.0, description="Analytical confidence if known")
+
+    @field_validator("parent_incident_id", "parent_rca_id")
+    @classmethod
+    def validate_parent_ids(cls, v: Optional[str], info) -> Optional[str]:
+        if v is not None and not re.match(r"^[A-Za-z0-9_\-\.]{1,128}$", v):
+            raise ValueError(f"Invalid identifier format for '{info.field_name}': '{v}'.")
+        return v
 
     @field_validator("origin_reason")
     @classmethod
@@ -337,10 +513,10 @@ class Mission(BaseModel):
     mission_type: MissionType = Field(..., description="Allowlisted mission classification")
     objective: str = Field(..., min_length=1, max_length=4000, description="Primary bounded operational objective")
     scope: MissionScope = Field(..., description="Authoritative organizational and security boundary")
-    constraints: List[MissionConstraint] = Field(default_factory=list, description="Bounded operational constraints")
-    success_criteria: List[MissionSuccessCriterion] = Field(default_factory=list, description="Structured success conditions")
-    planned_steps: List[MissionPlannedStep] = Field(default_factory=list, description="Planned DAG steps")
-    evidence_requirements: List[MissionEvidenceRequirement] = Field(default_factory=list, description="Required evidence items")
+    constraints: List[MissionConstraint] = Field(default_factory=list, max_length=20, description="Bounded operational constraints")
+    success_criteria: List[MissionSuccessCriterion] = Field(default_factory=list, max_length=20, description="Structured success conditions")
+    planned_steps: List[MissionPlannedStep] = Field(default_factory=list, max_length=50, description="Planned DAG steps")
+    evidence_requirements: List[MissionEvidenceRequirement] = Field(default_factory=list, max_length=30, description="Required evidence items")
     related_resources: Dict[str, List[str]] = Field(
         default_factory=dict,
         description="Referenced Action proposals, Decisions, Incidents, RCAs, and Memories"
@@ -357,8 +533,8 @@ class Mission(BaseModel):
         description="ISO-8601 last update timestamp"
     )
     created_by: str = Field(..., min_length=1, max_length=128, description="Authoritative identity of creator")
-    validation_errors: List[str] = Field(default_factory=list, description="Structural and domain validation error traces")
-    validation_warnings: List[str] = Field(default_factory=list, description="Domain validation warnings")
+    validation_errors: List[str] = Field(default_factory=list, max_length=50, description="Structural and domain validation error traces")
+    validation_warnings: List[str] = Field(default_factory=list, max_length=50, description="Domain validation warnings")
     review_notes: Optional[str] = Field(default=None, max_length=4000, description="Governance reviewer notes")
     reviewed_by: Optional[str] = Field(default=None, max_length=128, description="Governance reviewer identity")
     reviewed_at: Optional[str] = Field(default=None, description="ISO-8601 review timestamp")
@@ -367,6 +543,11 @@ class Mission(BaseModel):
     @classmethod
     def validate_mission_text(cls, v: str, info) -> str:
         return _validate_safe_text(v, info.field_name) or v
+
+    @field_validator("related_resources")
+    @classmethod
+    def validate_mission_related_resources(cls, v: Dict[str, List[str]]) -> Dict[str, List[str]]:
+        return _validate_related_resources(v) or {}
 
     @model_validator(mode="after")
     def validate_created_by_matches_provenance(self) -> "Mission":
@@ -459,10 +640,10 @@ class MissionCreateRequest(BaseModel):
     mission_type: MissionType
     objective: str = Field(..., min_length=1, max_length=4000)
     plant_id: str = Field(..., min_length=1, max_length=128)
-    constraints: List[MissionConstraint] = Field(default_factory=list)
-    success_criteria: List[MissionSuccessCriterion] = Field(default_factory=list)
-    planned_steps: List[MissionPlannedStep] = Field(default_factory=list)
-    evidence_requirements: List[MissionEvidenceRequirement] = Field(default_factory=list)
+    constraints: List[MissionConstraint] = Field(default_factory=list, max_length=20)
+    success_criteria: List[MissionSuccessCriterion] = Field(default_factory=list, max_length=20)
+    planned_steps: List[MissionPlannedStep] = Field(default_factory=list, max_length=50)
+    evidence_requirements: List[MissionEvidenceRequirement] = Field(default_factory=list, max_length=30)
     related_resources: Dict[str, List[str]] = Field(default_factory=dict)
     origin_reason: str = Field(..., min_length=1, max_length=1000)
     parent_incident_id: Optional[str] = Field(default=None, max_length=128)
@@ -474,6 +655,44 @@ class MissionCreateRequest(BaseModel):
     def validate_request_text(cls, v: str, info) -> str:
         return _validate_safe_text(v, info.field_name) or v
 
+    @field_validator("parent_incident_id", "parent_rca_id", "idempotency_key")
+    @classmethod
+    def validate_request_ids(cls, v: Optional[str], info) -> Optional[str]:
+        if v is not None and not re.match(r"^[A-Za-z0-9_\-\.]{1,128}$", v):
+            raise ValueError(f"Invalid identifier format for '{info.field_name}': '{v}'.")
+        return v
+
+    @field_validator("related_resources")
+    @classmethod
+    def validate_request_related_resources(cls, v: Dict[str, List[str]]) -> Dict[str, List[str]]:
+        return _validate_related_resources(v) or {}
+
+    @field_validator("success_criteria")
+    @classmethod
+    def validate_criteria_initial_status(cls, v: List[MissionSuccessCriterion]) -> List[MissionSuccessCriterion]:
+        if len(v) > 20:
+            raise ValueError(f"Success criteria count ({len(v)}) exceeds maximum allowed (20).")
+        for crit in v:
+            if crit.status in (CriterionStatus.SATISFIED, CriterionStatus.NOT_SATISFIED):
+                raise ValueError(
+                    f"Success criterion '{crit.criterion_id}' status cannot be self-certified as '{crit.status.value}'. "
+                    "Initial criteria must have status 'UNKNOWN'."
+                )
+        return v
+
+    @field_validator("planned_steps")
+    @classmethod
+    def validate_steps_initial_status(cls, v: List[MissionPlannedStep]) -> List[MissionPlannedStep]:
+        if len(v) > 50:
+            raise ValueError(f"Planned steps count ({len(v)}) exceeds maximum allowed (50).")
+        for step in v:
+            if step.status not in (StepStatus.PLANNED, StepStatus.PENDING):
+                raise ValueError(
+                    f"Planned step '{step.step_id}' status cannot be initialized to '{step.status.value}'. "
+                    "Planned steps must begin in 'PLANNED' or 'PENDING' status."
+                )
+        return v
+
 
 class MissionUpdateRequest(BaseModel):
     """Payload to update an editable mission draft."""
@@ -482,10 +701,10 @@ class MissionUpdateRequest(BaseModel):
     title: Optional[str] = Field(default=None, min_length=1, max_length=256)
     description: Optional[str] = Field(default=None, min_length=1, max_length=4000)
     objective: Optional[str] = Field(default=None, min_length=1, max_length=4000)
-    constraints: Optional[List[MissionConstraint]] = None
-    success_criteria: Optional[List[MissionSuccessCriterion]] = None
-    planned_steps: Optional[List[MissionPlannedStep]] = None
-    evidence_requirements: Optional[List[MissionEvidenceRequirement]] = None
+    constraints: Optional[List[MissionConstraint]] = Field(default=None, max_length=20)
+    success_criteria: Optional[List[MissionSuccessCriterion]] = Field(default=None, max_length=20)
+    planned_steps: Optional[List[MissionPlannedStep]] = Field(default=None, max_length=50)
+    evidence_requirements: Optional[List[MissionEvidenceRequirement]] = Field(default=None, max_length=30)
     related_resources: Optional[Dict[str, List[str]]] = None
     update_reason: str = Field(..., min_length=1, max_length=1000)
 
@@ -493,6 +712,40 @@ class MissionUpdateRequest(BaseModel):
     @classmethod
     def validate_update_text(cls, v: Optional[str], info) -> Optional[str]:
         return _validate_safe_text(v, info.field_name)
+
+    @field_validator("related_resources")
+    @classmethod
+    def validate_update_related_resources(cls, v: Optional[Dict[str, List[str]]]) -> Optional[Dict[str, List[str]]]:
+        return _validate_related_resources(v)
+
+    @field_validator("success_criteria")
+    @classmethod
+    def validate_update_criteria_status(cls, v: Optional[List[MissionSuccessCriterion]]) -> Optional[List[MissionSuccessCriterion]]:
+        if v is None:
+            return v
+        if len(v) > 20:
+            raise ValueError(f"Success criteria count ({len(v)}) exceeds maximum allowed (20).")
+        for crit in v:
+            if crit.status in (CriterionStatus.SATISFIED, CriterionStatus.NOT_SATISFIED):
+                raise ValueError(
+                    f"Success criterion '{crit.criterion_id}' status cannot be self-certified as '{crit.status.value}'. "
+                    "Criterion completion requires authoritative verification."
+                )
+        return v
+
+    @field_validator("planned_steps")
+    @classmethod
+    def validate_update_steps_status(cls, v: Optional[List[MissionPlannedStep]]) -> Optional[List[MissionPlannedStep]]:
+        if v is None:
+            return v
+        if len(v) > 50:
+            raise ValueError(f"Planned steps count ({len(v)}) exceeds maximum allowed (50).")
+        for step in v:
+            if step.status in (StepStatus.IN_PROGRESS, StepStatus.COMPLETED, StepStatus.FAILED):
+                raise ValueError(
+                    f"Planned step '{step.step_id}' cannot claim unverified execution outcome status '{step.status.value}'."
+                )
+        return v
 
 
 class MissionReviewRequest(BaseModel):

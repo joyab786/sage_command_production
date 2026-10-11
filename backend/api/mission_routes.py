@@ -301,6 +301,8 @@ async def submit_for_review(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(le))
     except MissionPermissionError as pe:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(pe))
+    except (ValueError, MissionValidationError) as ve:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(ve))
     except Exception as e:
         logger.error(f"Mission submission failure: {type(e).__name__}: {str(e)}", exc_info=True)
         raise HTTPException(
@@ -340,6 +342,8 @@ async def review_mission(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(le))
     except MissionPermissionError as pe:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(pe))
+    except (ValueError, MissionValidationError) as ve:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(ve))
     except Exception as e:
         logger.error(f"Mission review failure: {type(e).__name__}: {str(e)}", exc_info=True)
         raise HTTPException(
@@ -378,6 +382,8 @@ async def cancel_mission(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(le))
     except MissionPermissionError as pe:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(pe))
+    except (ValueError, MissionValidationError) as ve:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(ve))
     except Exception as e:
         logger.error(f"Mission cancellation failure: {type(e).__name__}: {str(e)}", exc_info=True)
         raise HTTPException(

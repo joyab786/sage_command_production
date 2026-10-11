@@ -63,6 +63,8 @@ try:
         MissionAuditRecord,
         MANDATORY_MISSION_NOTICE,
         VALID_LIFECYCLE_TRANSITIONS,
+        SUPPORTED_RESOURCE_CATEGORIES,
+        _validate_safe_text,
         is_valid_lifecycle_transition,
         validate_mission_dependencies,
     )
@@ -73,6 +75,12 @@ try:
         MissionConcurrencyError,
         MissionIdempotencyConflictError,
     )
+    from services.action_store import action_store
+    from repositories.decision_engine_repository import DecisionEngineRepository
+    from repositories.evidence_explainability_repository import evidence_explainability_repository
+    from services.incident_repository import IncidentRepository
+    from services.rca_repository import RcaRepository
+    from repositories.organizational_memory_repository import OrganizationalMemoryRepository
 except (ImportError, ModuleNotFoundError):
     from backend.core.auth import Identity
     from backend.core.config import (
@@ -111,6 +119,8 @@ except (ImportError, ModuleNotFoundError):
         MissionAuditRecord,
         MANDATORY_MISSION_NOTICE,
         VALID_LIFECYCLE_TRANSITIONS,
+        SUPPORTED_RESOURCE_CATEGORIES,
+        _validate_safe_text,
         is_valid_lifecycle_transition,
         validate_mission_dependencies,
     )
@@ -121,6 +131,12 @@ except (ImportError, ModuleNotFoundError):
         MissionConcurrencyError,
         MissionIdempotencyConflictError,
     )
+    from backend.services.action_store import action_store
+    from backend.repositories.decision_engine_repository import DecisionEngineRepository
+    from backend.repositories.evidence_explainability_repository import evidence_explainability_repository
+    from backend.services.incident_repository import IncidentRepository
+    from backend.services.rca_repository import RcaRepository
+    from backend.repositories.organizational_memory_repository import OrganizationalMemoryRepository
 
 logger = logging.getLogger("mission_service")
 
@@ -157,12 +173,37 @@ class MissionService:
     # SCOPE & SECURITY VALIDATION
     # -------------------------------------------------------------------------
 
+    def _get_authorized_plants(self, identity: Identity) -> Set[str]:
+        """
+        Extracts authoritative plant assignments from caller identity.
+        Strictly fail-closed:
+        - If assigned_plants is missing, None, or empty list: returns empty set.
+        - Only explicit values (including explicit "*") grant access.
+        - Never converts empty assignment into wildcard.
+        """
+        raw = getattr(identity, "assigned_plants", None)
+        if not raw or not isinstance(raw, (list, set, tuple)):
+            return set()
+        return set(raw)
+
+    def _is_plant_authorized(self, identity: Identity, plant_id: Optional[str]) -> bool:
+        """Determines if a target plant is within caller's authorized scope."""
+        assigned = self._get_authorized_plants(identity)
+        if not assigned:
+            return False
+        if not plant_id or not plant_id.strip():
+            return True
+        if "*" in assigned:
+            return True
+        return plant_id in assigned
+
     def _validate_scope_authority(self, identity: Identity, requested_plant_id: Optional[str] = None) -> None:
         """
         Validates authoritative caller scope:
         - Workspace ID must not be empty or null (fail closed).
-        - Tenant ID must not be empty or null.
-        - Plant ID (if requested) must be in caller's assigned plants.
+        - Tenant ID must not be empty or null (fail closed).
+        - Caller must have at least one assigned plant (fail closed).
+        - Requested plant ID (if specified) must be in caller's assigned plants or wildcard.
         """
         if not identity.workspace_id or not identity.workspace_id.strip():
             logger.warning(f"Rejecting mission access: caller '{identity.user_id}' has empty workspace_id.")
@@ -172,8 +213,12 @@ class MissionService:
             logger.warning(f"Rejecting mission access: caller '{identity.user_id}' has empty tenant_id.")
             raise MissionPermissionError("Authoritative tenant identity is required. Access denied (fail-closed).")
 
+        assigned = self._get_authorized_plants(identity)
+        if not assigned:
+            logger.warning(f"Rejecting mission access: caller '{identity.user_id}' has no assigned plants (fail-closed).")
+            raise MissionPermissionError("Caller has no assigned plants. Access denied (fail-closed).")
+
         if requested_plant_id:
-            assigned = getattr(identity, "assigned_plants", ["*"]) or ["*"]
             if "*" not in assigned and requested_plant_id not in assigned:
                 logger.warning(
                     f"Scope denial: caller '{identity.user_id}' assigned to {assigned} attempted access to plant '{requested_plant_id}'."
@@ -189,8 +234,229 @@ class MissionService:
         return hashlib.sha256(dumped.encode("utf-8")).hexdigest()
 
     # -------------------------------------------------------------------------
-    # DOMAIN VALIDATION ENGINE
+    # DOMAIN & RESOURCE REFERENCE VALIDATION ENGINE
     # -------------------------------------------------------------------------
+
+    def _detect_resource_category(self, res_id: str) -> Optional[str]:
+        """Detects canonical resource category by prefix."""
+        low = res_id.lower()
+        if low.startswith(("act_", "action_")):
+            return "actions"
+        if low.startswith(("dec_", "eval_")):
+            return "decisions"
+        if low.startswith(("ev_", "evd_", "exp_")):
+            return "evidence"
+        if low.startswith("inc_"):
+            return "incidents"
+        if low.startswith(("rca_", "ana_")):
+            return "rcas"
+        if low.startswith("mem_"):
+            return "memories"
+        return None
+
+    def _validate_single_resource(
+        self,
+        identity: Identity,
+        category: str,
+        res_id: str,
+        errors: List[str],
+        warnings: List[str],
+        context: str = "Resource",
+    ) -> None:
+        """Validates a single resource reference against its canonical repository."""
+        caller_tenant = identity.tenant_id
+        caller_ws = identity.workspace_id
+
+        cat = category.lower()
+        if cat in ("actions", "action_proposals"):
+            act = action_store.get_by_id(res_id, caller_tenant)
+            if not act:
+                with action_store._get_connection() as conn:
+                    row = conn.execute("SELECT tenant_id, workspace_id FROM actions_v3 WHERE action_id = ?", (res_id,)).fetchone()
+                if row:
+                    errors.append(f"{context} reference '{res_id}' is invalid or inaccessible in the authorized scope.")
+                else:
+                    errors.append(f"{context} reference '{res_id}' in category '{category}' not found.")
+            else:
+                if act.workspace_id and act.workspace_id != caller_ws:
+                    errors.append(f"{context} reference '{res_id}' is invalid or inaccessible in the authorized scope.")
+                elif act.target and act.target.plant_id and not self._is_plant_authorized(identity, act.target.plant_id):
+                    errors.append(f"{context} reference '{res_id}' is invalid or inaccessible in the authorized scope.")
+
+        elif cat == "decisions":
+            dec_repo = DecisionEngineRepository()
+            dec = dec_repo.get_by_id(res_id, caller_tenant)
+            if not dec:
+                with dec_repo._get_connection() as conn:
+                    row = conn.execute("SELECT tenant_id, workspace_id, plant_id FROM decision_evaluations WHERE decision_id = ?", (res_id,)).fetchone()
+                if row:
+                    errors.append(f"{context} reference '{res_id}' is invalid or inaccessible in the authorized scope.")
+                else:
+                    errors.append(f"{context} reference '{res_id}' in category '{category}' not found.")
+            else:
+                if dec.workspace_id and dec.workspace_id != caller_ws:
+                    errors.append(f"{context} reference '{res_id}' is invalid or inaccessible in the authorized scope.")
+                elif dec.plant_id and not self._is_plant_authorized(identity, dec.plant_id):
+                    errors.append(f"{context} reference '{res_id}' is invalid or inaccessible in the authorized scope.")
+
+        elif cat == "evidence":
+            with evidence_explainability_repository._get_connection() as conn:
+                row = conn.execute(
+                    "SELECT tenant_id, workspace_id, plant_id, validation_status FROM evidence_records WHERE evidence_id = ?",
+                    (res_id,),
+                ).fetchone()
+                if not row:
+                    row = conn.execute(
+                        "SELECT tenant_id, workspace_id, plant_id, NULL as validation_status FROM evidence_explanations WHERE explanation_id = ?",
+                        (res_id,),
+                    ).fetchone()
+            if not row:
+                errors.append(f"{context} reference '{res_id}' in category '{category}' not found.")
+            else:
+                if row["tenant_id"] != caller_tenant or (row["workspace_id"] and row["workspace_id"] != caller_ws) or not self._is_plant_authorized(identity, row["plant_id"]):
+                    errors.append(f"{context} reference '{res_id}' is invalid or inaccessible in the authorized scope.")
+                elif row["validation_status"] and row["validation_status"] != "VALID":
+                    warnings.append(f"Referenced evidence '{res_id}' is unverified (status: {row['validation_status']}).")
+
+        elif cat == "incidents":
+            inc_repo = IncidentRepository()
+            inc = inc_repo.get_incident(res_id, caller_tenant)
+            if not inc:
+                with inc_repo._get_conn() as conn:
+                    row = conn.execute("SELECT tenant_id, workspace_id, plant_id FROM incidents WHERE incident_id = ?", (res_id,)).fetchone()
+                if row:
+                    errors.append(f"{context} reference '{res_id}' is invalid or inaccessible in the authorized scope.")
+                else:
+                    errors.append(f"{context} reference '{res_id}' in category '{category}' not found.")
+            else:
+                if inc.workspace_id and inc.workspace_id != caller_ws:
+                    errors.append(f"{context} reference '{res_id}' is invalid or inaccessible in the authorized scope.")
+                elif inc.plant_id and not self._is_plant_authorized(identity, inc.plant_id):
+                    errors.append(f"{context} reference '{res_id}' is invalid or inaccessible in the authorized scope.")
+
+        elif cat == "rcas":
+            rca_repo = RcaRepository()
+            rca = rca_repo.get_analysis(res_id, caller_tenant)
+            if not rca:
+                with rca_repo._get_connection() as conn:
+                    row = conn.execute("SELECT tenant_id, workspace_id, plant_id FROM rca_analyses WHERE analysis_id = ?", (res_id,)).fetchone()
+                if row:
+                    errors.append(f"{context} reference '{res_id}' is invalid or inaccessible in the authorized scope.")
+                else:
+                    errors.append(f"{context} reference '{res_id}' in category '{category}' not found.")
+            else:
+                if rca.workspace_id and rca.workspace_id != caller_ws:
+                    errors.append(f"{context} reference '{res_id}' is invalid or inaccessible in the authorized scope.")
+                elif rca.plant_id and not self._is_plant_authorized(identity, rca.plant_id):
+                    errors.append(f"{context} reference '{res_id}' is invalid or inaccessible in the authorized scope.")
+
+        elif cat == "memories":
+            mem_repo = OrganizationalMemoryRepository()
+            mem = mem_repo.get_entry(caller_tenant, caller_ws, res_id)
+            if not mem:
+                with mem_repo._get_connection() as conn:
+                    row = conn.execute("SELECT tenant_id, workspace_id, plant_id FROM organizational_memory_entries WHERE memory_id = ?", (res_id,)).fetchone()
+                if row:
+                    errors.append(f"{context} reference '{res_id}' is invalid or inaccessible in the authorized scope.")
+                else:
+                    errors.append(f"{context} reference '{res_id}' in category '{category}' not found.")
+            else:
+                if mem.plant_id and not self._is_plant_authorized(identity, mem.plant_id):
+                    errors.append(f"{context} reference '{res_id}' is invalid or inaccessible in the authorized scope.")
+        else:
+            errors.append(f"Resource category '{category}' is unsupported for canonical reference validation.")
+
+    def validate_resource_references(
+        self,
+        identity: Identity,
+        mission: Mission,
+    ) -> Tuple[bool, List[str], List[str]]:
+        """
+        Validates referenced resources against canonical systems:
+        - related_resources
+        - step.related_resource_ids
+        - step.required_evidence
+        - ev_req.linked_evidence_id
+        - provenance.parent_incident_id
+        - provenance.parent_rca_id
+
+        Enforces tenant, workspace, and plant scoping with non-disclosing error messages.
+        """
+        errors: List[str] = []
+        warnings: List[str] = []
+
+        # 1. Parent incident reference
+        if mission.provenance.parent_incident_id:
+            self._validate_single_resource(
+                identity,
+                "incidents",
+                mission.provenance.parent_incident_id,
+                errors,
+                warnings,
+                context="Parent incident",
+            )
+
+        # 2. Parent RCA reference
+        if mission.provenance.parent_rca_id:
+            self._validate_single_resource(
+                identity,
+                "rcas",
+                mission.provenance.parent_rca_id,
+                errors,
+                warnings,
+                context="Parent RCA",
+            )
+
+        # 3. Evidence requirements linked_evidence_id
+        for ev_req in mission.evidence_requirements:
+            if ev_req.linked_evidence_id:
+                self._validate_single_resource(
+                    identity,
+                    "evidence",
+                    ev_req.linked_evidence_id,
+                    errors,
+                    warnings,
+                    context=f"Requirement '{ev_req.requirement_id}' linked evidence",
+                )
+
+        # 4. related_resources dictionary
+        for cat, id_list in mission.related_resources.items():
+            if cat.lower() not in SUPPORTED_RESOURCE_CATEGORIES:
+                errors.append(f"Resource category '{cat}' is unsupported for canonical reference validation.")
+                continue
+            for res_id in id_list:
+                self._validate_single_resource(
+                    identity,
+                    cat,
+                    res_id,
+                    errors,
+                    warnings,
+                    context=f"Related resource ({cat})",
+                )
+
+        # 5. Step related_resource_ids
+        for step in mission.planned_steps:
+            for res_id in step.related_resource_ids:
+                detected_cat = self._detect_resource_category(res_id)
+                if not detected_cat:
+                    errors.append(f"Step '{step.step_id}' references unrecognized or unsupported resource '{res_id}'.")
+                else:
+                    self._validate_single_resource(
+                        identity,
+                        detected_cat,
+                        res_id,
+                        errors,
+                        warnings,
+                        context=f"Step '{step.step_id}' resource",
+                    )
+
+        # 6. Step required_evidence format
+        for step in mission.planned_steps:
+            for ev_name in step.required_evidence:
+                if len(ev_name) > 128:
+                    errors.append(f"Step '{step.step_id}' required evidence name '{ev_name[:20]}...' exceeds maximum length (128).")
+
+        return len(errors) == 0, errors[:50], warnings[:50]
 
     def validate_mission_structure(self, mission: Mission) -> Tuple[bool, List[str], List[str]]:
         """
@@ -255,7 +521,7 @@ class MissionService:
     ) -> Mission:
         """
         Creates a new industrial mission draft.
-        Enforces authoritative scope, initial DRAFT state, and deterministic validation.
+        Enforces authoritative scope, initial DRAFT state, bounds, and deterministic validation.
         """
         # Validate caller scope
         self._validate_scope_authority(identity, request.plant_id)
@@ -297,6 +563,14 @@ class MissionService:
         is_valid, errors, warnings = self.validate_mission_structure(mission)
         mission.validation_errors = errors
         mission.validation_warnings = warnings
+
+        # Resource reference validation check
+        ref_valid, ref_errors, ref_warnings = self.validate_resource_references(identity, mission)
+        if not ref_valid:
+            logger.warning(f"Rejecting mission draft creation: reference validation failed: {ref_errors}")
+            raise MissionValidationError(f"Resource reference validation failed: {'; '.join(ref_errors)}")
+
+        mission.validation_warnings.extend(ref_warnings)
 
         # Audit event
         audit_event = MissionAuditRecord(
@@ -359,10 +633,26 @@ class MissionService:
         limit: int = 20,
         offset: int = 0,
     ) -> Tuple[List[Mission], int]:
-        """Lists missions for caller's tenant and workspace."""
-        self._validate_scope_authority(identity, plant_id)
+        """Lists missions for caller's tenant and workspace with fail-closed plant scoping."""
+        if not identity.workspace_id or not identity.workspace_id.strip():
+            raise MissionPermissionError("Authoritative workspace identity is required. Access denied (fail-closed).")
+        if not identity.tenant_id or not identity.tenant_id.strip():
+            raise MissionPermissionError("Authoritative tenant identity is required. Access denied (fail-closed).")
 
-        missions, total = self.repository.list_missions(
+        assigned = self._get_authorized_plants(identity)
+        if not assigned:
+            # Caller has no authorized plants: fail closed, return 0 records immediately
+            return [], 0
+
+        if plant_id:
+            # Caller requested a specific plant filter
+            if "*" not in assigned and plant_id not in assigned:
+                raise MissionPermissionError(f"Caller is not authorized for plant '{plant_id}'.")
+            allowed_plants = {plant_id}
+        else:
+            allowed_plants = None if "*" in assigned else assigned
+
+        return self.repository.list_missions(
             tenant_id=identity.tenant_id,
             workspace_id=identity.workspace_id,
             plant_id=plant_id,
@@ -370,15 +660,8 @@ class MissionService:
             mission_type=mission_type,
             limit=limit,
             offset=offset,
+            allowed_plants=allowed_plants,
         )
-
-        # Filter by plant assignment if caller is restricted
-        assigned = getattr(identity, "assigned_plants", ["*"]) or ["*"]
-        if "*" not in assigned:
-            missions = [m for m in missions if m.scope.plant_id in assigned]
-            total = len(missions)
-
-        return missions, total
 
     def update_mission_draft(
         self,
@@ -419,10 +702,18 @@ class MissionService:
         if request.related_resources is not None:
             current.related_resources = request.related_resources
 
-        # Re-validate
+        # Re-validate structure
         is_valid, errors, warnings = self.validate_mission_structure(current)
         current.validation_errors = errors
         current.validation_warnings = warnings
+
+        # Reference validation check
+        ref_valid, ref_errors, ref_warnings = self.validate_resource_references(identity, current)
+        if not ref_valid:
+            logger.warning(f"Rejecting mission draft update: reference validation failed: {ref_errors}")
+            raise MissionValidationError(f"Resource reference validation failed: {'; '.join(ref_errors)}")
+
+        current.validation_warnings.extend(ref_warnings)
 
         # Audit record
         audit_event = MissionAuditRecord(
@@ -459,12 +750,17 @@ class MissionService:
         trace_id: Optional[str] = None,
     ) -> MissionValidationResponse:
         """
-        Executes deterministic domain and DAG validation.
+        Executes deterministic domain, DAG, and canonical resource reference validation.
         Transitions mission status to VALIDATED if passes; records errors and returns response.
         """
         current = self.get_mission(identity, mission_id)
 
-        is_valid, errors, warnings = self.validate_mission_structure(current)
+        struct_valid, struct_errors, struct_warnings = self.validate_mission_structure(current)
+        ref_valid, ref_errors, ref_warnings = self.validate_resource_references(identity, current)
+
+        is_valid = struct_valid and ref_valid
+        errors = (struct_errors + ref_errors)[:50]
+        warnings = (struct_warnings + ref_warnings)[:50]
         current.validation_errors = errors
         current.validation_warnings = warnings
 
@@ -532,6 +828,10 @@ class MissionService:
         Fails if mission has not successfully passed domain validation.
         """
         current = self.get_mission(identity, mission_id)
+
+        if len(submission_notes) > 4000:
+            raise ValueError("Submission notes exceed maximum allowed length (4000 characters).")
+        _validate_safe_text(submission_notes, "submission_notes")
 
         if current.status != MissionStatus.VALIDATED:
             raise MissionLifecycleError(
@@ -646,6 +946,10 @@ class MissionService:
         """
         Cancels an industrial mission from any non-terminal state.
         """
+        if len(cancel_reason) > 1000:
+            raise ValueError("Cancellation reason exceeds maximum allowed length (1000 characters).")
+        _validate_safe_text(cancel_reason, "cancel_reason")
+
         current = self.get_mission(identity, mission_id)
 
         if current.status == MissionStatus.CANCELLED:

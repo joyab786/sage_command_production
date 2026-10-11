@@ -28,6 +28,7 @@ try:
     from data.schemas.mission_contract import (
         MANDATORY_MISSION_NOTICE,
         SCHEMA_VERSION,
+        SUPPORTED_RESOURCE_CATEGORIES,
         MissionStatus,
         MissionType,
         StepType,
@@ -56,6 +57,7 @@ except (ImportError, ModuleNotFoundError):
     from backend.data.schemas.mission_contract import (
         MANDATORY_MISSION_NOTICE,
         SCHEMA_VERSION,
+        SUPPORTED_RESOURCE_CATEGORIES,
         MissionStatus,
         MissionType,
         StepType,

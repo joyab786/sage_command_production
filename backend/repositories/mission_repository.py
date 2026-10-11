@@ -515,8 +515,12 @@ class MissionRepository:
         mission_type: Optional[MissionType] = None,
         limit: int = 20,
         offset: int = 0,
+        allowed_plants: Optional[Set[str]] = None,
     ) -> Tuple[List[Mission], int]:
         """Lists missions matching tenant, workspace, and optional filters with total count."""
+        if allowed_plants is not None and len(allowed_plants) == 0:
+            return [], 0
+
         limit = min(max(1, limit), SAGE_MISSION_MAX_LIST_RESULTS)
         offset = max(0, offset)
 
@@ -524,8 +528,15 @@ class MissionRepository:
         params: List[Any] = [tenant_id, workspace_id]
 
         if plant_id:
+            if allowed_plants is not None and plant_id not in allowed_plants:
+                return [], 0
             clauses.append("plant_id = ?")
             params.append(plant_id)
+        elif allowed_plants is not None:
+            sorted_plants = sorted(list(allowed_plants))
+            placeholders = ", ".join("?" for _ in sorted_plants)
+            clauses.append(f"plant_id IN ({placeholders})")
+            params.extend(sorted_plants)
 
         if status:
             clauses.append("status = ?")
