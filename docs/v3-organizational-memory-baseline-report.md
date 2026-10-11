@@ -9,7 +9,7 @@
 - **Prompt 34 Implementation Commit:** `94219fa22d410d31fd9f0b4e884f0010445afdb7` (`feat(v3): implement governed organizational memory foundation (Prompt 34)`)
 - **Prompt 34 Documentation Follow-up Commit:** `dafd1cf4eea0d77a7705e83b533123ea956db57e` (`docs(v3): record final commit SHA in Prompt 34 baseline report`)
 - **Prompt 34A Targeted Security Hardening Commit:** `b78701932542555abe59306983dd2361348c40c4` (`fix(v3): enforce organizational memory workspace and plant isolation (Prompt 34A)`)
-- **Prompt 34B Atomic Supersession, Search, & Migration Commit:** Pending checkpoint commit (`fix(v3): make organizational memory supersession and search safe (Prompt 34B)`)
+- **Prompt 34B Implementation Commit:** `2d5dcb7b11c97a2cb455f58c7075217646a7823b` (`fix(v3): make organizational memory supersession and search safe (Prompt 34B)`)
 
 ---
 
