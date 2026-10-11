@@ -14,6 +14,7 @@
 - **Prompt 35A Test Teardown Commit:** `36de22416ec1a533ad03eeb0c169c9b139db080d` (`test(v3): ensure dependency overrides teardown in mission tests`)
 - **Prompt 35A Baseline Final Commit:** `6dc4c1bbbbc19f8657071231c89b90e25303d55e` (`docs(v3): record final commit SHAs in Prompt 35A baseline report`)
 - **Prompt 35B Starting Baseline:** `6dc4c1bbbbc19f8657071231c89b90e25303d55e`
+- **Prompt 35B Implementation Commit:** `7cf387f740f53793e59af8609d583da03ca4e945` (`fix(v3): harden mission outcome integrity, scoped resource lookup, and input safety (Prompt 35B)`)
 
 ---
 
