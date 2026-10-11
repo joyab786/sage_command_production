@@ -674,6 +674,7 @@ class OrganizationalMemoryService:
             },
         )
 
+        replacement_audit: Optional[MemoryAuditRecord] = None
         if replacement_entry:
             replacement_audit = MemoryAuditRecord(
                 audit_id=f"aud_mem_{uuid.uuid4().hex[:12]}",
@@ -690,11 +691,15 @@ class OrganizationalMemoryService:
                     "title": replacement_entry.title,
                 },
             )
-            # Atomically save replacement and update target
-            self.repository.save_draft(replacement_entry, replacement_audit)
-            self.repository.commit_lifecycle_mutation_atomic(superseded_target, target_audit)
-        else:
-            self.repository.commit_lifecycle_mutation_atomic(superseded_target, target_audit)
+
+        committed = self.repository.supersede_entry_atomic(
+            superseded_entry=superseded_target,
+            superseded_audit=target_audit,
+            replacement_entry=replacement_entry,
+            replacement_audit=replacement_audit,
+        )
+        if not committed:
+            raise RuntimeError(f"Atomic supersession transaction failed for entry '{memory_id}'.")
 
         return superseded_target, replacement_entry
 

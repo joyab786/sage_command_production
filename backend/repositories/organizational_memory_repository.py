@@ -20,6 +20,7 @@ Cardinal Invariants:
 import json
 import sqlite3
 import threading
+import logging
 from typing import Dict, Any, List, Optional, Tuple, Set
 from datetime import datetime, timezone
 
@@ -40,6 +41,7 @@ try:
         MemoryRelationship,
         MemorySearchRequest,
         MemoryAuditRecord,
+        VALID_LIFECYCLE_TRANSITIONS,
     )
     from data.schemas.sop_rag_contract import ClassificationLevel
     from data.schemas.confidence_uncertainty_contract import (
@@ -63,12 +65,15 @@ except (ImportError, ModuleNotFoundError):
         MemoryRelationship,
         MemorySearchRequest,
         MemoryAuditRecord,
+        VALID_LIFECYCLE_TRANSITIONS,
     )
     from backend.data.schemas.sop_rag_contract import ClassificationLevel
     from backend.data.schemas.confidence_uncertainty_contract import (
         ConfidenceStatus,
         UncertaintyType,
     )
+
+logger = logging.getLogger("organizational_memory_repository")
 
 
 # Classification hierarchy ranking for clearance checks
@@ -101,8 +106,140 @@ class OrganizationalMemoryRepository:
     def _init_db(self) -> None:
         with self._lock:
             with self._get_connection() as conn:
+                self._migrate_schema_if_needed(conn)
+                self._create_tables_and_indexes(conn)
+
+    def _create_tables_and_indexes(self, conn: sqlite3.Connection) -> None:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS organizational_memory_entries (
+                memory_id TEXT NOT NULL,
+                tenant_id TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
+                plant_id TEXT NOT NULL,
+                asset_id TEXT,
+                process_id TEXT,
+                session_id TEXT,
+                classification TEXT NOT NULL,
+                memory_type TEXT NOT NULL,
+                epistemic_status TEXT NOT NULL,
+                lifecycle_status TEXT NOT NULL,
+                verification_status TEXT NOT NULL,
+                title TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                content TEXT NOT NULL,
+                tags_json TEXT NOT NULL,
+                source_references_json TEXT NOT NULL,
+                evidence_references_json TEXT NOT NULL,
+                decision_reference TEXT,
+                incident_reference TEXT,
+                rca_reference TEXT,
+                sop_reference TEXT,
+                relationships_json TEXT NOT NULL,
+                supersedes_memory_id TEXT,
+                superseded_by_memory_id TEXT,
+                revision INTEGER NOT NULL DEFAULT 1,
+                confidence_status TEXT NOT NULL,
+                uncertainty_types_json TEXT NOT NULL,
+                uncertainty_notes TEXT,
+                retention_policy TEXT NOT NULL,
+                is_hold INTEGER NOT NULL DEFAULT 0,
+                hold_reason TEXT,
+                event_timestamp TEXT,
+                valid_from TEXT,
+                valid_until TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                verified_at TEXT,
+                superseded_at TEXT,
+                archived_at TEXT,
+                created_by TEXT NOT NULL,
+                verified_by TEXT,
+                superseded_by TEXT,
+                archived_by TEXT,
+                metadata_json TEXT NOT NULL,
+                PRIMARY KEY (tenant_id, workspace_id, memory_id)
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS organizational_memory_audit_ledger (
+                audit_id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
+                plant_id TEXT NOT NULL,
+                memory_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                details_json TEXT NOT NULL
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS organizational_memory_relationships (
+                tenant_id TEXT NOT NULL,
+                source_memory_id TEXT NOT NULL,
+                target_memory_id TEXT NOT NULL,
+                relationship_type TEXT NOT NULL,
+                description TEXT,
+                created_at TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                PRIMARY KEY (tenant_id, source_memory_id, target_memory_id, relationship_type)
+            )
+        """)
+
+        # Performance and workspace isolation indexes
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_tenant_ws ON organizational_memory_entries (tenant_id, workspace_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_tenant_ws_id ON organizational_memory_entries (tenant_id, workspace_id, memory_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_tenant_type ON organizational_memory_entries (tenant_id, workspace_id, memory_type)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_tenant_status ON organizational_memory_entries (tenant_id, workspace_id, lifecycle_status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_tenant_plant ON organizational_memory_entries (tenant_id, workspace_id, plant_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_tenant_asset ON organizational_memory_entries (tenant_id, workspace_id, asset_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_tenant_incident ON organizational_memory_entries (tenant_id, workspace_id, incident_reference)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_tenant_decision ON organizational_memory_entries (tenant_id, workspace_id, decision_reference)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_audit_tenant_ws_mem ON organizational_memory_audit_ledger (tenant_id, workspace_id, memory_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_rel_target ON organizational_memory_relationships (tenant_id, target_memory_id)")
+
+    def _migrate_schema_if_needed(self, conn: sqlite3.Connection) -> bool:
+        """
+        Detects actual existing table schema and safely migrates composite primary key to
+        (tenant_id, workspace_id, memory_id) if existing database was created under older schema.
+        Preserves all existing organizational-memory entries, audit records, relationships,
+        provenance, classifications, and lifecycle states.
+        Idempotent and safe to run repeatedly.
+        Returns True if a migration was performed, False otherwise.
+        """
+        cur = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='organizational_memory_entries'"
+        )
+        if not cur.fetchone():
+            return False
+
+        table_info = conn.execute("PRAGMA table_info(organizational_memory_entries)").fetchall()
+        pk_cols = [r[1] for r in sorted([r for r in table_info if r[5] > 0], key=lambda x: x[5])]
+
+        target_pk = ["tenant_id", "workspace_id", "memory_id"]
+        if pk_cols == target_pk:
+            return False
+
+        logger.info(
+            "Migrating organizational_memory_entries schema from PK %s to %s",
+            pk_cols, target_pk,
+        )
+
+        fk_cur = conn.execute("PRAGMA foreign_keys")
+        fk_enabled = bool(fk_cur.fetchone()[0])
+        if fk_enabled:
+            conn.execute("PRAGMA foreign_keys = OFF")
+
+        try:
+            with conn:
+                old_count = conn.execute("SELECT COUNT(*) FROM organizational_memory_entries").fetchone()[0]
+
+                # 1. Create temporary migration table with target composite primary key
                 conn.execute("""
-                    CREATE TABLE IF NOT EXISTS organizational_memory_entries (
+                    CREATE TABLE organizational_memory_entries__v3_migration (
                         memory_id TEXT NOT NULL,
                         tenant_id TEXT NOT NULL,
                         workspace_id TEXT NOT NULL,
@@ -152,35 +289,44 @@ class OrganizationalMemoryRepository:
                     )
                 """)
 
+                # 2. Copy all data into migration table preserving all fields
                 conn.execute("""
-                    CREATE TABLE IF NOT EXISTS organizational_memory_audit_ledger (
-                        audit_id TEXT PRIMARY KEY,
-                        tenant_id TEXT NOT NULL,
-                        workspace_id TEXT NOT NULL,
-                        plant_id TEXT NOT NULL,
-                        memory_id TEXT NOT NULL,
-                        event_type TEXT NOT NULL,
-                        actor_id TEXT NOT NULL,
-                        timestamp TEXT NOT NULL,
-                        outcome TEXT NOT NULL,
-                        details_json TEXT NOT NULL
+                    INSERT INTO organizational_memory_entries__v3_migration (
+                        memory_id, tenant_id, workspace_id, plant_id, asset_id, process_id, session_id,
+                        classification, memory_type, epistemic_status, lifecycle_status, verification_status,
+                        title, summary, content, tags_json, source_references_json, evidence_references_json,
+                        decision_reference, incident_reference, rca_reference, sop_reference, relationships_json,
+                        supersedes_memory_id, superseded_by_memory_id, revision, confidence_status,
+                        uncertainty_types_json, uncertainty_notes, retention_policy, is_hold, hold_reason,
+                        event_timestamp, valid_from, valid_until, created_at, updated_at,
+                        verified_at, superseded_at, archived_at, created_by, verified_by,
+                        superseded_by, archived_by, metadata_json
                     )
+                    SELECT
+                        memory_id, tenant_id, COALESCE(NULLIF(workspace_id, ''), 'workspace_default'), plant_id, asset_id, process_id, session_id,
+                        classification, memory_type, epistemic_status, lifecycle_status, verification_status,
+                        title, summary, content, tags_json, source_references_json, evidence_references_json,
+                        decision_reference, incident_reference, rca_reference, sop_reference, relationships_json,
+                        supersedes_memory_id, superseded_by_memory_id, revision, confidence_status,
+                        uncertainty_types_json, uncertainty_notes, retention_policy, is_hold, hold_reason,
+                        event_timestamp, valid_from, valid_until, created_at, updated_at,
+                        verified_at, superseded_at, archived_at, created_by, verified_by,
+                        superseded_by, archived_by, metadata_json
+                    FROM organizational_memory_entries
                 """)
 
-                conn.execute("""
-                    CREATE TABLE IF NOT EXISTS organizational_memory_relationships (
-                        tenant_id TEXT NOT NULL,
-                        source_memory_id TEXT NOT NULL,
-                        target_memory_id TEXT NOT NULL,
-                        relationship_type TEXT NOT NULL,
-                        description TEXT,
-                        created_at TEXT NOT NULL,
-                        created_by TEXT NOT NULL,
-                        PRIMARY KEY (tenant_id, source_memory_id, target_memory_id, relationship_type)
+                # 3. Verify exact record count preservation
+                new_count = conn.execute("SELECT COUNT(*) FROM organizational_memory_entries__v3_migration").fetchone()[0]
+                if new_count != old_count:
+                    raise RuntimeError(
+                        f"Migration aborted: row count mismatch. Expected {old_count}, got {new_count}."
                     )
-                """)
 
-                # Performance and workspace isolation indexes
+                # 4. Drop old table and rename migration table
+                conn.execute("DROP TABLE organizational_memory_entries")
+                conn.execute("ALTER TABLE organizational_memory_entries__v3_migration RENAME TO organizational_memory_entries")
+
+                # 5. Recreate indexes
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_tenant_ws ON organizational_memory_entries (tenant_id, workspace_id)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_tenant_ws_id ON organizational_memory_entries (tenant_id, workspace_id, memory_id)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_tenant_type ON organizational_memory_entries (tenant_id, workspace_id, memory_type)")
@@ -189,8 +335,28 @@ class OrganizationalMemoryRepository:
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_tenant_asset ON organizational_memory_entries (tenant_id, workspace_id, asset_id)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_tenant_incident ON organizational_memory_entries (tenant_id, workspace_id, incident_reference)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_tenant_decision ON organizational_memory_entries (tenant_id, workspace_id, decision_reference)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_audit_tenant_ws_mem ON organizational_memory_audit_ledger (tenant_id, workspace_id, memory_id)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_rel_target ON organizational_memory_relationships (tenant_id, target_memory_id)")
+
+            logger.info("Successfully migrated organizational_memory_entries schema to composite PK (rows: %d)", new_count)
+            return True
+        except Exception as exc:
+            try:
+                conn.execute("DROP TABLE IF EXISTS organizational_memory_entries__v3_migration")
+                conn.commit()
+            except Exception:
+                pass
+            logger.error("Failed to migrate organizational_memory_entries schema: %s", exc)
+            raise RuntimeError(f"Database schema migration failed: {exc}") from exc
+        finally:
+            if fk_enabled:
+                conn.execute("PRAGMA foreign_keys = ON")
+
+    def migrate_schema(self) -> bool:
+        """
+        Public entry point to check and perform schema migration if necessary.
+        """
+        with self._lock:
+            with self._get_connection() as conn:
+                return self._migrate_schema_if_needed(conn)
 
     # -------------------------------------------------------------------------
     # Helper: Serialize / Deserialize
@@ -473,6 +639,117 @@ class OrganizationalMemoryRepository:
             finally:
                 conn.close()
 
+    def supersede_entry_atomic(
+        self,
+        superseded_entry: OrganizationalMemoryEntry,
+        superseded_audit: MemoryAuditRecord,
+        replacement_entry: Optional[OrganizationalMemoryEntry] = None,
+        replacement_audit: Optional[MemoryAuditRecord] = None,
+    ) -> bool:
+        """
+        Atomically supersedes a memory entry in a single SQLite transaction:
+        1. Verifies existing target belongs to authoritative (tenant_id, workspace_id).
+        2. Verifies target's current lifecycle state permits supersession and is not under hold.
+        3. Inserts replacement entry, if requested.
+        4. Inserts replacement-created audit event, if replacement exists.
+        5. Updates original entry to SUPERSEDED.
+        6. Inserts original supersession audit event.
+        7. Commits only after all required operations succeed; rolls back all changes on any error.
+        """
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                with conn:
+                    # 1. Verify target exists and belongs to authoritative (tenant_id, workspace_id)
+                    cur = conn.execute(
+                        "SELECT lifecycle_status, is_hold FROM organizational_memory_entries WHERE tenant_id = ? AND workspace_id = ? AND memory_id = ?",
+                        (superseded_entry.tenant_id, superseded_entry.workspace_id, superseded_entry.memory_id),
+                    )
+                    row = cur.fetchone()
+                    if not row:
+                        raise KeyError(
+                            f"Memory entry '{superseded_entry.memory_id}' not found in workspace '{superseded_entry.workspace_id}'."
+                        )
+
+                    # 2. Verify lifecycle permits supersession and is not under active hold
+                    current_status = MemoryLifecycleStatus(row["lifecycle_status"])
+                    valid_targets = VALID_LIFECYCLE_TRANSITIONS.get(current_status, set())
+                    if MemoryLifecycleStatus.SUPERSEDED not in valid_targets:
+                        raise ValueError(
+                            f"Memory entry '{superseded_entry.memory_id}' in status '{current_status.value}' cannot be superseded."
+                        )
+                    if row["is_hold"]:
+                        raise ValueError(
+                            f"Memory entry '{superseded_entry.memory_id}' is under active hold and cannot be superseded."
+                        )
+
+                    # Validate tenant/workspace alignment if replacement exists
+                    if replacement_entry:
+                        if (
+                            replacement_entry.tenant_id != superseded_entry.tenant_id
+                            or replacement_entry.workspace_id != superseded_entry.workspace_id
+                        ):
+                            raise ValueError(
+                                "Replacement entry must belong to the same tenant_id and workspace_id as target entry."
+                            )
+                        if replacement_audit and (
+                            replacement_audit.tenant_id != superseded_entry.tenant_id
+                            or replacement_audit.workspace_id != superseded_entry.workspace_id
+                        ):
+                            raise ValueError(
+                                "Replacement audit must belong to the same tenant_id and workspace_id as target entry."
+                            )
+
+                        # 3. Insert replacement entry
+                        row_data_repl = self._entry_to_row(replacement_entry)
+                        conn.execute("""
+                            INSERT INTO organizational_memory_entries (
+                                memory_id, tenant_id, workspace_id, plant_id, asset_id, process_id, session_id,
+                                classification, memory_type, epistemic_status, lifecycle_status, verification_status,
+                                title, summary, content, tags_json, source_references_json, evidence_references_json,
+                                decision_reference, incident_reference, rca_reference, sop_reference, relationships_json,
+                                supersedes_memory_id, superseded_by_memory_id, revision, confidence_status,
+                                uncertainty_types_json, uncertainty_notes, retention_policy, is_hold, hold_reason,
+                                event_timestamp, valid_from, valid_until, created_at, updated_at,
+                                verified_at, superseded_at, archived_at, created_by, verified_by,
+                                superseded_by, archived_by, metadata_json
+                            ) VALUES (
+                                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                            )
+                        """, row_data_repl)
+
+                        # 4. Insert replacement-created audit event
+                        if replacement_audit:
+                            self._insert_audit_entry_conn(conn, replacement_audit)
+
+                    # 5. Update original entry to SUPERSEDED
+                    row_data_sup = self._entry_to_row(superseded_entry)
+                    upd_cur = conn.execute("""
+                        UPDATE organizational_memory_entries SET
+                            plant_id = ?, asset_id = ?, process_id = ?, session_id = ?,
+                            classification = ?, memory_type = ?, epistemic_status = ?, lifecycle_status = ?,
+                            verification_status = ?, title = ?, summary = ?, content = ?, tags_json = ?,
+                            source_references_json = ?, evidence_references_json = ?, decision_reference = ?,
+                            incident_reference = ?, rca_reference = ?, sop_reference = ?, relationships_json = ?,
+                            supersedes_memory_id = ?, superseded_by_memory_id = ?, revision = ?, confidence_status = ?,
+                            uncertainty_types_json = ?, uncertainty_notes = ?, retention_policy = ?, is_hold = ?,
+                            hold_reason = ?, event_timestamp = ?, valid_from = ?, valid_until = ?, created_at = ?,
+                            updated_at = ?, verified_at = ?, superseded_at = ?, archived_at = ?, created_by = ?,
+                            verified_by = ?, superseded_by = ?, archived_by = ?, metadata_json = ?
+                        WHERE tenant_id = ? AND workspace_id = ? AND memory_id = ?
+                    """, row_data_sup[3:] + (superseded_entry.tenant_id, superseded_entry.workspace_id, superseded_entry.memory_id))
+
+                    if upd_cur.rowcount == 0:
+                        raise RuntimeError(f"Failed to update original entry '{superseded_entry.memory_id}'.")
+
+                    # 6. Insert original supersession audit event
+                    self._insert_audit_entry_conn(conn, superseded_audit)
+
+                return True
+            finally:
+                conn.close()
+
     # -------------------------------------------------------------------------
     # Retrieval & Search
     # -------------------------------------------------------------------------
@@ -606,16 +883,31 @@ class OrganizationalMemoryRepository:
             clauses.append("tags_json LIKE ?")
             params.append(tag_pat)
 
+        # Classification ceiling filter applied before both counting and pagination
+        target_ceiling = max_classification or ClassificationLevel.RESTRICTED
+        max_rank = CLASSIFICATION_HIERARCHY.get(target_ceiling, 4)
+        allowed_classifications = [
+            lvl.value
+            for lvl, rank in CLASSIFICATION_HIERARCHY.items()
+            if rank <= max_rank
+        ]
+        if not allowed_classifications:
+            return [], 0
+
+        placeholders_cls = ",".join("?" for _ in allowed_classifications)
+        clauses.append(f"classification IN ({placeholders_cls})")
+        params.extend(allowed_classifications)
+
         where_clause = " AND ".join(clauses)
 
         with self._lock:
             with self._get_connection() as conn:
-                # Count total matches
+                # Count total matches within authorized classification ceiling
                 count_query = f"SELECT COUNT(*) as cnt FROM organizational_memory_entries WHERE {where_clause}"
                 cur = conn.execute(count_query, params)
                 total_cnt = cur.fetchone()["cnt"]
 
-                # Fetch bounded window
+                # Fetch bounded window within authorized classification ceiling
                 fetch_query = f"""
                     SELECT * FROM organizational_memory_entries
                     WHERE {where_clause}
@@ -625,17 +917,7 @@ class OrganizationalMemoryRepository:
                 cur = conn.execute(fetch_query, params + [search_req.limit, search_req.offset])
                 rows = cur.fetchall()
 
-                entries: List[OrganizationalMemoryEntry] = []
-                max_rank = CLASSIFICATION_HIERARCHY.get(
-                    max_classification or ClassificationLevel.RESTRICTED, 4
-                )
-
-                for r in rows:
-                    entry = self._row_to_entry(r)
-                    entry_rank = CLASSIFICATION_HIERARCHY.get(entry.classification, 4)
-                    if entry_rank <= max_rank:
-                        entries.append(entry)
-
+                entries: List[OrganizationalMemoryEntry] = [self._row_to_entry(r) for r in rows]
                 return entries, total_cnt
 
     # -------------------------------------------------------------------------
