@@ -1274,19 +1274,21 @@ class TestPrompt35AServerAuthoritativeOutcomeStatus:
             assigned_plants=["*"],
         )
         app.dependency_overrides[get_current_identity] = lambda: mgr
-
-        # Client attempting to set status directly to VALIDATED
-        payload = {
-            "title": "Bypass Test",
-            "description": "Trying to bypass draft state",
-            "mission_type": "INVESTIGATION",
-            "objective": "Verify status is server authoritative",
-            "plant_id": "plant_01",
-            "origin_reason": "Test",
-            "status": "VALIDATED",
-        }
-        res = client.post("/api/v3/missions", json=payload)
-        assert res.status_code == 422, f"Extra status field must be rejected with 422, got {res.status_code}"
+        try:
+            # Client attempting to set status directly to VALIDATED
+            payload = {
+                "title": "Bypass Test",
+                "description": "Trying to bypass draft state",
+                "mission_type": "INVESTIGATION",
+                "objective": "Verify status is server authoritative",
+                "plant_id": "plant_01",
+                "origin_reason": "Test",
+                "status": "VALIDATED",
+            }
+            res = client.post("/api/v3/missions", json=payload)
+            assert res.status_code == 422, f"Extra status field must be rejected with 422, got {res.status_code}"
+        finally:
+            app.dependency_overrides.clear()
 
 
 class TestPrompt35AResourceReferenceValidation:
