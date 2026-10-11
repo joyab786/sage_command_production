@@ -228,6 +228,19 @@ class OrganizationalMemoryRepository:
             pk_cols, target_pk,
         )
 
+        # Fail-closed check: verify all existing records have valid, non-null, non-empty workspace_id
+        invalid_ws_count = conn.execute(
+            "SELECT COUNT(*) FROM organizational_memory_entries WHERE workspace_id IS NULL OR trim(workspace_id) = ''"
+        ).fetchone()[0]
+        if invalid_ws_count > 0:
+            err_msg = (
+                f"Migration aborted: detected {invalid_ws_count} record(s) with null or empty workspace_id. "
+                "Authoritative workspace ownership must be explicitly assigned via administrative remediation "
+                "before schema migration can proceed (fail-closed; synthetic workspace assignment is disallowed)."
+            )
+            logger.error(err_msg)
+            raise RuntimeError(err_msg)
+
         fk_cur = conn.execute("PRAGMA foreign_keys")
         fk_enabled = bool(fk_cur.fetchone()[0])
         if fk_enabled:
@@ -303,7 +316,7 @@ class OrganizationalMemoryRepository:
                         superseded_by, archived_by, metadata_json
                     )
                     SELECT
-                        memory_id, tenant_id, COALESCE(NULLIF(workspace_id, ''), 'workspace_default'), plant_id, asset_id, process_id, session_id,
+                        memory_id, tenant_id, workspace_id, plant_id, asset_id, process_id, session_id,
                         classification, memory_type, epistemic_status, lifecycle_status, verification_status,
                         title, summary, content, tags_json, source_references_json, evidence_references_json,
                         decision_reference, incident_reference, rca_reference, sop_reference, relationships_json,
@@ -648,14 +661,86 @@ class OrganizationalMemoryRepository:
     ) -> bool:
         """
         Atomically supersedes a memory entry in a single SQLite transaction:
-        1. Verifies existing target belongs to authoritative (tenant_id, workspace_id).
-        2. Verifies target's current lifecycle state permits supersession and is not under hold.
-        3. Inserts replacement entry, if requested.
-        4. Inserts replacement-created audit event, if replacement exists.
-        5. Updates original entry to SUPERSEDED.
-        6. Inserts original supersession audit event.
-        7. Commits only after all required operations succeed; rolls back all changes on any error.
+        1. Validates superseded_audit matches superseded_entry identities and event type.
+        2. Validates replacement_audit is provided if replacement_entry is provided,
+           and matches replacement_entry identities and event type.
+        3. Verifies existing target belongs to authoritative (tenant_id, workspace_id).
+        4. Verifies target's current lifecycle state permits supersession and is not under hold.
+        5. Inserts replacement entry, if requested.
+        6. Inserts replacement-created audit event, if replacement exists.
+        7. Updates original entry to SUPERSEDED.
+        8. Inserts original supersession audit event.
+        9. Commits only after all required operations succeed; rolls back all changes on any error.
         """
+        # Validate superseded_audit pairing
+        if superseded_audit is None:
+            raise ValueError("Target supersession audit record is mandatory.")
+        if superseded_audit.tenant_id != superseded_entry.tenant_id:
+            raise ValueError(
+                f"Target audit tenant_id '{superseded_audit.tenant_id}' does not match "
+                f"superseded entry tenant_id '{superseded_entry.tenant_id}'."
+            )
+        if superseded_audit.workspace_id != superseded_entry.workspace_id:
+            raise ValueError(
+                f"Target audit workspace_id '{superseded_audit.workspace_id}' does not match "
+                f"superseded entry workspace_id '{superseded_entry.workspace_id}'."
+            )
+        if superseded_audit.memory_id != superseded_entry.memory_id:
+            raise ValueError(
+                f"Target audit memory_id '{superseded_audit.memory_id}' does not match "
+                f"superseded entry memory_id '{superseded_entry.memory_id}'."
+            )
+        if superseded_audit.plant_id != superseded_entry.plant_id:
+            raise ValueError(
+                f"Target audit plant_id '{superseded_audit.plant_id}' does not match "
+                f"superseded entry plant_id '{superseded_entry.plant_id}'."
+            )
+        if superseded_audit.event_type != "ORGANIZATIONAL_MEMORY_SUPERSEDED":
+            raise ValueError(
+                f"Target audit event_type must be 'ORGANIZATIONAL_MEMORY_SUPERSEDED', got '{superseded_audit.event_type}'."
+            )
+
+        # Validate replacement_entry & replacement_audit pairing
+        if replacement_entry is not None:
+            if replacement_audit is None:
+                raise ValueError("Replacement audit record is mandatory when a replacement entry is provided.")
+            if replacement_entry.tenant_id != superseded_entry.tenant_id:
+                raise ValueError(
+                    f"Replacement entry tenant_id '{replacement_entry.tenant_id}' must match "
+                    f"superseded entry tenant_id '{superseded_entry.tenant_id}'."
+                )
+            if replacement_entry.workspace_id != superseded_entry.workspace_id:
+                raise ValueError(
+                    f"Replacement entry workspace_id '{replacement_entry.workspace_id}' must match "
+                    f"superseded entry workspace_id '{superseded_entry.workspace_id}'."
+                )
+            if replacement_audit.tenant_id != replacement_entry.tenant_id:
+                raise ValueError(
+                    f"Replacement audit tenant_id '{replacement_audit.tenant_id}' does not match "
+                    f"replacement entry tenant_id '{replacement_entry.tenant_id}'."
+                )
+            if replacement_audit.workspace_id != replacement_entry.workspace_id:
+                raise ValueError(
+                    f"Replacement audit workspace_id '{replacement_audit.workspace_id}' does not match "
+                    f"replacement entry workspace_id '{replacement_entry.workspace_id}'."
+                )
+            if replacement_audit.memory_id != replacement_entry.memory_id:
+                raise ValueError(
+                    f"Replacement audit memory_id '{replacement_audit.memory_id}' does not match "
+                    f"replacement entry memory_id '{replacement_entry.memory_id}'."
+                )
+            if replacement_audit.plant_id != replacement_entry.plant_id:
+                raise ValueError(
+                    f"Replacement audit plant_id '{replacement_audit.plant_id}' does not match "
+                    f"replacement entry plant_id '{replacement_entry.plant_id}'."
+                )
+            if replacement_audit.event_type != "ORGANIZATIONAL_MEMORY_CREATED":
+                raise ValueError(
+                    f"Replacement audit event_type must be 'ORGANIZATIONAL_MEMORY_CREATED', got '{replacement_audit.event_type}'."
+                )
+        elif replacement_audit is not None:
+            raise ValueError("Replacement audit cannot be provided without a replacement entry.")
+
         with self._lock:
             conn = self._get_connection()
             try:
@@ -683,24 +768,8 @@ class OrganizationalMemoryRepository:
                             f"Memory entry '{superseded_entry.memory_id}' is under active hold and cannot be superseded."
                         )
 
-                    # Validate tenant/workspace alignment if replacement exists
+                    # 3. Insert replacement entry & audit if replacement exists
                     if replacement_entry:
-                        if (
-                            replacement_entry.tenant_id != superseded_entry.tenant_id
-                            or replacement_entry.workspace_id != superseded_entry.workspace_id
-                        ):
-                            raise ValueError(
-                                "Replacement entry must belong to the same tenant_id and workspace_id as target entry."
-                            )
-                        if replacement_audit and (
-                            replacement_audit.tenant_id != superseded_entry.tenant_id
-                            or replacement_audit.workspace_id != superseded_entry.workspace_id
-                        ):
-                            raise ValueError(
-                                "Replacement audit must belong to the same tenant_id and workspace_id as target entry."
-                            )
-
-                        # 3. Insert replacement entry
                         row_data_repl = self._entry_to_row(replacement_entry)
                         conn.execute("""
                             INSERT INTO organizational_memory_entries (
@@ -719,11 +788,9 @@ class OrganizationalMemoryRepository:
                             )
                         """, row_data_repl)
 
-                        # 4. Insert replacement-created audit event
-                        if replacement_audit:
-                            self._insert_audit_entry_conn(conn, replacement_audit)
+                        self._insert_audit_entry_conn(conn, replacement_audit)
 
-                    # 5. Update original entry to SUPERSEDED
+                    # 4. Update original entry to SUPERSEDED
                     row_data_sup = self._entry_to_row(superseded_entry)
                     upd_cur = conn.execute("""
                         UPDATE organizational_memory_entries SET
@@ -743,7 +810,7 @@ class OrganizationalMemoryRepository:
                     if upd_cur.rowcount == 0:
                         raise RuntimeError(f"Failed to update original entry '{superseded_entry.memory_id}'.")
 
-                    # 6. Insert original supersession audit event
+                    # 5. Insert original supersession audit event
                     self._insert_audit_entry_conn(conn, superseded_audit)
 
                 return True

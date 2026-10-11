@@ -2732,3 +2732,714 @@ class TestPrompt34BRegressionAtomicSupersessionClassificationSearchMigration:
         check_conn.close()
 
 
+class TestPrompt34CFailClosedMigrationAndMandatorySupersessionAuditing:
+    """
+    Prompt 34C Regression Suite:
+    1. Fail-closed migration without synthetic workspace assignment.
+    2. Mandatory audit pairing and identity validation for supersession.
+    """
+
+    def test_valid_workspace_ids_survive_migration_unchanged(self, tmp_path):
+        """
+        Valid, existing workspace IDs must survive migration exactly as authored,
+        without being overwritten, corrupted, or replaced with synthetic defaults.
+        """
+        db_path = str(tmp_path / "valid_ws_mig.sqlite")
+        conn = sqlite3.connect(db_path)
+        conn.execute("""
+            CREATE TABLE organizational_memory_entries (
+                memory_id TEXT NOT NULL,
+                tenant_id TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
+                plant_id TEXT NOT NULL,
+                asset_id TEXT,
+                process_id TEXT,
+                session_id TEXT,
+                classification TEXT NOT NULL,
+                memory_type TEXT NOT NULL,
+                epistemic_status TEXT NOT NULL,
+                lifecycle_status TEXT NOT NULL,
+                verification_status TEXT NOT NULL,
+                title TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                content TEXT NOT NULL,
+                tags_json TEXT NOT NULL,
+                source_references_json TEXT NOT NULL,
+                evidence_references_json TEXT NOT NULL,
+                decision_reference TEXT,
+                incident_reference TEXT,
+                rca_reference TEXT,
+                sop_reference TEXT,
+                relationships_json TEXT NOT NULL,
+                supersedes_memory_id TEXT,
+                superseded_by_memory_id TEXT,
+                revision INTEGER NOT NULL DEFAULT 1,
+                confidence_status TEXT NOT NULL,
+                uncertainty_types_json TEXT NOT NULL,
+                uncertainty_notes TEXT,
+                retention_policy TEXT NOT NULL,
+                is_hold INTEGER NOT NULL DEFAULT 0,
+                hold_reason TEXT,
+                event_timestamp TEXT,
+                valid_from TEXT,
+                valid_until TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                verified_at TEXT,
+                superseded_at TEXT,
+                archived_at TEXT,
+                created_by TEXT NOT NULL,
+                verified_by TEXT,
+                superseded_by TEXT,
+                archived_by TEXT,
+                metadata_json TEXT NOT NULL,
+                PRIMARY KEY (tenant_id, memory_id)
+            )
+        """)
+        now_iso = datetime.now(timezone.utc).isoformat()
+        # Insert records across two distinct explicit workspaces
+        test_rows = [
+            ("mem_1", "ws_production_alpha", "Plant Alpha Lesson"),
+            ("mem_2", "ws_engineering_beta", "Plant Beta Investigation"),
+        ]
+        for m_id, ws_id, title in test_rows:
+            conn.execute("""
+                INSERT INTO organizational_memory_entries (
+                    memory_id, tenant_id, workspace_id, plant_id, asset_id, process_id, session_id,
+                    classification, memory_type, epistemic_status, lifecycle_status, verification_status,
+                    title, summary, content, tags_json, source_references_json, evidence_references_json,
+                    decision_reference, incident_reference, rca_reference, sop_reference, relationships_json,
+                    supersedes_memory_id, superseded_by_memory_id, revision, confidence_status,
+                    uncertainty_types_json, uncertainty_notes, retention_policy, is_hold, hold_reason,
+                    event_timestamp, valid_from, valid_until, created_at, updated_at,
+                    verified_at, superseded_at, archived_at, created_by, verified_by,
+                    superseded_by, archived_by, metadata_json
+                ) VALUES (
+                    ?, 'tenant_alpha', ?, 'plant_01', NULL, NULL, NULL,
+                    'INTERNAL', 'LESSON_LEARNED', 'REPORTED_CLAIM', 'ACTIVE', 'VERIFIED',
+                    ?, 'Summary', 'Content', '[]', '[]', '[]',
+                    NULL, NULL, NULL, NULL, '[]',
+                    NULL, NULL, 1, 'HIGH_CONFIDENCE',
+                    '[]', NULL, 'STANDARD_7_YEARS', 0, NULL,
+                    ?, ?, ?, ?, ?,
+                    ?, NULL, NULL, 'user_01', 'user_01',
+                    NULL, NULL, '{}'
+                )
+            """, (m_id, ws_id, title, now_iso, now_iso, now_iso, now_iso, now_iso, now_iso))
+        conn.commit()
+        conn.close()
+
+        # Run migration via repository
+        repo = OrganizationalMemoryRepository(db_path=db_path)
+        with repo._get_connection() as c:
+            # Verify primary key is now composite (tenant_id, workspace_id, memory_id)
+            info = c.execute("PRAGMA table_info(organizational_memory_entries)").fetchall()
+            pk_cols = [r[1] for r in sorted([r for r in info if r[5] > 0], key=lambda x: x[5])]
+            assert pk_cols == ["tenant_id", "workspace_id", "memory_id"]
+
+            # Verify both workspace IDs survived exactly without alteration
+            rows = c.execute("SELECT memory_id, workspace_id FROM organizational_memory_entries ORDER BY memory_id").fetchall()
+            assert len(rows) == 2
+            assert rows[0][0] == "mem_1" and rows[0][1] == "ws_production_alpha"
+            assert rows[1][0] == "mem_2" and rows[1][1] == "ws_engineering_beta"
+
+            # Verify no 'workspace_default' exists
+            default_count = c.execute("SELECT COUNT(*) FROM organizational_memory_entries WHERE workspace_id = 'workspace_default'").fetchone()[0]
+            assert default_count == 0
+
+    def test_null_or_empty_workspace_causes_safe_migration_failure(self, tmp_path):
+        """
+        If a legacy table contains null or empty workspace IDs, migration must abort
+        fail-closed, raise RuntimeError, and leave the original table and data completely intact.
+        No synthetic 'workspace_default' assignment may occur.
+        """
+        db_path = str(tmp_path / "null_ws_fail.sqlite")
+        conn = sqlite3.connect(db_path)
+        conn.execute("""
+            CREATE TABLE organizational_memory_entries (
+                memory_id TEXT NOT NULL,
+                tenant_id TEXT NOT NULL,
+                workspace_id TEXT,
+                plant_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                PRIMARY KEY (tenant_id, memory_id)
+            )
+        """)
+        conn.execute("INSERT INTO organizational_memory_entries VALUES ('mem_valid', 't_1', 'ws_valid', 'p_1', 'Valid Entry')")
+        conn.execute("INSERT INTO organizational_memory_entries VALUES ('mem_null', 't_1', NULL, 'p_1', 'Null WS Entry')")
+        conn.execute("INSERT INTO organizational_memory_entries VALUES ('mem_empty', 't_1', '   ', 'p_1', 'Empty WS Entry')")
+        conn.commit()
+        conn.close()
+
+        # Attempting to open with OrganizationalMemoryRepository must trigger migration and fail closed
+        with pytest.raises(RuntimeError, match="detected 2 record\\(s\\) with null or empty workspace_id"):
+            OrganizationalMemoryRepository(db_path=db_path)
+
+        # Verify live database is completely intact with original table and unchanged records
+        conn_check = sqlite3.connect(db_path)
+        tables = [r[0] for r in conn_check.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+        assert "organizational_memory_entries" in tables
+        assert "organizational_memory_entries__v3_migration" not in tables
+
+        info = conn_check.execute("PRAGMA table_info(organizational_memory_entries)").fetchall()
+        pk_cols = [r[1] for r in sorted([r for r in info if r[5] > 0], key=lambda x: x[5])]
+        # PK remains the original unmigrated PK
+        assert pk_cols == ["tenant_id", "memory_id"]
+
+        rows = conn_check.execute("SELECT memory_id, workspace_id FROM organizational_memory_entries ORDER BY memory_id").fetchall()
+        assert len(rows) == 3
+        row_dict = {r[0]: r[1] for r in rows}
+        assert row_dict["mem_valid"] == "ws_valid"
+        assert row_dict["mem_null"] is None
+        assert row_dict["mem_empty"] == "   "
+
+        # Verify no workspace_default was written
+        ws_default_rows = conn_check.execute("SELECT COUNT(*) FROM organizational_memory_entries WHERE workspace_id = 'workspace_default'").fetchone()[0]
+        assert ws_default_rows == 0
+        conn_check.close()
+
+    def test_corrected_legacy_dataset_migrates_successfully(self, tmp_path):
+        """
+        After administrator remediation assigns valid workspace IDs to legacy rows,
+        re-running schema migration must succeed cleanly and upgrade the primary key.
+        """
+        db_path = str(tmp_path / "remediated_ws.sqlite")
+        conn = sqlite3.connect(db_path)
+        now_iso = datetime.now(timezone.utc).isoformat()
+        conn.execute("""
+            CREATE TABLE organizational_memory_entries (
+                memory_id TEXT NOT NULL,
+                tenant_id TEXT NOT NULL,
+                workspace_id TEXT,
+                plant_id TEXT NOT NULL,
+                asset_id TEXT,
+                process_id TEXT,
+                session_id TEXT,
+                classification TEXT NOT NULL,
+                memory_type TEXT NOT NULL,
+                epistemic_status TEXT NOT NULL,
+                lifecycle_status TEXT NOT NULL,
+                verification_status TEXT NOT NULL,
+                title TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                content TEXT NOT NULL,
+                tags_json TEXT NOT NULL,
+                source_references_json TEXT NOT NULL,
+                evidence_references_json TEXT NOT NULL,
+                decision_reference TEXT,
+                incident_reference TEXT,
+                rca_reference TEXT,
+                sop_reference TEXT,
+                relationships_json TEXT NOT NULL,
+                supersedes_memory_id TEXT,
+                superseded_by_memory_id TEXT,
+                revision INTEGER NOT NULL DEFAULT 1,
+                confidence_status TEXT NOT NULL,
+                uncertainty_types_json TEXT NOT NULL,
+                uncertainty_notes TEXT,
+                retention_policy TEXT NOT NULL,
+                is_hold INTEGER NOT NULL DEFAULT 0,
+                hold_reason TEXT,
+                event_timestamp TEXT,
+                valid_from TEXT,
+                valid_until TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                verified_at TEXT,
+                superseded_at TEXT,
+                archived_at TEXT,
+                created_by TEXT NOT NULL,
+                verified_by TEXT,
+                superseded_by TEXT,
+                archived_by TEXT,
+                metadata_json TEXT NOT NULL,
+                PRIMARY KEY (tenant_id, memory_id)
+            )
+        """)
+        conn.execute("""
+            INSERT INTO organizational_memory_entries (
+                memory_id, tenant_id, workspace_id, plant_id, asset_id, process_id, session_id,
+                classification, memory_type, epistemic_status, lifecycle_status, verification_status,
+                title, summary, content, tags_json, source_references_json, evidence_references_json,
+                decision_reference, incident_reference, rca_reference, sop_reference, relationships_json,
+                supersedes_memory_id, superseded_by_memory_id, revision, confidence_status,
+                uncertainty_types_json, uncertainty_notes, retention_policy, is_hold, hold_reason,
+                event_timestamp, valid_from, valid_until, created_at, updated_at,
+                verified_at, superseded_at, archived_at, created_by, verified_by,
+                superseded_by, archived_by, metadata_json
+            ) VALUES (
+                'mem_rem_1', 'tenant_alpha', NULL, 'plant_01', NULL, NULL, NULL,
+                'INTERNAL', 'LESSON_LEARNED', 'REPORTED_CLAIM', 'ACTIVE', 'VERIFIED',
+                'Legacy Row', 'Summary', 'Content', '[]', '[]', '[]',
+                NULL, NULL, NULL, NULL, '[]',
+                NULL, NULL, 1, 'HIGH_CONFIDENCE',
+                '[]', NULL, 'STANDARD_7_YEARS', 0, NULL,
+                ?, ?, ?, ?, ?,
+                ?, NULL, NULL, 'user_01', 'user_01',
+                NULL, NULL, '{}'
+            )
+        """, (now_iso, now_iso, now_iso, now_iso, now_iso, now_iso))
+        conn.commit()
+
+        # Step 1: Migration fails closed
+        repo_fail = OrganizationalMemoryRepository.__new__(OrganizationalMemoryRepository)
+        repo_fail.db_path = db_path
+        repo_fail._lock = threading.Lock()
+        with pytest.raises(RuntimeError, match="detected 1 record\\(s\\) with null or empty workspace_id"):
+            repo_fail._migrate_schema_if_needed(conn)
+
+        # Step 2: Administrative remediation assigns authoritative workspace_id
+        conn.execute("UPDATE organizational_memory_entries SET workspace_id = 'ws_remediated' WHERE memory_id = 'mem_rem_1'")
+        conn.commit()
+
+        # Step 3: Migration now succeeds
+        migrated = repo_fail._migrate_schema_if_needed(conn)
+        assert migrated is True
+        conn.close()
+
+        # Step 4: Verify composite primary key and preserved data
+        repo_success = OrganizationalMemoryRepository(db_path=db_path)
+        with repo_success._get_connection() as c:
+            info = c.execute("PRAGMA table_info(organizational_memory_entries)").fetchall()
+            pk_cols = [r[1] for r in sorted([r for r in info if r[5] > 0], key=lambda x: x[5])]
+            assert pk_cols == ["tenant_id", "workspace_id", "memory_id"]
+
+            row = c.execute("SELECT memory_id, workspace_id FROM organizational_memory_entries WHERE memory_id = 'mem_rem_1'").fetchone()
+            assert row["workspace_id"] == "ws_remediated"
+
+        # Step 5: Repeat migration is safe and idempotent
+        assert repo_success.migrate_schema() is False
+
+    def test_supersession_missing_replacement_audit_rejected(
+        self, in_memory_repo, memory_service, operator_identity, manager_identity
+    ):
+        """
+        When a replacement entry is provided, supersede_entry_atomic must reject execution
+        if replacement_audit is None.
+        """
+        draft = memory_service.create_draft(
+            MemoryDraftCreateRequest(
+                memory_type=MemoryType.LESSON_LEARNED,
+                title="Target for Missing Audit Test",
+                summary="Summary",
+                content="Content",
+                plant_id="plant_01",
+            ),
+            operator_identity,
+        )
+        memory_service.submit_for_review(draft.memory_id, operator_identity)
+        target = memory_service.verify_entry(
+            draft.memory_id,
+            MemoryVerifyRequest(activate_immediately=True),
+            manager_identity,
+        )
+
+        now = datetime.now(timezone.utc)
+        target_audit = MemoryAuditRecord(
+            audit_id="aud_sup_miss",
+            tenant_id=target.tenant_id,
+            workspace_id=target.workspace_id,
+            plant_id=target.plant_id,
+            memory_id=target.memory_id,
+            event_type="ORGANIZATIONAL_MEMORY_SUPERSEDED",
+            actor_id="user_c4",
+            timestamp=now,
+            outcome="SUCCESS",
+        )
+
+        repl_entry = target.model_copy(update={
+            "memory_id": "mem_repl_missing_aud",
+            "title": "Replacement with No Audit",
+            "supersedes_memory_id": target.memory_id,
+        })
+
+        # Calling supersede_entry_atomic with replacement_entry but replacement_audit=None
+        with pytest.raises(ValueError, match="Replacement audit record is mandatory"):
+            in_memory_repo.supersede_entry_atomic(
+                superseded_entry=target,
+                superseded_audit=target_audit,
+                replacement_entry=repl_entry,
+                replacement_audit=None,
+            )
+
+        # Verify original entry remains ACTIVE
+        check_target = in_memory_repo.get_entry(target.tenant_id, target.workspace_id, target.memory_id)
+        assert check_target.lifecycle_status == MemoryLifecycleStatus.ACTIVE
+        assert check_target.superseded_by_memory_id is None
+
+        # Verify replacement was never inserted
+        check_repl = in_memory_repo.get_entry(target.tenant_id, target.workspace_id, "mem_repl_missing_aud")
+        assert check_repl is None
+
+    def test_supersession_mismatched_workspace_rejected(
+        self, in_memory_repo, memory_service, operator_identity, manager_identity
+    ):
+        """
+        supersede_entry_atomic must reject mismatched workspace between replacement entry and audit,
+        or between target entry and target audit.
+        """
+        draft = memory_service.create_draft(
+            MemoryDraftCreateRequest(
+                memory_type=MemoryType.LESSON_LEARNED,
+                title="Target for Mismatched WS Audit Test",
+                summary="Summary",
+                content="Content",
+                plant_id="plant_01",
+            ),
+            operator_identity,
+        )
+        memory_service.submit_for_review(draft.memory_id, operator_identity)
+        target = memory_service.verify_entry(
+            draft.memory_id,
+            MemoryVerifyRequest(activate_immediately=True),
+            manager_identity,
+        )
+
+        now = datetime.now(timezone.utc)
+        target_audit = MemoryAuditRecord(
+            audit_id="aud_sup_ws",
+            tenant_id=target.tenant_id,
+            workspace_id=target.workspace_id,
+            plant_id=target.plant_id,
+            memory_id=target.memory_id,
+            event_type="ORGANIZATIONAL_MEMORY_SUPERSEDED",
+            actor_id="user_c4",
+            timestamp=now,
+            outcome="SUCCESS",
+        )
+
+        repl_entry = target.model_copy(update={
+            "memory_id": "mem_repl_ws_mismatch",
+            "title": "Replacement",
+            "supersedes_memory_id": target.memory_id,
+        })
+
+        # Mismatched workspace on replacement audit
+        mismatched_repl_audit = MemoryAuditRecord(
+            audit_id="aud_repl_ws_mismatch",
+            tenant_id=target.tenant_id,
+            workspace_id="workspace_bravo",  # Mismatched!
+            plant_id=target.plant_id,
+            memory_id=repl_entry.memory_id,
+            event_type="ORGANIZATIONAL_MEMORY_CREATED",
+            actor_id="user_c4",
+            timestamp=now,
+            outcome="SUCCESS",
+        )
+
+        with pytest.raises(ValueError, match="Replacement audit workspace_id .* does not match"):
+            in_memory_repo.supersede_entry_atomic(
+                superseded_entry=target,
+                superseded_audit=target_audit,
+                replacement_entry=repl_entry,
+                replacement_audit=mismatched_repl_audit,
+            )
+
+        # Mismatched workspace on target audit
+        mismatched_target_audit = MemoryAuditRecord(
+            audit_id="aud_tgt_ws_mismatch",
+            tenant_id=target.tenant_id,
+            workspace_id="workspace_bravo",  # Mismatched!
+            plant_id=target.plant_id,
+            memory_id=target.memory_id,
+            event_type="ORGANIZATIONAL_MEMORY_SUPERSEDED",
+            actor_id="user_c4",
+            timestamp=now,
+            outcome="SUCCESS",
+        )
+        valid_repl_audit = MemoryAuditRecord(
+            audit_id="aud_repl_ws_valid",
+            tenant_id=target.tenant_id,
+            workspace_id=target.workspace_id,
+            plant_id=target.plant_id,
+            memory_id=repl_entry.memory_id,
+            event_type="ORGANIZATIONAL_MEMORY_CREATED",
+            actor_id="user_c4",
+            timestamp=now,
+            outcome="SUCCESS",
+        )
+
+        with pytest.raises(ValueError, match="Target audit workspace_id .* does not match"):
+            in_memory_repo.supersede_entry_atomic(
+                superseded_entry=target,
+                superseded_audit=mismatched_target_audit,
+                replacement_entry=repl_entry,
+                replacement_audit=valid_repl_audit,
+            )
+
+        # Verify target is still ACTIVE and no partial replacement persists
+        check_target = in_memory_repo.get_entry(target.tenant_id, target.workspace_id, target.memory_id)
+        assert check_target.lifecycle_status == MemoryLifecycleStatus.ACTIVE
+        assert in_memory_repo.get_entry(target.tenant_id, target.workspace_id, "mem_repl_ws_mismatch") is None
+
+    def test_supersession_mismatched_memory_id_rejected(
+        self, in_memory_repo, memory_service, operator_identity, manager_identity
+    ):
+        """
+        supersede_entry_atomic must reject mismatched memory_id between replacement entry and audit,
+        or between target entry and target audit.
+        """
+        draft = memory_service.create_draft(
+            MemoryDraftCreateRequest(
+                memory_type=MemoryType.LESSON_LEARNED,
+                title="Target for Mismatched ID Audit Test",
+                summary="Summary",
+                content="Content",
+                plant_id="plant_01",
+            ),
+            operator_identity,
+        )
+        memory_service.submit_for_review(draft.memory_id, operator_identity)
+        target = memory_service.verify_entry(
+            draft.memory_id,
+            MemoryVerifyRequest(activate_immediately=True),
+            manager_identity,
+        )
+
+        now = datetime.now(timezone.utc)
+        target_audit = MemoryAuditRecord(
+            audit_id="aud_sup_id",
+            tenant_id=target.tenant_id,
+            workspace_id=target.workspace_id,
+            plant_id=target.plant_id,
+            memory_id=target.memory_id,
+            event_type="ORGANIZATIONAL_MEMORY_SUPERSEDED",
+            actor_id="user_c4",
+            timestamp=now,
+            outcome="SUCCESS",
+        )
+
+        repl_entry = target.model_copy(update={
+            "memory_id": "mem_repl_id_target",
+            "title": "Replacement",
+            "supersedes_memory_id": target.memory_id,
+        })
+
+        # Mismatched memory_id on replacement audit
+        mismatched_repl_audit = MemoryAuditRecord(
+            audit_id="aud_repl_id_mismatch",
+            tenant_id=target.tenant_id,
+            workspace_id=target.workspace_id,
+            plant_id=target.plant_id,
+            memory_id="mem_wrong_replacement_id",  # Mismatched!
+            event_type="ORGANIZATIONAL_MEMORY_CREATED",
+            actor_id="user_c4",
+            timestamp=now,
+            outcome="SUCCESS",
+        )
+
+        with pytest.raises(ValueError, match="Replacement audit memory_id .* does not match"):
+            in_memory_repo.supersede_entry_atomic(
+                superseded_entry=target,
+                superseded_audit=target_audit,
+                replacement_entry=repl_entry,
+                replacement_audit=mismatched_repl_audit,
+            )
+
+        # Mismatched memory_id on target audit
+        mismatched_target_audit = MemoryAuditRecord(
+            audit_id="aud_tgt_id_mismatch",
+            tenant_id=target.tenant_id,
+            workspace_id=target.workspace_id,
+            plant_id=target.plant_id,
+            memory_id="mem_wrong_target_id",  # Mismatched!
+            event_type="ORGANIZATIONAL_MEMORY_SUPERSEDED",
+            actor_id="user_c4",
+            timestamp=now,
+            outcome="SUCCESS",
+        )
+        valid_repl_audit = MemoryAuditRecord(
+            audit_id="aud_repl_id_valid",
+            tenant_id=target.tenant_id,
+            workspace_id=target.workspace_id,
+            plant_id=target.plant_id,
+            memory_id=repl_entry.memory_id,
+            event_type="ORGANIZATIONAL_MEMORY_CREATED",
+            actor_id="user_c4",
+            timestamp=now,
+            outcome="SUCCESS",
+        )
+
+        with pytest.raises(ValueError, match="Target audit memory_id .* does not match"):
+            in_memory_repo.supersede_entry_atomic(
+                superseded_entry=target,
+                superseded_audit=mismatched_target_audit,
+                replacement_entry=repl_entry,
+                replacement_audit=valid_repl_audit,
+            )
+
+        # Verify original intact
+        check_target = in_memory_repo.get_entry(target.tenant_id, target.workspace_id, target.memory_id)
+        assert check_target.lifecycle_status == MemoryLifecycleStatus.ACTIVE
+
+    def test_supersession_incorrect_event_type_rejected(
+        self, in_memory_repo, memory_service, operator_identity, manager_identity
+    ):
+        """
+        supersede_entry_atomic must reject incorrect event_type for both replacement and target audits.
+        """
+        draft = memory_service.create_draft(
+            MemoryDraftCreateRequest(
+                memory_type=MemoryType.LESSON_LEARNED,
+                title="Target for Incorrect Event Type Test",
+                summary="Summary",
+                content="Content",
+                plant_id="plant_01",
+            ),
+            operator_identity,
+        )
+        memory_service.submit_for_review(draft.memory_id, operator_identity)
+        target = memory_service.verify_entry(
+            draft.memory_id,
+            MemoryVerifyRequest(activate_immediately=True),
+            manager_identity,
+        )
+
+        now = datetime.now(timezone.utc)
+        target_audit = MemoryAuditRecord(
+            audit_id="aud_sup_evt",
+            tenant_id=target.tenant_id,
+            workspace_id=target.workspace_id,
+            plant_id=target.plant_id,
+            memory_id=target.memory_id,
+            event_type="ORGANIZATIONAL_MEMORY_SUPERSEDED",
+            actor_id="user_c4",
+            timestamp=now,
+            outcome="SUCCESS",
+        )
+
+        repl_entry = target.model_copy(update={
+            "memory_id": "mem_repl_evt_test",
+            "title": "Replacement",
+            "supersedes_memory_id": target.memory_id,
+        })
+
+        # Incorrect event_type for replacement audit
+        wrong_repl_audit = MemoryAuditRecord(
+            audit_id="aud_repl_evt_wrong",
+            tenant_id=target.tenant_id,
+            workspace_id=target.workspace_id,
+            plant_id=target.plant_id,
+            memory_id=repl_entry.memory_id,
+            event_type="ORGANIZATIONAL_MEMORY_UPDATED",  # Wrong! Must be CREATED
+            actor_id="user_c4",
+            timestamp=now,
+            outcome="SUCCESS",
+        )
+
+        with pytest.raises(ValueError, match="Replacement audit event_type must be 'ORGANIZATIONAL_MEMORY_CREATED'"):
+            in_memory_repo.supersede_entry_atomic(
+                superseded_entry=target,
+                superseded_audit=target_audit,
+                replacement_entry=repl_entry,
+                replacement_audit=wrong_repl_audit,
+            )
+
+        # Incorrect event_type for target audit
+        wrong_target_audit = MemoryAuditRecord(
+            audit_id="aud_tgt_evt_wrong",
+            tenant_id=target.tenant_id,
+            workspace_id=target.workspace_id,
+            plant_id=target.plant_id,
+            memory_id=target.memory_id,
+            event_type="ORGANIZATIONAL_MEMORY_CREATED",  # Wrong! Must be SUPERSEDED
+            actor_id="user_c4",
+            timestamp=now,
+            outcome="SUCCESS",
+        )
+        valid_repl_audit = MemoryAuditRecord(
+            audit_id="aud_repl_evt_valid",
+            tenant_id=target.tenant_id,
+            workspace_id=target.workspace_id,
+            plant_id=target.plant_id,
+            memory_id=repl_entry.memory_id,
+            event_type="ORGANIZATIONAL_MEMORY_CREATED",
+            actor_id="user_c4",
+            timestamp=now,
+            outcome="SUCCESS",
+        )
+
+        with pytest.raises(ValueError, match="Target audit event_type must be 'ORGANIZATIONAL_MEMORY_SUPERSEDED'"):
+            in_memory_repo.supersede_entry_atomic(
+                superseded_entry=target,
+                superseded_audit=wrong_target_audit,
+                replacement_entry=repl_entry,
+                replacement_audit=valid_repl_audit,
+            )
+
+        # Verify original intact
+        check_target = in_memory_repo.get_entry(target.tenant_id, target.workspace_id, target.memory_id)
+        assert check_target.lifecycle_status == MemoryLifecycleStatus.ACTIVE
+
+    def test_supersession_replacement_audit_insertion_failure_rolls_back_all(
+        self, in_memory_repo, memory_service, operator_identity, manager_identity, monkeypatch
+    ):
+        """
+        If the replacement audit insert fails inside the SQLite transaction, all mutations
+        (replacement insertion and target update) must roll back cleanly.
+        """
+        draft = memory_service.create_draft(
+            MemoryDraftCreateRequest(
+                memory_type=MemoryType.LESSON_LEARNED,
+                title="Target for Replacement Audit Failure Test",
+                summary="Summary",
+                content="Content",
+                plant_id="plant_01",
+            ),
+            operator_identity,
+        )
+        memory_service.submit_for_review(draft.memory_id, operator_identity)
+        target = memory_service.verify_entry(
+            draft.memory_id,
+            MemoryVerifyRequest(activate_immediately=True),
+            manager_identity,
+        )
+
+        replacement_draft = MemoryDraftCreateRequest(
+            memory_type=MemoryType.LESSON_LEARNED,
+            title="Replacement Failing on Audit Insert",
+            summary="Summary",
+            content="Content",
+            plant_id="plant_01",
+        )
+
+        orig_audit_insert = in_memory_repo._insert_audit_entry_conn
+        fail_triggered = False
+
+        def failing_audit_insert(conn, audit):
+            nonlocal fail_triggered
+            if audit.event_type == "ORGANIZATIONAL_MEMORY_CREATED":
+                fail_triggered = True
+                raise sqlite3.DatabaseError("Simulated ledger disk write failure during replacement audit")
+            orig_audit_insert(conn, audit)
+
+        monkeypatch.setattr(in_memory_repo, "_insert_audit_entry_conn", failing_audit_insert)
+
+        with pytest.raises(sqlite3.DatabaseError, match="Simulated ledger disk write failure"):
+            memory_service.supersede_entry(
+                target.memory_id,
+                MemorySupersedeRequest(reason="Replacing", replacement_draft=replacement_draft),
+                manager_identity,
+            )
+
+        assert fail_triggered is True
+
+        # Verify target remains ACTIVE
+        check_target = in_memory_repo.get_entry(target.tenant_id, target.workspace_id, target.memory_id)
+        assert check_target.lifecycle_status == MemoryLifecycleStatus.ACTIVE
+        assert check_target.superseded_by_memory_id is None
+
+        # Verify replacement was not committed
+        search_res = memory_service.search_memory(
+            MemorySearchRequest(query="Failing on Audit Insert"),
+            manager_identity,
+        )
+        assert search_res.total_count == 0
+
+        # Verify no audit records for this supersession attempt were persisted
+        audits = in_memory_repo.get_audit_records(target.tenant_id, target.workspace_id)
+        assert not any(a.event_type == "ORGANIZATIONAL_MEMORY_SUPERSEDED" for a in audits)
+        assert not any("Failing on Audit Insert" in json.dumps(a.details) for a in audits)
+
+
+
