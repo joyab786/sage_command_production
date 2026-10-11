@@ -15,6 +15,8 @@
 - **Prompt 35A Baseline Final Commit:** `6dc4c1bbbbc19f8657071231c89b90e25303d55e` (`docs(v3): record final commit SHAs in Prompt 35A baseline report`)
 - **Prompt 35B Starting Baseline:** `6dc4c1bbbbc19f8657071231c89b90e25303d55e`
 - **Prompt 35B Implementation Commit:** `7cf387f740f53793e59af8609d583da03ca4e945` (`fix(v3): harden mission outcome integrity, scoped resource lookup, and input safety (Prompt 35B)`)
+- **Prompt 35B Documentation Commit:** `b26eaa94a337f5f483e38557730a0cf04d137fac` (`docs(v3): document mission outcome integrity, scoped resource lookup, and input safety (Prompt 35B)`)
+- **Prompt 35B Baseline Final Commit:** `d772e864d45b92d9a78721b175a0fb8437e68fb4` (`docs(v3): record final commit SHAs in Prompt 35B baseline report`)
 
 ---
 
