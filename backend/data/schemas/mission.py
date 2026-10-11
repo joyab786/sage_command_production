@@ -19,3 +19,64 @@ class MissionObject(BaseModel):
     deadline: Optional[str] = Field(default=None, description="ISO-8601 deadline timestamp")
     success_criteria: List[str] = Field(default_factory=list, description="Verifiable success condition benchmarks")
     created_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat(), description="Creation timestamp")
+
+
+# =============================================================================
+# Re-export Prompt 35 Canonical Mission Contracts
+# =============================================================================
+try:
+    from data.schemas.mission_contract import (
+        MANDATORY_MISSION_NOTICE,
+        SCHEMA_VERSION,
+        MissionStatus,
+        MissionType,
+        StepType,
+        StepStatus,
+        DataMode,
+        CriterionStatus,
+        ConstraintType,
+        MissionScope,
+        MissionConstraint,
+        MissionSuccessCriterion,
+        MissionEvidenceRequirement,
+        MissionPlannedStep,
+        MissionProvenance,
+        Mission,
+        MissionCreateRequest,
+        MissionUpdateRequest,
+        MissionReviewRequest,
+        MissionValidationResponse,
+        MissionRevisionRecord,
+        MissionAuditRecord,
+        VALID_LIFECYCLE_TRANSITIONS,
+        is_valid_lifecycle_transition,
+        validate_mission_dependencies,
+    )
+except (ImportError, ModuleNotFoundError):
+    from backend.data.schemas.mission_contract import (
+        MANDATORY_MISSION_NOTICE,
+        SCHEMA_VERSION,
+        MissionStatus,
+        MissionType,
+        StepType,
+        StepStatus,
+        DataMode,
+        CriterionStatus,
+        ConstraintType,
+        MissionScope,
+        MissionConstraint,
+        MissionSuccessCriterion,
+        MissionEvidenceRequirement,
+        MissionPlannedStep,
+        MissionProvenance,
+        Mission,
+        MissionCreateRequest,
+        MissionUpdateRequest,
+        MissionReviewRequest,
+        MissionValidationResponse,
+        MissionRevisionRecord,
+        MissionAuditRecord,
+        VALID_LIFECYCLE_TRANSITIONS,
+        is_valid_lifecycle_transition,
+        validate_mission_dependencies,
+    )

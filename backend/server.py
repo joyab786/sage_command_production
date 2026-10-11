@@ -49,6 +49,7 @@ try:
     from api.confidence_uncertainty_routes import router as confidence_uncertainty_router
     from api.sop_rag_routes import router as sop_rag_router
     from api.organizational_memory_routes import router as organizational_memory_router
+    from api.mission_routes import router as mission_router
     from services.event_bus import get_event_bus
 except (ImportError, ModuleNotFoundError):
     from backend.core.config import SAGE_ALLOWED_ORIGINS, IS_PRODUCTION
@@ -90,6 +91,7 @@ except (ImportError, ModuleNotFoundError):
     from backend.api.confidence_uncertainty_routes import router as confidence_uncertainty_router
     from backend.api.sop_rag_routes import router as sop_rag_router
     from backend.api.organizational_memory_routes import router as organizational_memory_router
+    from backend.api.mission_routes import router as mission_router
     from backend.services.event_bus import get_event_bus
 
 app = FastAPI(title="SageCommand V3 Industrial Operations AI OS")
@@ -174,6 +176,7 @@ app.include_router(evidence_explainability_router)
 app.include_router(confidence_uncertainty_router)
 app.include_router(sop_rag_router)
 app.include_router(organizational_memory_router)
+app.include_router(mission_router)
 
 # BOOT SEQUENCE
 if __name__ == "__main__":
