@@ -1,4 +1,8 @@
 # SageCommand V3 — Mission Architecture Foundation
+**Repository:** `joyab786/sage_command_production`  
+**Workspace:** `E:\js\sage_command_production`  
+**Branch:** `main`  
+**Implementation Commit:** `62f4f3646c63eab903118fe1793e50d5a988149f`
 
 ## 1. Mission Domain and Purpose
 
