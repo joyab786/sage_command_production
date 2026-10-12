@@ -117,17 +117,46 @@ Following remote review of Prompt 36, Prompt 36A hardened the verification subsy
 
 ---
 
-## 6. Known Limitations
+## 6. Prompt 36B — Verification Trust-Boundary Corrections & Non-Disclosure
 
-1. **Synchronous Polling vs. Event-Driven Push**: Evidence evaluation is performed on demand during a verification request. Streaming continuous re-evaluation upon telemetry event emission is architecturally prepared but scheduled for Prompt 37.
-2. **Deterministic Rules Bound**: The current rule registry implements 8 explicit deterministic rule types. Non-deterministic probabilistic models are intentionally not permitted to decide verification outcomes.
-3. **Cross-Subsystem Adapters**: Evidence resolution queries existing SQLite stores (`ActionStore`, `DecisionEngineRepository`, `IncidentRepository`, `EvidenceExplainabilityRepository`). Distributed federated databases beyond local SQLite stores rely on the existing `DatabaseConnectionGateway`.
+Prompt 36B resolved remaining architectural gaps identified during remote review of Prompt 36A:
+
+### A. Summary of Corrections Applied
+1. **Trusted Identity Propagation Wiring:**
+   - Call site integration: Connected `active_verification_identity` in [backend/api/websocket.py](file:///E:/js/sage_command_production/backend/api/websocket.py) around `_invoke_graph` execution.
+   - Token lifecycle: `set_active_verification_identity` returns a context token; `reset_active_verification_identity` safely resets it in `finally`.
+   - Tool isolation: Concurrency and sequential tests prove zero context leakage across async tasks or sequential worker executions.
+   - Deliberate tool registry boundary: Tools remain unregistered from `copilot_tools.py` pending Prompt 37 copilot lifecycle hardening.
+2. **Evidence-Existence Non-Disclosure & Fail-Closed Aggregation:**
+   - In `EvidenceExistsRule`, mixed collections containing inaccessible or blocked items return `BLOCKED`, never promoting to `VERIFIED`.
+   - Blocked and unknown record IDs, classifications, and internal reasons are strictly excluded from caller-visible findings (`evidence_references`, `evidence_assessments`, `limitations`, `explanation`) and run `provenance.evidence_ids`.
+3. **Authoritative Validation Signals Across All 6 Adapters:**
+   - Eliminated inference of `VALID` from operational statuses (`SUCCEEDED`, `RESOLVED`, `COMPLETED`, `RECOMMENDED`, `OPTIMAL`) or self-reported hashes.
+   - Records fail closed to `UNVERIFIED` / `UNKNOWN` with transparent limitations unless an authoritative validation process exists.
+   - Preserved strict observation timestamp semantics; creation, ingestion, or analysis timestamps are never synthesized into sensor observation time.
+4. **Elimination of Permissive Classification Fallback:**
+   - Removed silent fallback to `INTERNAL`. Missing, malformed, or unsupported classification evaluates to `UNKNOWN` and fails closed to `BLOCKED`.
+
+### B. Extended Test Verification
+- **Continuous Verification Suite (`backend/test_v3_continuous_verification.py`):** 68 tests (100% passed in 7.92s).
+- **Mission Regression Suite (`backend/test_v3_mission_architecture.py`):** 74 tests (100% passed in 6.30s).
+- **Subsystem Regression Suite:** 309 tests (100% passed in 18.20s) across Evidence Explainability (140), Organizational Memory (119), Root Cause Analysis (26), and Incident Management (24).
+- **Combined Test Count:** 451 passed, 0 failed across all active suites.
 
 ---
 
-## 7. Explicitly Deferred Capabilities
+## 7. Known Limitations
 
-The following capabilities are explicitly deferred from Prompts 36 & 36A:
+1. **Synchronous Polling vs. Event-Driven Push**: Evidence evaluation is performed on demand during a verification request. Streaming continuous re-evaluation upon telemetry event emission is architecturally prepared but scheduled for Prompt 37.
+2. **Deterministic Rules Bound**: The current rule registry implements 8 explicit deterministic rule types. Non-deterministic probabilistic models are intentionally not permitted to decide verification outcomes.
+3. **Cross-Subsystem Adapters**: Evidence resolution queries existing SQLite stores (`ActionStore`, `DecisionEngineRepository`, `IncidentRepository`, `EvidenceExplainabilityRepository`, `RcaRepository`, `OrganizationalMemoryRepository`). Distributed federated databases beyond local SQLite stores rely on the existing `DatabaseConnectionGateway`.
+4. **Agent Tools Registration**: Verification tools are deliberately not registered in the default `copilot_tools` agent registry pending Prompt 37 closed-loop copilot integration.
+
+---
+
+## 8. Explicitly Deferred Capabilities
+
+The following capabilities are explicitly deferred from Prompts 36, 36A & 36B:
 - Autonomous mission execution or dispatch.
 - Direct SCADA / PLC write commands.
 - Operational database updates or deletions.
@@ -137,10 +166,11 @@ The following capabilities are explicitly deferred from Prompts 36 & 36A:
 
 ---
 
-## 8. Lineage and Git Lineage
+## 9. Lineage and Git Lineage
 
 - **Prompt 36 Starting Baseline:** `de6dac99df8c1285b33076eeb58d37b0656c1dcc`
 - **Prompt 36A Starting Baseline:** `663f3a491f84a97e580f575fd711d82e87f67f45`
 - **Prompt 36A Implementation Commit:** `28ee5bd4346a4b2d6fc2b5fb1a812a2d5ccd129c`
+- **Prompt 36B Starting Baseline:** `be2c111ec934e3bac7f06781d2081b8762fd1c0a`
 - **Target Branch:** `main`
 - **Repository:** `joyab786/sage_command_production`

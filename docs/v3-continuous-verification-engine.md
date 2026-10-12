@@ -279,12 +279,54 @@ Following independent security and correctness review of the Prompt 36 implement
 
 ---
 
-## 15. Status Summary
+## 15. Verification Trust-Boundary Corrections, Adapter Validation Signals & Non-Disclosure (Prompt 36B)
 
-- **Continuous Verification Engine**: `IMPLEMENTED` & `HARDENED (Prompt 36A)`
-- **Deterministic Rule Registry**: `IMPLEMENTED` (8 rules, fail-closed aggregation)
-- **Scope & Plant Isolation**: `IMPLEMENTED` (Fail-closed)
-- **Agent Identity Boundary**: `SECURED` (Server-injected runtime context, fail-closed)
+Prompt 36B completed the hardening of the Continuous Verification Engine by addressing gaps identified during remote review:
+
+### A. Authoritative Identity Propagation Path
+- **Context Injection Lifecycle:** In [backend/tools/verification_tools.py](file:///E:/js/sage_command_production/backend/tools/verification_tools.py), `set_active_verification_identity(identity)` returns a `Token`, and `reset_active_verification_identity(token)` guarantees reset. Wrapped by `@contextmanager def active_verification_identity(identity)` and `@asynccontextmanager def async_active_verification_identity(identity)`.
+- **WebSocket & Agent Orchestration Call Site:** In [backend/api/websocket.py](file:///E:/js/sage_command_production/backend/api/websocket.py), authenticated agent graph invocation is wrapped via:
+  ```python
+  with active_verification_identity(identity):
+      await asyncio.to_thread(_invoke_graph, input_state, config)
+  ```
+- **Context Isolation & Concurrency:** Verified that concurrent async tasks and sequential worker executions maintain strict isolation; identity tokens are reset in `finally` blocks upon both success and exceptions.
+- **Agent Tool Status:** Model-facing tools remain deliberately unregistered from `copilot_tools.py` pending end-to-end mission copilot lifecycle integration in Prompt 37, preventing any unmonitored agent invocation.
+
+### B. Evidence-Existence Aggregation & Strict Non-Disclosure
+- **Distinction Preserved:** `EVIDENCE_EXISTS` confirms solely the presence of accessible records in authorized storage, never certifying operational completion or real-world outcomes.
+- **Fail-Closed Collection Aggregation:** In `EvidenceExistsRule`, when a target requires multiple evidence references:
+  - If any required reference is inaccessible or blocked (`BLOCKED`), the rule returns `BLOCKED` (never promoted to `VERIFIED`).
+  - If any required reference is unknown or unresolved, the rule returns `INDETERMINATE`.
+  - Only when all required references exist and are accessible does it evaluate to `VERIFIED`.
+- **Non-Disclosure Boundary:** Blocked and unknown records are strictly excluded from caller-visible `evidence_references` and `evidence_assessments`. Their identifiers, classifications, and internal rejection causes are redacted from finding `limitations`, `explanation`, and run `provenance.evidence_ids`.
+
+### C. Authoritative Adapter Validation Signals & Matrix
+Records are never marked `VALID` solely from workflow completion statuses (`COMPLETED`, `RESOLVED`, `APPROVED`, `OPTIMAL`) or self-reported hashes. Without an authoritative third-party validation contract, records fail closed to `UNVERIFIED` with explicit limitations:
+
+| Adapter | Authoritative validation source | Classification source | Observation timestamp semantics | Fallback when unavailable |
+|---|---|---|---|---|
+| **Evidence Explainability** (`EvidenceExplainabilityRepository`) | Explicit `rec["validation_status"]` (`VALID` / `INVALID`) | `rec["classification"]` validated against `ClassificationTier` | `rec["observed_at"]` strictly (no ingestion substitution) | Explicit `UNVERIFIED` / `UNKNOWN` |
+| **Action Store** (`ActionStore`) | None authoritative; execution status (`SUCCEEDED`) or action hash does not prove evidence validity | `action.parameters` or `metadata["classification"]` validated against `ClassificationTier` | No synthetic observation time; workflow event timestamps (`created_at`) are not telemetry observations | Explicit `UNVERIFIED` / `UNKNOWN` |
+| **Decision Engine** (`DecisionEngineRepository`) | None authoritative; optimization outcome (`RECOMMENDED`, `OPTIMAL`) or fingerprint does not prove evidence validity | `evaluation.metadata["classification"]` validated against `ClassificationTier` | Analytical timestamp (`assessment_timestamp`) is algorithmic computation, not telemetry observation | Explicit `UNVERIFIED` / `UNKNOWN` |
+| **Incident Repository** (`IncidentRepository`) | None authoritative; lifecycle status (`RESOLVED`, `CLOSED`) or fingerprint reflects ticketing state | `incident.metadata["classification"]` validated against `ClassificationTier` | `detected_at` only; `opened_at`, `resolved_at`, `updated_at` are not observation times | Explicit `UNVERIFIED` / `UNKNOWN` |
+| **RCA Repository** (`RcaRepository`) | None authoritative; analysis status (`COMPLETED`) or input fingerprint reflects investigation lifecycle | Root cause metadata classification validated against `ClassificationTier` | Completion time (`completed_at`) is investigation synthesis, not sensor observation time | Explicit `UNVERIFIED` / `UNKNOWN` |
+| **Organizational Memory** (`OrganizationalMemoryRepository`) | Authoritative `memory.verification_status == VERIFIED` maps to `VALID` | `memory.metadata["classification"]` validated against `ClassificationTier` | Ingestion/creation time is not telemetry observation; observation time requires explicit sensor timestamp | Explicit `UNVERIFIED` / `UNKNOWN` |
+
+### D. Elimination of Permissive Classification Fallback
+- The previous permissive fallback converting missing metadata to `INTERNAL` has been completely eliminated.
+- Missing, malformed, or unsupported classification values strictly evaluate to `UNKNOWN`.
+- Any record with `UNKNOWN` classification fails closed to `BLOCKED` with insufficient clearance, enforcing full non-disclosure.
+
+---
+
+## 16. Status Summary
+
+- **Continuous Verification Engine**: `IMPLEMENTED` & `HARDENED (Prompt 36A & 36B)`
+- **Deterministic Rule Registry**: `IMPLEMENTED` (8 rules, fail-closed aggregation, strict non-disclosure)
+- **Scope & Plant Isolation**: `IMPLEMENTED` (Fail-closed, non-disclosing)
+- **Trusted Identity Propagation**: `IMPLEMENTED & INTEGRATED` (Token-safe context in WebSocket orchestrator)
+- **Agent Tools Registration**: `DELIBERATELY UNREGISTERED` (Unregistered from `copilot_tools.py` pending Prompt 37)
 - **Persistence & Audit Ledger**: `IMPLEMENTED` (SQLite WAL + SHA-256)
 - **FastAPI Endpoints**: `IMPLEMENTED`
 - **Real-Time Polling/Continuous Loop**: `DEFERRED` (Prompt 37)
