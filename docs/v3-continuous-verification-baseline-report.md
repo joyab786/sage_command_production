@@ -96,7 +96,28 @@ A codebase search across all Python files in `backend/` was performed for forbid
 
 ---
 
-## 5. Known Limitations
+## 5. Prompt 36A — Security, Trust & Evidence Integrity Hardening
+
+Following remote review of Prompt 36, Prompt 36A hardened the verification subsystem against trust boundary violations, permissive defaults, and permissive evidence aggregation:
+
+### A. Summary of Corrections Applied
+1. **Agent Identity Boundary:** Removed all model-facing identity parameters (`tenant_id`, `workspace_id`, `plant_id`, `user_id`, `roles`, `permissions`, `clearance_level`). Replaced with server-injected `ContextVar[Optional[Identity]]`. Tools fail closed immediately when identity context is absent.
+2. **Fail-Closed Evidence Aggregation:** Eliminated partial-success promotion. In `EvidenceValidatedRule` and `RequiredEvidenceValidatedRule`, mixed collections containing invalid (`NOT_VERIFIED`), unverified/unknown/incomplete (`INDETERMINATE`), blocked/insufficient clearance (`BLOCKED`), or conflicting (`CONFLICTING`) evidence never return `VERIFIED`.
+3. **Evidence Trust Defaults:** Removed permissive defaults (`classification_status="AUTHORIZED"`, `applicability_status="APPLICABLE"`). Replaced with explicit untrusted states (`UNKNOWN`).
+4. **Authoritative Clearance Evaluation:** Added caller `clearance_level` comparison against evidence clearance tiers. Mismatches return `CLEARANCE_INSUFFICIENT` and fail closed to `BLOCKED` without disclosing record contents.
+5. **Freshness and Timestamp Decoupling:** Observation time is strictly decoupled from ingestion/creation time (`created_at`, `received_at`). Historical records without observation timestamps are marked `TIMESTAMP_MISSING` and cannot satisfy `EVIDENCE_FRESH`.
+6. **Error Redaction and Sanitization:** Internal exceptions are logged strictly server-side; agent tools and REST endpoints return sanitized bounded error codes without leaking tracebacks or sensitive payloads.
+
+### B. Extended Test Verification
+- **Focused Verification Suite (`backend/test_v3_continuous_verification.py`):** 48 tests (100% passed in 7.05s).
+  - Covers agent identity fail-closed, schema argument verification, mixed collections (VALID+UNVERIFIED, VALID+INVALID, VALID+UNKNOWN, VALID+INCOMPLETE, VALID+CONFLICTING, VALID+inaccessible), classification clearance, timestamp decoupling, and non-disclosure.
+- **Mission Regression Suite (`backend/test_v3_mission_architecture.py`):** 74 tests (100% passed in 6.29s).
+- **Subsystem Regression Suite:** 309 tests (100% passed in 18.08s) across evidence explainability, organizational memory, root cause analysis, and incident management.
+- **Frontend Production Build:** Successful (`npm run build`, Next.js 16.2.7, static pages generated cleanly in 6.9s).
+
+---
+
+## 6. Known Limitations
 
 1. **Synchronous Polling vs. Event-Driven Push**: Evidence evaluation is performed on demand during a verification request. Streaming continuous re-evaluation upon telemetry event emission is architecturally prepared but scheduled for Prompt 37.
 2. **Deterministic Rules Bound**: The current rule registry implements 8 explicit deterministic rule types. Non-deterministic probabilistic models are intentionally not permitted to decide verification outcomes.
@@ -104,20 +125,22 @@ A codebase search across all Python files in `backend/` was performed for forbid
 
 ---
 
-## 6. Explicitly Deferred Capabilities
+## 7. Explicitly Deferred Capabilities
 
-The following capabilities are explicitly deferred from Prompt 36:
+The following capabilities are explicitly deferred from Prompts 36 & 36A:
 - Autonomous mission execution or dispatch.
 - Direct SCADA / PLC write commands.
 - Operational database updates or deletions.
-- Closed-loop policy adaptation.
+- Closed-loop policy adaptation (Prompt 37).
+- Continuous background polling daemons / watchers (Prompt 37).
 - General-purpose executable verification domain-specific language (DSL).
-- Distributed event queues (Kafka / RabbitMQ).
 
 ---
 
-## 7. Lineage and Git Lineage
+## 8. Lineage and Git Lineage
 
-- **Starting Baseline:** `de6dac99df8c1285b33076eeb58d37b0656c1dcc`
+- **Prompt 36 Starting Baseline:** `de6dac99df8c1285b33076eeb58d37b0656c1dcc`
+- **Prompt 36A Starting Baseline:** `663f3a491f84a97e580f575fd711d82e87f67f45`
+- **Prompt 36A Implementation Commit:** `28ee5bd4346a4b2d6fc2b5fb1a812a2d5ccd129c`
 - **Target Branch:** `main`
 - **Repository:** `joyab786/sage_command_production`

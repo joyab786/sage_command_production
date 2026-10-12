@@ -240,13 +240,52 @@ Static AST tests and comprehensive codebase searches demonstrate zero forbidden 
 
 ---
 
-## 13. Status Summary
+---
 
-- **Continuous Verification Engine**: `IMPLEMENTED`
-- **Deterministic Rule Registry**: `IMPLEMENTED` (8 rules)
+## 14. Verification Security and Integrity Hardening (Prompt 36A)
+
+Following independent security and correctness review of the Prompt 36 implementation, Prompt 36A applied critical hardening to eliminate trust boundary violations and permissive defaults.
+
+### A. Agent Identity Boundary Enforcement
+- **Root Cause:** Initial implementation accepted model-supplied `tenant_id`, `workspace_id`, `plant_id`, and `user_id` as tool arguments and synthesized caller identities.
+- **Correction:** Removed all identity, scope, role, clearance, and permission parameters from model-visible schemas (`request_mission_verification_tool` and `get_mission_verification_findings_tool`).
+- **Mechanism:** Implemented server-side runtime context injection using `ContextVar[Optional[Identity]]` (`set_active_verification_identity`, `get_active_verification_identity`).
+- **Fail-Closed Guarantee:** Tool invocations immediately fail closed with `[VERIFICATION BLOCKED]` if trusted runtime context is missing. Model-supplied keyword arguments cannot override the server-injected identity.
+- **Integration Status:** Agent tool integration is fully secured with zero model-controlled identity surface.
+
+### B. Fail-Closed Evidence Validation & Aggregation Semantics
+- **Root Cause:** Evidence rules previously allowed mixed collections to return `VERIFIED` if at least one item was valid.
+- **Correction:** Enforced strict fail-closed aggregation hierarchy across `EvidenceValidatedRule` and `RequiredEvidenceValidatedRule`:
+  1. **Any unauthorized or classification-blocked evidence** -> `BLOCKED` (without leaking inaccessible data).
+  2. **Any conflicting evidence** -> `CONFLICTING`.
+  3. **Any invalid evidence** -> `NOT_VERIFIED`.
+  4. **Any unverified, unknown, or incomplete evidence** -> `INDETERMINATE`.
+  5. **All required evidence cleared, authorized, applicable, and valid** -> `VERIFIED`.
+- **Notice on Existence:** `EvidenceExistsRule` clarifies that record existence confirms accessible database presence only, never certifying operational outcome.
+
+### C. Evidence Trust Defaults & Clearance Enforcement
+- **Root Cause:** Permissive defaults manufactured trust (`classification_status="AUTHORIZED"`, `applicability_status="APPLICABLE"`).
+- **Correction:** Updated default schema fields in `EvidenceAssessment` to explicit untrusted states (`classification_status="UNKNOWN"`, `applicability_status="UNKNOWN"`, `scope_status=ScopeStatus.UNKNOWN`).
+- **Clearance Engine:** Evidence adapters evaluate the caller's authoritative `clearance_level` against evidence clearance tiers. Callers with insufficient clearance receive `CLEARANCE_INSUFFICIENT`, deterministically failing closed to `BLOCKED`.
+
+### D. Freshness and Timestamp Semantics
+- **Decoupled Observation Time:** Ingestion and record creation timestamps (`created_at`, `received_at`) are never silently substituted for observation time (`observed_at`).
+- **Missing Timestamps:** Records without authoritative observation timestamps are marked `FreshnessStatus.TIMESTAMP_MISSING` and fail `EVIDENCE_FRESH` (returning `INDETERMINATE`).
+- **Historical Records:** Static historical records without observation timestamps cannot satisfy real-time freshness rules.
+
+### E. Safe Error Handling and Non-Disclosure
+- Raw exceptions and internal stack traces are caught, redacted, and logged server-side only.
+- Inaccessible or cross-scope records return generic non-disclosure notices without leaking record contents, IDs, or sensitive field existence.
+
+---
+
+## 15. Status Summary
+
+- **Continuous Verification Engine**: `IMPLEMENTED` & `HARDENED (Prompt 36A)`
+- **Deterministic Rule Registry**: `IMPLEMENTED` (8 rules, fail-closed aggregation)
 - **Scope & Plant Isolation**: `IMPLEMENTED` (Fail-closed)
+- **Agent Identity Boundary**: `SECURED` (Server-injected runtime context, fail-closed)
 - **Persistence & Audit Ledger**: `IMPLEMENTED` (SQLite WAL + SHA-256)
-- **Agent Tools Integration**: `IMPLEMENTED`
 - **FastAPI Endpoints**: `IMPLEMENTED`
 - **Real-Time Polling/Continuous Loop**: `DEFERRED` (Prompt 37)
 - **Closed-Loop Learning**: `DEFERRED` (Prompt 37)
