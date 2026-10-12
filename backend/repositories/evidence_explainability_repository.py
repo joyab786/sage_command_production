@@ -372,6 +372,80 @@ class EvidenceExplainabilityRepository:
                 }
             return None
 
+    def get_evidence_record_scoped(
+        self,
+        identifier: str,
+        tenant_id: str,
+        workspace_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Retrieves a full evidence record or explanation payload, enforcing
+        strict tenant and workspace isolation.
+        Returns None if not found or if inaccessible.
+        """
+        with self._lock, self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT evidence_id, explanation_id, tenant_id, workspace_id, plant_id, "
+                "source_type, source_record_id, provenance, validation_status, payload_json, created_at "
+                "FROM evidence_records WHERE evidence_id = ? AND tenant_id = ? AND workspace_id = ?",
+                (identifier, tenant_id, workspace_id),
+            )
+            row = cursor.fetchone()
+            if row:
+                payload = {}
+                if row["payload_json"]:
+                    try:
+                        payload = json.loads(row["payload_json"])
+                    except Exception:
+                        payload = {}
+                return {
+                    "evidence_id": row["evidence_id"],
+                    "explanation_id": row["explanation_id"],
+                    "tenant_id": row["tenant_id"],
+                    "workspace_id": row["workspace_id"],
+                    "plant_id": row["plant_id"],
+                    "source_type": row["source_type"],
+                    "source_record_id": row["source_record_id"],
+                    "provenance": row["provenance"],
+                    "validation_status": row["validation_status"],
+                    "payload": payload,
+                    "created_at": row["created_at"],
+                    "type": "evidence_record",
+                }
+
+            # Check explanation
+            cursor.execute(
+                "SELECT explanation_id, tenant_id, workspace_id, plant_id, "
+                "target_type, target_id, assessment_timestamp, payload_json, created_at "
+                "FROM evidence_explanations WHERE explanation_id = ? AND tenant_id = ? AND workspace_id = ?",
+                (identifier, tenant_id, workspace_id),
+            )
+            exp_row = cursor.fetchone()
+            if exp_row:
+                payload = {}
+                if exp_row["payload_json"]:
+                    try:
+                        payload = json.loads(exp_row["payload_json"])
+                    except Exception:
+                        payload = {}
+                return {
+                    "evidence_id": exp_row["explanation_id"],
+                    "explanation_id": exp_row["explanation_id"],
+                    "tenant_id": exp_row["tenant_id"],
+                    "workspace_id": exp_row["workspace_id"],
+                    "plant_id": exp_row["plant_id"],
+                    "source_type": f"EXPLANATION_{exp_row['target_type']}",
+                    "source_record_id": exp_row["target_id"],
+                    "provenance": "DERIVED",
+                    "validation_status": "VALID",
+                    "payload": payload,
+                    "observed_at": exp_row["assessment_timestamp"],
+                    "created_at": exp_row["created_at"],
+                    "type": "explanation",
+                }
+            return None
+
     def get_by_fingerprint(self, fingerprint: str, tenant_id: str) -> Optional[ExplanationResult]:
         """
         Retrieves explanation by input fingerprint with tenant isolation.
