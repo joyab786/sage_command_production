@@ -147,6 +147,8 @@ try:
     from tools.verification_tools import (
         request_mission_verification_tool,
         get_mission_verification_findings_tool,
+        set_active_verification_identity,
+        get_active_verification_identity,
     )
 except (ImportError, ModuleNotFoundError):
     from backend.server import app
@@ -217,6 +219,8 @@ except (ImportError, ModuleNotFoundError):
     from backend.tools.verification_tools import (
         request_mission_verification_tool,
         get_mission_verification_findings_tool,
+        set_active_verification_identity,
+        get_active_verification_identity,
     )
 
 
@@ -451,6 +455,7 @@ def test_evidence_exists_rule_verified():
         source_type="SENSOR",
         observed_at=datetime.now(timezone.utc).isoformat(),
         scope_status=ScopeStatus.AUTHORIZED,
+        classification_status="AUTHORIZED",
         applicability_status="APPLICABLE",
     )
     finding = rule.evaluate(
@@ -463,6 +468,8 @@ def test_evidence_exists_rule_verified():
     assert finding.status == VerificationStatus.VERIFIED
     assert "ev_001" in finding.evidence_references
     assert finding.rule_id == "RULE_EVIDENCE_EXISTS_V1"
+    # Ensure notice explicitly clarifies record presence only
+    assert "confirms record presence only" in finding.explanation
 
 
 def test_evidence_exists_rule_missing_evidence():
@@ -480,6 +487,22 @@ def test_evidence_exists_rule_missing_evidence():
     assert len(finding.limitations) > 0
 
 
+def test_evidence_exists_does_not_certify_operational_outcome():
+    """EVIDENCE_EXISTS rule proves accessible record exists, not operational truth."""
+    rule = EvidenceExistsRule()
+    assessment = EvidenceAssessment(
+        evidence_id="ev_raw_01",
+        source_type="TELEMETRY_LOG",
+        observed_at=datetime.now(timezone.utc).isoformat(),
+        scope_status=ScopeStatus.AUTHORIZED,
+        classification_status="AUTHORIZED",
+        applicability_status="APPLICABLE",
+    )
+    finding = rule.evaluate("step_01", VerificationTargetType.STEP, [assessment], {}, {})
+    assert finding.status == VerificationStatus.VERIFIED
+    assert "does not self-certify operational completion or outcome" in finding.explanation
+
+
 def test_evidence_validated_rule_valid_evidence():
     """Valid integrity evidence satisfies EVIDENCE_VALIDATED rule."""
     rule = EvidenceValidatedRule()
@@ -488,6 +511,9 @@ def test_evidence_validated_rule_valid_evidence():
         source_type="SENSOR",
         integrity_status="VALID",
         quality_status=QualityStatus.VALID,
+        scope_status=ScopeStatus.AUTHORIZED,
+        classification_status="AUTHORIZED",
+        applicability_status="APPLICABLE",
     )
     finding = rule.evaluate(
         target_id="crit_01",
@@ -507,6 +533,9 @@ def test_evidence_validated_rule_invalid_evidence():
         source_type="SENSOR",
         integrity_status="INVALID",
         quality_status=QualityStatus.INVALID,
+        scope_status=ScopeStatus.AUTHORIZED,
+        classification_status="AUTHORIZED",
+        applicability_status="APPLICABLE",
     )
     finding = rule.evaluate(
         target_id="crit_01",
@@ -527,6 +556,9 @@ def test_evidence_validated_rule_unverified_evidence():
         source_type="SENSOR",
         integrity_status="UNVERIFIED",
         quality_status=QualityStatus.UNVERIFIED,
+        scope_status=ScopeStatus.AUTHORIZED,
+        classification_status="AUTHORIZED",
+        applicability_status="APPLICABLE",
     )
     finding = rule.evaluate(
         target_id="crit_01",
@@ -538,6 +570,216 @@ def test_evidence_validated_rule_unverified_evidence():
     assert finding.status == VerificationStatus.INDETERMINATE
 
 
+# --- PROMPT 36A: MIXED EVIDENCE AGGREGATION FAIL-CLOSED TESTS ---
+
+def test_mixed_evidence_valid_plus_unverified():
+    """VALID + UNVERIFIED evidence must never return VERIFIED; returns INDETERMINATE."""
+    rule = EvidenceValidatedRule()
+    valid_ev = EvidenceAssessment(
+        evidence_id="ev_valid",
+        source_type="SENSOR",
+        integrity_status="VALID",
+        quality_status=QualityStatus.VALID,
+        scope_status=ScopeStatus.AUTHORIZED,
+        classification_status="AUTHORIZED",
+        applicability_status="APPLICABLE",
+    )
+    unverified_ev = EvidenceAssessment(
+        evidence_id="ev_unverified",
+        source_type="SENSOR",
+        integrity_status="UNVERIFIED",
+        quality_status=QualityStatus.UNVERIFIED,
+        scope_status=ScopeStatus.AUTHORIZED,
+        classification_status="AUTHORIZED",
+        applicability_status="APPLICABLE",
+    )
+    finding = rule.evaluate("crit_01", VerificationTargetType.CRITERION, [valid_ev, unverified_ev], {}, {})
+    assert finding.status == VerificationStatus.INDETERMINATE
+    assert finding.status != VerificationStatus.VERIFIED
+
+
+def test_mixed_evidence_valid_plus_invalid():
+    """VALID + INVALID evidence must never return VERIFIED; returns NOT_VERIFIED."""
+    rule = EvidenceValidatedRule()
+    valid_ev = EvidenceAssessment(
+        evidence_id="ev_valid",
+        source_type="SENSOR",
+        integrity_status="VALID",
+        quality_status=QualityStatus.VALID,
+        scope_status=ScopeStatus.AUTHORIZED,
+        classification_status="AUTHORIZED",
+        applicability_status="APPLICABLE",
+    )
+    invalid_ev = EvidenceAssessment(
+        evidence_id="ev_invalid",
+        source_type="SENSOR",
+        integrity_status="INVALID",
+        quality_status=QualityStatus.INVALID,
+        scope_status=ScopeStatus.AUTHORIZED,
+        classification_status="AUTHORIZED",
+        applicability_status="APPLICABLE",
+    )
+    finding = rule.evaluate("crit_01", VerificationTargetType.CRITERION, [valid_ev, invalid_ev], {}, {})
+    assert finding.status == VerificationStatus.NOT_VERIFIED
+    assert finding.status != VerificationStatus.VERIFIED
+
+
+def test_mixed_evidence_valid_plus_unknown():
+    """VALID + UNKNOWN integrity must never return VERIFIED; returns INDETERMINATE."""
+    rule = EvidenceValidatedRule()
+    valid_ev = EvidenceAssessment(
+        evidence_id="ev_valid",
+        source_type="SENSOR",
+        integrity_status="VALID",
+        quality_status=QualityStatus.VALID,
+        scope_status=ScopeStatus.AUTHORIZED,
+        classification_status="AUTHORIZED",
+        applicability_status="APPLICABLE",
+    )
+    unknown_ev = EvidenceAssessment(
+        evidence_id="ev_unknown",
+        source_type="SENSOR",
+        integrity_status="UNKNOWN",
+        quality_status=QualityStatus.UNKNOWN,
+        scope_status=ScopeStatus.AUTHORIZED,
+        classification_status="AUTHORIZED",
+        applicability_status="APPLICABLE",
+    )
+    finding = rule.evaluate("crit_01", VerificationTargetType.CRITERION, [valid_ev, unknown_ev], {}, {})
+    assert finding.status == VerificationStatus.INDETERMINATE
+    assert finding.status != VerificationStatus.VERIFIED
+
+
+def test_mixed_evidence_valid_plus_incomplete():
+    """VALID + INCOMPLETE evidence must never return VERIFIED; returns INDETERMINATE."""
+    rule = EvidenceValidatedRule()
+    valid_ev = EvidenceAssessment(
+        evidence_id="ev_valid",
+        source_type="SENSOR",
+        integrity_status="VALID",
+        quality_status=QualityStatus.VALID,
+        scope_status=ScopeStatus.AUTHORIZED,
+        classification_status="AUTHORIZED",
+        applicability_status="APPLICABLE",
+    )
+    incomplete_ev = EvidenceAssessment(
+        evidence_id="ev_incomplete",
+        source_type="SENSOR",
+        integrity_status="INCOMPLETE",
+        quality_status=QualityStatus.INCOMPLETE,
+        scope_status=ScopeStatus.AUTHORIZED,
+        classification_status="AUTHORIZED",
+        applicability_status="APPLICABLE",
+    )
+    finding = rule.evaluate("crit_01", VerificationTargetType.CRITERION, [valid_ev, incomplete_ev], {}, {})
+    assert finding.status == VerificationStatus.INDETERMINATE
+    assert finding.status != VerificationStatus.VERIFIED
+
+
+def test_mixed_evidence_valid_plus_conflicting():
+    """VALID + CONFLICTING evidence must return CONFLICTING."""
+    rule = EvidenceValidatedRule()
+    valid_ev = EvidenceAssessment(
+        evidence_id="ev_valid",
+        source_type="SENSOR",
+        integrity_status="VALID",
+        quality_status=QualityStatus.VALID,
+        scope_status=ScopeStatus.AUTHORIZED,
+        classification_status="AUTHORIZED",
+        applicability_status="APPLICABLE",
+    )
+    conflicting_ev = EvidenceAssessment(
+        evidence_id="ev_conflicting",
+        source_type="SENSOR",
+        integrity_status="CONFLICTING",
+        quality_status=QualityStatus.CONFLICTING,
+        scope_status=ScopeStatus.AUTHORIZED,
+        classification_status="AUTHORIZED",
+        applicability_status="APPLICABLE",
+    )
+    finding = rule.evaluate("crit_01", VerificationTargetType.CRITERION, [valid_ev, conflicting_ev], {}, {})
+    assert finding.status == VerificationStatus.CONFLICTING
+    assert finding.status != VerificationStatus.VERIFIED
+
+
+def test_mixed_evidence_valid_plus_inaccessible():
+    """VALID + inaccessible/blocked evidence must return BLOCKED without data leak."""
+    rule = EvidenceValidatedRule()
+    valid_ev = EvidenceAssessment(
+        evidence_id="ev_valid",
+        source_type="SENSOR",
+        integrity_status="VALID",
+        quality_status=QualityStatus.VALID,
+        scope_status=ScopeStatus.AUTHORIZED,
+        classification_status="AUTHORIZED",
+        applicability_status="APPLICABLE",
+    )
+    blocked_ev = EvidenceAssessment(
+        evidence_id="ev_secret",
+        source_type="SENSOR",
+        integrity_status="VALID",
+        quality_status=QualityStatus.VALID,
+        scope_status=ScopeStatus.CROSS_PLANT,
+        classification_status="CLEARANCE_INSUFFICIENT",
+        applicability_status="TARGET_MISMATCH",
+    )
+    finding = rule.evaluate("crit_01", VerificationTargetType.CRITERION, [valid_ev, blocked_ev], {}, {})
+    assert finding.status == VerificationStatus.BLOCKED
+    assert finding.status != VerificationStatus.VERIFIED
+
+
+# --- PROMPT 36A: CLASSIFICATION AND APPLICABILITY TESTS ---
+
+def test_unknown_classification_cannot_be_treated_as_authorized():
+    """Unknown classification clearance metadata fails closed to INDETERMINATE."""
+    rule = EvidenceValidatedRule()
+    assessment = EvidenceAssessment(
+        evidence_id="ev_001",
+        source_type="SENSOR",
+        integrity_status="VALID",
+        quality_status=QualityStatus.VALID,
+        scope_status=ScopeStatus.AUTHORIZED,
+        classification_status="UNKNOWN",  # Untrusted default
+        applicability_status="APPLICABLE",
+    )
+    finding = rule.evaluate("crit_01", VerificationTargetType.CRITERION, [assessment], {}, {})
+    assert finding.status == VerificationStatus.INDETERMINATE
+
+
+def test_unknown_applicability_cannot_be_treated_as_applicable():
+    """Unknown applicability metadata fails closed to INDETERMINATE."""
+    rule = EvidenceValidatedRule()
+    assessment = EvidenceAssessment(
+        evidence_id="ev_001",
+        source_type="SENSOR",
+        integrity_status="VALID",
+        quality_status=QualityStatus.VALID,
+        scope_status=ScopeStatus.AUTHORIZED,
+        classification_status="AUTHORIZED",
+        applicability_status="UNKNOWN",  # Untrusted default
+    )
+    finding = rule.evaluate("crit_01", VerificationTargetType.CRITERION, [assessment], {}, {})
+    assert finding.status == VerificationStatus.INDETERMINATE
+
+
+def test_insufficient_clearance_returns_blocked(v_service, sample_mission):
+    """Caller with lower clearance than required evidence gets BLOCKED without data leak."""
+    low_clearance_identity = Identity(
+        user_id="low_sec_user",
+        tenant_id="tenant_alpha",
+        workspace_id="workspace_prod",
+        roles=["ANALYST"],
+        permissions=["mission.read", "mission.verification.request"],
+        assigned_plants=["plant_01"],
+        clearance_level=1,  # Tier 1 (INTERNAL)
+    )
+    # Evidence service evaluating a tier 3 (RESTRICTED) source
+    clear_status = v_service._evaluate_clearance(low_clearance_identity, required_clearance=3)
+    assert clear_status == "CLEARANCE_INSUFFICIENT"
+
+
+# --- PROMPT 36A: FRESHNESS AND TIMESTAMP SEMANTICS TESTS ---
+
 def test_evidence_fresh_rule_current():
     """Fresh evidence within threshold window produces VERIFIED."""
     rule = EvidenceFreshRule()
@@ -546,6 +788,9 @@ def test_evidence_fresh_rule_current():
         evidence_id="ev_001",
         source_type="TELEMETRY",
         observed_at=(now - timedelta(minutes=5)).isoformat(),
+        scope_status=ScopeStatus.AUTHORIZED,
+        classification_status="AUTHORIZED",
+        applicability_status="APPLICABLE",
     )
     finding = rule.evaluate(
         target_id="crit_01",
@@ -566,6 +811,9 @@ def test_evidence_fresh_rule_stale():
         evidence_id="ev_001",
         source_type="TELEMETRY",
         observed_at=(now - timedelta(hours=48)).isoformat(),
+        scope_status=ScopeStatus.AUTHORIZED,
+        classification_status="AUTHORIZED",
+        applicability_status="APPLICABLE",
     )
     finding = rule.evaluate(
         target_id="crit_01",
@@ -585,6 +833,9 @@ def test_evidence_fresh_rule_missing_timestamp():
         evidence_id="ev_001",
         source_type="TELEMETRY",
         observed_at=None,
+        scope_status=ScopeStatus.AUTHORIZED,
+        classification_status="AUTHORIZED",
+        applicability_status="APPLICABLE",
     )
     finding = rule.evaluate(
         target_id="crit_01",
@@ -597,6 +848,33 @@ def test_evidence_fresh_rule_missing_timestamp():
     assert "missing" in finding.explanation.lower()
 
 
+def test_historical_record_without_observation_timestamp_cannot_satisfy_evidence_fresh():
+    """Recently created historical record without observation timestamp fails freshness."""
+    rule = EvidenceFreshRule()
+    now = datetime.now(timezone.utc)
+    # Record has recent received/created time, but NO observation time
+    assessment = EvidenceAssessment(
+        evidence_id="ev_hist_01",
+        source_type="ACTION_RECORD",
+        observed_at=None,
+        received_at=now.isoformat(),
+        freshness_status=FreshnessStatus.TIMESTAMP_MISSING,
+        scope_status=ScopeStatus.AUTHORIZED,
+        classification_status="AUTHORIZED",
+        applicability_status="APPLICABLE",
+    )
+    finding = rule.evaluate(
+        target_id="crit_01",
+        target_type=VerificationTargetType.CRITERION,
+        assessments=[assessment],
+        mission_scope={"tenant_id": "t1", "workspace_id": "w1", "plant_id": "p1"},
+        parameters={"freshness_threshold_seconds": 3600.0},
+        now=now,
+    )
+    assert finding.status == VerificationStatus.INDETERMINATE
+    assert finding.status != VerificationStatus.VERIFIED
+
+
 def test_evidence_fresh_rule_future_timestamp():
     """Future-dated timestamp produces INDETERMINATE caveat."""
     rule = EvidenceFreshRule()
@@ -605,6 +883,9 @@ def test_evidence_fresh_rule_future_timestamp():
         evidence_id="ev_001",
         source_type="TELEMETRY",
         observed_at=(now + timedelta(hours=5)).isoformat(),
+        scope_status=ScopeStatus.AUTHORIZED,
+        classification_status="AUTHORIZED",
+        applicability_status="APPLICABLE",
     )
     finding = rule.evaluate(
         target_id="crit_01",
@@ -624,6 +905,9 @@ def test_required_evidence_present_rule():
     assessment = EvidenceAssessment(
         evidence_id="ev_001",
         source_type="TELEMETRY_LOG",
+        scope_status=ScopeStatus.AUTHORIZED,
+        classification_status="AUTHORIZED",
+        applicability_status="APPLICABLE",
     )
     # Satisfies
     f1 = rule.evaluate(
@@ -653,11 +937,15 @@ def test_evidence_scope_match_rule():
         evidence_id="ev_001",
         source_type="SENSOR",
         scope_status=ScopeStatus.AUTHORIZED,
+        classification_status="AUTHORIZED",
+        applicability_status="APPLICABLE",
     )
     a_bad = EvidenceAssessment(
         evidence_id="ev_002",
         source_type="SENSOR",
         scope_status=ScopeStatus.CROSS_PLANT,
+        classification_status="AUTHORIZED",
+        applicability_status="APPLICABLE",
     )
 
     f_ok = rule.evaluate("crit_01", VerificationTargetType.CRITERION, [a_ok], {}, {})
@@ -670,7 +958,13 @@ def test_evidence_scope_match_rule():
 def test_required_fields_present_rule():
     """Verifies presence of specified payload fields."""
     rule = RequiredFieldsPresentRule()
-    assessment = EvidenceAssessment(evidence_id="ev_001", source_type="RECORD")
+    assessment = EvidenceAssessment(
+        evidence_id="ev_001",
+        source_type="RECORD",
+        scope_status=ScopeStatus.AUTHORIZED,
+        classification_status="AUTHORIZED",
+        applicability_status="APPLICABLE",
+    )
 
     # Has required field
     f1 = rule.evaluate(
@@ -696,8 +990,20 @@ def test_required_fields_present_rule():
 def test_source_consistency_rule_agreement_and_conflict():
     """Consistent sources produce VERIFIED; conflicting values produce CONFLICTING."""
     rule = SourceConsistencyRule()
-    a1 = EvidenceAssessment(evidence_id="ev_001", source_type="SENSOR_A")
-    a2 = EvidenceAssessment(evidence_id="ev_002", source_type="SENSOR_B")
+    a1 = EvidenceAssessment(
+        evidence_id="ev_001",
+        source_type="SENSOR_A",
+        scope_status=ScopeStatus.AUTHORIZED,
+        classification_status="AUTHORIZED",
+        applicability_status="APPLICABLE",
+    )
+    a2 = EvidenceAssessment(
+        evidence_id="ev_002",
+        source_type="SENSOR_B",
+        scope_status=ScopeStatus.AUTHORIZED,
+        classification_status="AUTHORIZED",
+        applicability_status="APPLICABLE",
+    )
 
     # Consistent within tolerance
     f_agree = rule.evaluate(
@@ -1128,8 +1434,8 @@ def test_api_request_and_list_verifications(sample_mission):
 # 8. AGENT TOOL INTEGRATION TESTS
 # =============================================================================
 
-def test_agent_verification_tool(monkeypatch, v_service, sample_mission):
-    """Tests agent tool request_mission_verification_tool and findings inspection."""
+def test_agent_verification_tool(monkeypatch, v_service, sample_mission, analyst_identity):
+    """Tests agent tool request_mission_verification_tool and findings inspection with trusted identity."""
     import re
     try:
         from tools import verification_tools as vt
@@ -1137,11 +1443,11 @@ def test_agent_verification_tool(monkeypatch, v_service, sample_mission):
         from backend.tools import verification_tools as vt
     monkeypatch.setattr(vt, "verification_service", v_service)
 
+    # Inject trusted server-side identity context
+    vt.set_active_verification_identity(analyst_identity)
+
     res_str = request_mission_verification_tool.invoke({
         "mission_id": sample_mission.mission_id,
-        "tenant_id": "tenant_alpha",
-        "workspace_id": "workspace_prod",
-        "plant_id": "plant_01",
     })
     assert "[VERIFICATION COMPLETED]" in res_str
     assert sample_mission.mission_id in res_str
@@ -1155,9 +1461,78 @@ def test_agent_verification_tool(monkeypatch, v_service, sample_mission):
     find_str = get_mission_verification_findings_tool.invoke({
         "mission_id": sample_mission.mission_id,
         "verification_id": v_id,
-        "tenant_id": "tenant_alpha",
-        "workspace_id": "workspace_prod",
-        "plant_id": "plant_01",
     })
     assert "[VERIFICATION FINDINGS]" in find_str or "Verification Findings for Run" in find_str
     assert v_id in find_str
+
+
+def test_agent_tool_schema_has_no_model_controlled_identity_args():
+    """Proves that verification tools do not expose identity parameters to LLMs."""
+    req_args = request_mission_verification_tool.args
+    findings_args = get_mission_verification_findings_tool.args
+
+    forbidden = {
+        "tenant_id",
+        "workspace_id",
+        "plant_id",
+        "user_id",
+        "roles",
+        "permissions",
+        "clearance_level",
+        "assigned_plants",
+        "session_id",
+    }
+    req_leak = forbidden.intersection(set(req_args.keys()))
+    findings_leak = forbidden.intersection(set(findings_args.keys()))
+
+    assert len(req_leak) == 0, f"request_mission_verification_tool exposes identity parameters: {req_leak}"
+    assert len(findings_leak) == 0, f"get_mission_verification_findings_tool exposes identity parameters: {findings_leak}"
+
+
+def test_agent_tool_fails_closed_when_identity_context_missing(monkeypatch, v_service, sample_mission):
+    """Invocation must fail closed when trusted identity context is unavailable."""
+    try:
+        from tools import verification_tools as vt
+    except ImportError:
+        from backend.tools import verification_tools as vt
+    monkeypatch.setattr(vt, "verification_service", v_service)
+
+    # Ensure context is explicitly None
+    vt.set_active_verification_identity(None)
+
+    res_str = request_mission_verification_tool.invoke({
+        "mission_id": sample_mission.mission_id,
+    })
+    assert "[VERIFICATION BLOCKED]" in res_str
+    assert "Trusted caller identity context is unavailable" in res_str
+
+    findings_str = get_mission_verification_findings_tool.invoke({
+        "mission_id": sample_mission.mission_id,
+        "verification_id": "vrun_dummy",
+    })
+    assert "[FINDINGS RETRIEVAL BLOCKED]" in findings_str or "[FINDINGS BLOCKED]" in findings_str
+    assert "Trusted caller identity context is unavailable" in findings_str
+
+
+def test_agent_tool_cannot_forge_identity_via_kwargs(monkeypatch, v_service, sample_mission, analyst_identity):
+    """Model kwargs cannot forge tenant, workspace, plant, or grant elevated roles."""
+    try:
+        from tools import verification_tools as vt
+    except ImportError:
+        from backend.tools import verification_tools as vt
+    monkeypatch.setattr(vt, "verification_service", v_service)
+
+    # Trusted identity is for tenant_alpha, workspace_prod, plant_01
+    vt.set_active_verification_identity(analyst_identity)
+
+    # LLM attempts to pass forged cross-tenant and cross-plant arguments
+    res_str = request_mission_verification_tool.invoke({
+        "mission_id": sample_mission.mission_id,
+        "tenant_id": "forged_tenant_evil",
+        "workspace_id": "forged_workspace_evil",
+        "plant_id": "forged_plant_999",
+        "roles": ["ADMIN", "SUPERUSER"],
+    })
+    # Operation executes strictly under analyst_identity (tenant_alpha), ignoring model kwargs
+    assert "[VERIFICATION COMPLETED]" in res_str
+    assert sample_mission.mission_id in res_str

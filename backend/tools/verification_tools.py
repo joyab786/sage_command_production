@@ -1,21 +1,29 @@
 # backend/tools/verification_tools.py
 """
-SageCommand V3 — Agent Verification Tools (Prompt 36)
+SageCommand V3 — Agent Verification Tools (Prompt 36 / 36A Hardened)
 
 Provides governed, read-only verification inspection tools for LangGraph agents.
-Enforces the mandatory verification boundary:
-- Agents may request verification, inspect authorized findings, summarize limitations,
-  and recommend follow-up evidence collection.
+Enforces the mandatory verification boundary and trusted identity invariants:
+- Trusted identity context MUST come from server-injected runtime context (_verification_identity_context_var).
+- Model-visible argument schemas MUST NOT include identity, tenant, workspace, plant, user, role, or clearance fields.
+- Tools FAIL CLOSED immediately if trusted server identity context is unavailable.
+- Tools NEVER manufacture fallback identity (tenant_default, plant_001, agent_verifier).
+- Tools NEVER grant fixed roles (ANALYST, VIEWER) inside the tool implementation.
 - Agents CANNOT forge verification results, declare missing evidence valid, override
   deterministic rules, mark operational steps completed, approve actions, change mission scope,
   or execute missions.
+- Raw exception details are never leaked to model callers.
 
 A VERIFICATION RUN ASSESSES EVIDENCE AND VERIFICATION FINDINGS ONLY — NEVER CONSTITUTES
 OPERATIONAL EXECUTION AUTHORITY, AUTONOMOUS EXECUTION, OR PHYSICAL MACHINE CONTROL.
 """
 
+import logging
+from contextvars import ContextVar
 from typing import Dict, Any, Optional, List
 from langchain_core.tools import tool
+
+logger = logging.getLogger("verification_tools")
 
 try:
     from core.auth import Identity
@@ -36,6 +44,24 @@ except (ImportError, ModuleNotFoundError):
     )
     from backend.services.verification_service import verification_service
 
+# Thread-safe, async-safe context variable for server-authoritative caller identity
+_verification_identity_context_var: ContextVar[Optional[Identity]] = ContextVar(
+    "verification_identity_context", default=None
+)
+
+
+def set_active_verification_identity(identity: Optional[Identity]) -> None:
+    """
+    Binds trusted, server-authoritative Identity context for verification tool execution.
+    Must be called by server orchestration before invoking model tool nodes.
+    """
+    _verification_identity_context_var.set(identity)
+
+
+def get_active_verification_identity() -> Optional[Identity]:
+    """Retrieves active trusted Identity context from server environment."""
+    return _verification_identity_context_var.get()
+
 
 @tool
 def request_mission_verification_tool(
@@ -43,27 +69,22 @@ def request_mission_verification_tool(
     target_type: Optional[str] = None,
     target_id: Optional[str] = None,
     freshness_threshold_override_seconds: Optional[float] = None,
-    tenant_id: str = "tenant_default",
-    workspace_id: str = "workspace_default",
-    plant_id: str = "plant_001",
-    user_id: str = "agent_verifier",
 ) -> str:
     """
     Requests continuous evidence-driven verification for a governed mission.
     Evaluates whether mission criteria or steps are supported by current, authorized evidence.
     Returns deterministic status, verified/unverified counts, and summary.
     Does NOT execute actions or complete steps.
+    Requires active, server-authenticated identity context.
     """
-    try:
-        # Construct caller identity
-        identity = Identity(
-            user_id=user_id,
-            tenant_id=tenant_id,
-            workspace_id=workspace_id,
-            plant_id=plant_id,
-            roles=["ANALYST"],
+    identity = get_active_verification_identity()
+    if not identity:
+        return (
+            "[VERIFICATION BLOCKED] Trusted caller identity context is unavailable. "
+            "Verification operations require an authenticated server context."
         )
 
+    try:
         tt_enum = None
         if target_type:
             tt_clean = target_type.upper().strip()
@@ -96,32 +117,32 @@ def request_mission_verification_tool(
             f"Limitations Count: {len(run.provenance.limitations)}"
         )
     except Exception as e:
-        return f"[VERIFICATION ERROR] Could not verify mission '{mission_id}': {str(e)}"
+        logger.error("Error executing verification tool for mission '%s': %s", mission_id, e, exc_info=True)
+        return (
+            f"[VERIFICATION ERROR] Could not verify mission '{mission_id}'. "
+            f"A server-side error occurred during verification processing."
+        )
 
 
 @tool
 def get_mission_verification_findings_tool(
     mission_id: str,
     verification_id: str,
-    tenant_id: str = "tenant_default",
-    workspace_id: str = "workspace_default",
-    plant_id: str = "plant_001",
-    user_id: str = "agent_verifier",
 ) -> str:
     """
     Inspects authorized verification findings for a mission verification run.
     Explains which criteria or steps are verified, unverified, stale, conflicting, or blocked,
     along with evidence references and recorded limitations.
+    Requires active, server-authenticated identity context.
     """
-    try:
-        identity = Identity(
-            user_id=user_id,
-            tenant_id=tenant_id,
-            workspace_id=workspace_id,
-            plant_id=plant_id,
-            roles=["VIEWER"],
+    identity = get_active_verification_identity()
+    if not identity:
+        return (
+            "[FINDINGS RETRIEVAL BLOCKED] Trusted caller identity context is unavailable. "
+            "Findings inspection requires an authenticated server context."
         )
 
+    try:
         findings = verification_service.get_verification_findings(
             identity=identity,
             mission_id=mission_id.strip(),
@@ -144,4 +165,14 @@ def get_mission_verification_findings_tool(
             )
         return "\n".join(lines)
     except Exception as e:
-        return f"[FINDINGS RETRIEVAL ERROR] Failed to fetch findings: {str(e)}"
+        logger.error(
+            "Error retrieving verification findings for run '%s' on mission '%s': %s",
+            verification_id,
+            mission_id,
+            e,
+            exc_info=True,
+        )
+        return (
+            f"[FINDINGS RETRIEVAL ERROR] Could not fetch findings for verification run "
+            f"'{verification_id}' on mission '{mission_id}'. A server-side error occurred."
+        )

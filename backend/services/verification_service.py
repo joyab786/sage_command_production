@@ -244,6 +244,22 @@ class VerificationService:
         canonical_json = json.dumps(payload_dict, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
 
+    def _evaluate_clearance(self, identity: Identity, required_clearance: int = 1) -> str:
+        """
+        Evaluates whether caller identity satisfies the required classification clearance.
+        Fails closed: if clearance_level is missing or lower than required, returns 'CLEARANCE_INSUFFICIENT'.
+        """
+        user_clearance = getattr(identity, "clearance_level", None)
+        if user_clearance is None:
+            return "CLEARANCE_INSUFFICIENT"
+        try:
+            user_clearance_int = int(user_clearance)
+        except (ValueError, TypeError):
+            return "CLEARANCE_INSUFFICIENT"
+        if user_clearance_int < required_clearance:
+            return "CLEARANCE_INSUFFICIENT"
+        return "AUTHORIZED"
+
     def _resolve_evidence_item(
         self,
         ref_id: str,
@@ -254,7 +270,8 @@ class VerificationService:
     ) -> Tuple[EvidenceAssessment, Dict[str, Any]]:
         """
         Resolves an individual evidence reference through canonical subsystem interfaces.
-        Validates tenant, workspace, and plant scope, integrity, and freshness.
+        Validates tenant, workspace, plant scope, classification clearance, integrity, and freshness.
+        Enforces strict timestamp semantics: observation time is never synthesized from creation/ingestion time.
         Returns both EvidenceAssessment and the resolved raw payload dictionary.
         """
         m_tenant = mission.scope.tenant_id
@@ -272,8 +289,22 @@ class VerificationService:
             else:
                 scope_status = ScopeStatus.AUTHORIZED
 
-            val_status = rec.get("validation_status", "UNKNOWN").upper()
-            observed_at = rec.get("observed_at") or rec.get("created_at")
+            # Classification clearance
+            rec_payload = rec.get("payload") or {}
+            rec_class = str(rec_payload.get("classification") or rec.get("classification") or "INTERNAL").upper()
+            req_clearance = 1
+            if rec_class in ("CONFIDENTIAL", "2"):
+                req_clearance = 2
+            elif rec_class in ("RESTRICTED", "3"):
+                req_clearance = 3
+            elif rec_class in ("TOP_SECRET", "4"):
+                req_clearance = 4
+            classification_status = self._evaluate_clearance(identity, req_clearance)
+
+            val_status = str(rec.get("validation_status", "UNKNOWN")).upper()
+            # Strict timestamp semantics: observation time is strictly observed_at; never fallback to created_at
+            observed_at = rec.get("observed_at")
+            received_at = rec.get("received_at") or rec.get("created_at")
 
             # Evaluate freshness
             obs_dt = _parse_iso_timestamp(observed_at)
@@ -291,31 +322,51 @@ class VerificationService:
             else:
                 freshness_status = FreshnessStatus.TIMESTAMP_MISSING
 
-            quality_status = QualityStatus.VALID if val_status == "VALID" else (
-                QualityStatus.INVALID if val_status == "INVALID" else QualityStatus.UNVERIFIED
+            # Integrity and quality
+            if val_status == "VALID":
+                integrity_status = "VALID"
+                quality_status = QualityStatus.VALID
+            elif val_status == "INVALID":
+                integrity_status = "INVALID"
+                quality_status = QualityStatus.INVALID
+            elif val_status == "CONFLICTING":
+                integrity_status = "CONFLICTING"
+                quality_status = QualityStatus.CONFLICTING
+            elif val_status == "INCOMPLETE":
+                integrity_status = "INCOMPLETE"
+                quality_status = QualityStatus.INCOMPLETE
+            else:
+                integrity_status = "UNVERIFIED"
+                quality_status = QualityStatus.UNVERIFIED
+
+            applicability_status = (
+                "APPLICABLE"
+                if (scope_status == ScopeStatus.AUTHORIZED and classification_status == "AUTHORIZED")
+                else "UNKNOWN"
             )
 
-            payload = rec.get("payload") or {}
             assessment = EvidenceAssessment(
                 evidence_id=ref_id,
                 source_type=rec.get("source_type", "EVIDENCE_RECORD"),
                 source_reference=rec.get("source_record_id"),
                 observed_at=observed_at,
-                received_at=rec.get("created_at"),
+                received_at=received_at,
                 freshness_status=freshness_status,
                 freshness_seconds=freshness_sec,
                 freshness_threshold_seconds=freshness_threshold,
-                integrity_status=val_status,
+                integrity_status=integrity_status,
                 scope_status=scope_status,
+                classification_status=classification_status,
+                applicability_status=applicability_status,
                 quality_status=quality_status,
                 limitations=[],
             )
-            return assessment, payload
+            return assessment, rec_payload
 
         # 2. Check ActionStore (prefixed or raw action_id)
         act = action_store.get_by_scope(ref_id, m_tenant, m_ws)
         if act:
-            act_plant = act.plant_id
+            act_plant = act.target.plant_id if hasattr(act, "target") and hasattr(act.target, "plant_id") else getattr(act, "plant_id", None)
             if not act_plant:
                 scope_status = ScopeStatus.UNTAGGED_PLANT
             elif act_plant != m_plant:
@@ -323,15 +374,31 @@ class VerificationService:
             else:
                 scope_status = ScopeStatus.AUTHORIZED
 
-            obs_dt = _parse_iso_timestamp(act.updated_at or act.created_at)
-            freshness_status = FreshnessStatus.UNKNOWN
+            classification_status = self._evaluate_clearance(identity, 1)
+
+            # Action proposals do not carry physical sensor observation timestamps
+            observed_at = None
+            received_at = act.created_at
+            freshness_status = FreshnessStatus.TIMESTAMP_MISSING
             freshness_sec = None
-            if obs_dt:
-                age = (eval_dt - obs_dt).total_seconds()
-                freshness_sec = max(0.0, age)
-                freshness_status = FreshnessStatus.STALE if age > freshness_threshold else FreshnessStatus.CURRENT
+
+            # Integrity check against action cryptographic hash
+            has_valid_hash = bool(act.action_hash and act.action_hash == act.compute_hash())
+            if has_valid_hash and act.status in ("SUCCEEDED", "READY", "APPROVED"):
+                integrity_status = "VALID"
+                quality_status = QualityStatus.VALID
+            elif act.status in ("FAILED", "ROLLBACK_FAILED", "CANCELLED", "REJECTED"):
+                integrity_status = "INVALID"
+                quality_status = QualityStatus.INVALID
             else:
-                freshness_status = FreshnessStatus.TIMESTAMP_MISSING
+                integrity_status = "UNVERIFIED"
+                quality_status = QualityStatus.UNVERIFIED
+
+            applicability_status = (
+                "APPLICABLE"
+                if (scope_status == ScopeStatus.AUTHORIZED and classification_status == "AUTHORIZED")
+                else "UNKNOWN"
+            )
 
             payload = act.parameters if isinstance(act.parameters, dict) else (
                 act.parameters.model_dump() if hasattr(act.parameters, "model_dump") else {}
@@ -340,47 +407,64 @@ class VerificationService:
                 evidence_id=ref_id,
                 source_type="ACTION_RECORD",
                 source_reference=act.action_id,
-                observed_at=act.updated_at or act.created_at,
-                received_at=act.created_at,
+                observed_at=observed_at,
+                received_at=received_at,
                 freshness_status=freshness_status,
                 freshness_seconds=freshness_sec,
                 freshness_threshold_seconds=freshness_threshold,
-                integrity_status="VALID",
+                integrity_status=integrity_status,
                 scope_status=scope_status,
-                quality_status=QualityStatus.VALID,
-                limitations=[],
+                classification_status=classification_status,
+                applicability_status=applicability_status,
+                quality_status=quality_status,
+                limitations=["Action proposal does not contain primary physical observation timestamp."],
             )
             return assessment, payload
 
         # 3. Check DecisionEngineRepository
         dec = self.decision_repo.get_by_id(ref_id, m_tenant, m_ws, m_plant)
         if dec:
-            obs_dt_str = dec.assessment_timestamp if hasattr(dec, "assessment_timestamp") else getattr(dec, "evaluated_at", None)
-            obs_dt = _parse_iso_timestamp(obs_dt_str)
-            freshness_status = FreshnessStatus.UNKNOWN
+            scope_status = ScopeStatus.AUTHORIZED
+            classification_status = self._evaluate_clearance(identity, 1)
+
+            # Decision evaluation is an analytical assessment, not a physical sensor observation
+            observed_at = None
+            received_at = getattr(dec, "assessment_timestamp", None) or getattr(dec, "evaluated_at", None)
+            freshness_status = FreshnessStatus.TIMESTAMP_MISSING
             freshness_sec = None
-            if obs_dt:
-                age = (eval_dt - obs_dt).total_seconds()
-                freshness_sec = max(0.0, age)
-                freshness_status = FreshnessStatus.STALE if age > freshness_threshold else FreshnessStatus.CURRENT
+
+            if dec.fingerprint and dec.status.value in ("OPTIMAL", "ACCEPTABLE", "SUBOPTIMAL"):
+                integrity_status = "VALID"
+                quality_status = QualityStatus.VALID
+            elif dec.status.value in ("REJECTED", "FAILED"):
+                integrity_status = "INVALID"
+                quality_status = QualityStatus.INVALID
             else:
-                freshness_status = FreshnessStatus.CURRENT
-                freshness_sec = 0.0
+                integrity_status = "UNVERIFIED"
+                quality_status = QualityStatus.UNVERIFIED
+
+            applicability_status = (
+                "APPLICABLE"
+                if (scope_status == ScopeStatus.AUTHORIZED and classification_status == "AUTHORIZED")
+                else "UNKNOWN"
+            )
 
             payload = dec.metadata or {}
             assessment = EvidenceAssessment(
                 evidence_id=ref_id,
                 source_type="DECISION_RECORD",
                 source_reference=dec.decision_id,
-                observed_at=obs_dt_str,
-                received_at=None,
+                observed_at=observed_at,
+                received_at=received_at,
                 freshness_status=freshness_status,
                 freshness_seconds=freshness_sec,
                 freshness_threshold_seconds=freshness_threshold,
-                integrity_status="VALID",
-                scope_status=ScopeStatus.AUTHORIZED,
-                quality_status=QualityStatus.VALID,
-                limitations=[],
+                integrity_status=integrity_status,
+                scope_status=scope_status,
+                classification_status=classification_status,
+                applicability_status=applicability_status,
+                quality_status=quality_status,
+                limitations=["Decision evaluation contains analytical assessment timestamp, not sensor observation."],
             )
             return assessment, payload
 
@@ -388,7 +472,47 @@ class VerificationService:
         inc = self.incident_repo.get_incident_scoped(ref_id, m_tenant, m_ws)
         if inc:
             inc_plant = inc.plant_id
-            scope_status = ScopeStatus.AUTHORIZED if inc_plant == m_plant else ScopeStatus.CROSS_PLANT
+            if not inc_plant:
+                scope_status = ScopeStatus.UNTAGGED_PLANT
+            elif inc_plant != m_plant:
+                scope_status = ScopeStatus.CROSS_PLANT
+            else:
+                scope_status = ScopeStatus.AUTHORIZED
+
+            classification_status = self._evaluate_clearance(identity, 1)
+
+            # Observation timestamp is detected_at; do not substitute created_at or opened_at
+            observed_at = getattr(inc, "detected_at", None)
+            received_at = getattr(inc, "opened_at", None) or getattr(inc, "created_at", None)
+
+            obs_dt = _parse_iso_timestamp(observed_at)
+            freshness_status = FreshnessStatus.UNKNOWN
+            freshness_sec = None
+            if obs_dt:
+                age = (eval_dt - obs_dt).total_seconds()
+                freshness_sec = max(0.0, age)
+                if age < -60.0:
+                    freshness_status = FreshnessStatus.FUTURE_DATED
+                elif age > freshness_threshold:
+                    freshness_status = FreshnessStatus.STALE
+                else:
+                    freshness_status = FreshnessStatus.CURRENT
+            else:
+                freshness_status = FreshnessStatus.TIMESTAMP_MISSING
+
+            if getattr(inc, "incident_fingerprint", None) and inc.status.value in ("OPEN", "ACKNOWLEDGED", "RESOLVED", "CLOSED"):
+                integrity_status = "VALID"
+                quality_status = QualityStatus.VALID
+            else:
+                integrity_status = "UNVERIFIED"
+                quality_status = QualityStatus.UNVERIFIED
+
+            applicability_status = (
+                "APPLICABLE"
+                if (scope_status == ScopeStatus.AUTHORIZED and classification_status == "AUTHORIZED")
+                else "UNKNOWN"
+            )
+
             payload = {
                 "category": inc.category.value,
                 "severity": inc.severity.value,
@@ -399,15 +523,17 @@ class VerificationService:
                 evidence_id=ref_id,
                 source_type="INCIDENT_RECORD",
                 source_reference=inc.incident_id,
-                observed_at=inc.created_at,
-                received_at=inc.created_at,
-                freshness_status=FreshnessStatus.CURRENT,
-                freshness_seconds=0.0,
+                observed_at=observed_at,
+                received_at=received_at,
+                freshness_status=freshness_status,
+                freshness_seconds=freshness_sec,
                 freshness_threshold_seconds=freshness_threshold,
-                integrity_status="VALID",
+                integrity_status=integrity_status,
                 scope_status=scope_status,
-                quality_status=QualityStatus.VALID,
-                limitations=[],
+                classification_status=classification_status,
+                applicability_status=applicability_status,
+                quality_status=quality_status,
+                limitations=[] if observed_at else ["Incident record missing detected_at observation timestamp."],
             )
             return assessment, payload
 
@@ -415,21 +541,53 @@ class VerificationService:
         rca = self.rca_repo.get_analysis_scoped(ref_id, m_tenant, m_ws)
         if rca:
             rca_plant = rca.plant_id
-            scope_status = ScopeStatus.AUTHORIZED if rca_plant == m_plant else ScopeStatus.CROSS_PLANT
+            if not rca_plant:
+                scope_status = ScopeStatus.UNTAGGED_PLANT
+            elif rca_plant != m_plant:
+                scope_status = ScopeStatus.CROSS_PLANT
+            else:
+                scope_status = ScopeStatus.AUTHORIZED
+
+            # Root Cause Analyses require elevated clearance (Level 2 Confidential)
+            classification_status = self._evaluate_clearance(identity, 2)
+
+            observed_at = None
+            received_at = getattr(rca, "completed_at", None) or getattr(rca, "started_at", None)
+            freshness_status = FreshnessStatus.TIMESTAMP_MISSING
+            freshness_sec = None
+
+            if getattr(rca, "input_fingerprint", None) and rca.status.value == "COMPLETED":
+                integrity_status = "VALID"
+                quality_status = QualityStatus.VALID
+            elif rca.status.value in ("FAILED", "CANCELLED"):
+                integrity_status = "INVALID"
+                quality_status = QualityStatus.INVALID
+            else:
+                integrity_status = "UNVERIFIED"
+                quality_status = QualityStatus.UNVERIFIED
+
+            applicability_status = (
+                "APPLICABLE"
+                if (scope_status == ScopeStatus.AUTHORIZED and classification_status == "AUTHORIZED")
+                else "UNKNOWN"
+            )
+
             payload = {"status": rca.status.value, "incident_id": rca.incident_id}
             assessment = EvidenceAssessment(
                 evidence_id=ref_id,
                 source_type="RCA_RECORD",
                 source_reference=rca.analysis_id,
-                observed_at=rca.created_at,
-                received_at=rca.created_at,
-                freshness_status=FreshnessStatus.CURRENT,
-                freshness_seconds=0.0,
+                observed_at=observed_at,
+                received_at=received_at,
+                freshness_status=freshness_status,
+                freshness_seconds=freshness_sec,
                 freshness_threshold_seconds=freshness_threshold,
-                integrity_status="VALID",
+                integrity_status=integrity_status,
                 scope_status=scope_status,
-                quality_status=QualityStatus.VALID,
-                limitations=[],
+                classification_status=classification_status,
+                applicability_status=applicability_status,
+                quality_status=quality_status,
+                limitations=["RCA record represents investigation synthesis, not primary observation."],
             )
             return assessment, payload
 
@@ -437,26 +595,63 @@ class VerificationService:
         mem = self.memory_repo.get_entry(m_tenant, m_ws, ref_id)
         if mem:
             mem_plant = mem.plant_id
-            scope_status = ScopeStatus.AUTHORIZED if mem_plant == m_plant else ScopeStatus.CROSS_PLANT
-            obs_dt_str = mem.created_at.isoformat() if hasattr(mem.created_at, "isoformat") else str(mem.created_at)
+            if not mem_plant:
+                scope_status = ScopeStatus.UNTAGGED_PLANT
+            elif mem_plant != m_plant:
+                scope_status = ScopeStatus.CROSS_PLANT
+            else:
+                scope_status = ScopeStatus.AUTHORIZED
+
+            # Check memory entry classification clearance
+            mem_class_str = str(getattr(mem, "classification", "INTERNAL")).upper()
+            req_clear = 1
+            if mem_class_str in ("CONFIDENTIAL", "2"):
+                req_clear = 2
+            elif mem_class_str in ("RESTRICTED", "3"):
+                req_clear = 3
+            classification_status = self._evaluate_clearance(identity, req_clear)
+
+            observed_at = None
+            received_at = mem.created_at.isoformat() if hasattr(mem.created_at, "isoformat") else str(mem.created_at)
+            freshness_status = FreshnessStatus.TIMESTAMP_MISSING
+            freshness_sec = None
+
+            if mem.status.value in ("VERIFIED", "ACTIVE") and mem.epistemic_status.value == "VERIFIED_OUTCOME":
+                integrity_status = "VALID"
+                quality_status = QualityStatus.VALID
+            elif mem.status.value in ("REVOKED", "REJECTED"):
+                integrity_status = "INVALID"
+                quality_status = QualityStatus.INVALID
+            else:
+                integrity_status = "UNVERIFIED"
+                quality_status = QualityStatus.UNVERIFIED
+
+            applicability_status = (
+                "APPLICABLE"
+                if (scope_status == ScopeStatus.AUTHORIZED and classification_status == "AUTHORIZED")
+                else "UNKNOWN"
+            )
+
             payload = mem.metadata or {}
             assessment = EvidenceAssessment(
                 evidence_id=ref_id,
                 source_type="MEMORY_RECORD",
                 source_reference=mem.memory_id,
-                observed_at=obs_dt_str,
-                received_at=obs_dt_str,
-                freshness_status=FreshnessStatus.CURRENT,
-                freshness_seconds=0.0,
+                observed_at=observed_at,
+                received_at=received_at,
+                freshness_status=freshness_status,
+                freshness_seconds=freshness_sec,
                 freshness_threshold_seconds=freshness_threshold,
-                integrity_status="VALID",
+                integrity_status=integrity_status,
                 scope_status=scope_status,
-                quality_status=QualityStatus.VALID,
-                limitations=[],
+                classification_status=classification_status,
+                applicability_status=applicability_status,
+                quality_status=quality_status,
+                limitations=["Organizational memory entry lacks primary operational sensor timestamp."],
             )
             return assessment, payload
 
-        # Missing or inaccessible record
+        # Missing or inaccessible record: fail closed without disclosing record existence
         assessment = EvidenceAssessment(
             evidence_id=ref_id,
             source_type="UNKNOWN",
@@ -468,6 +663,7 @@ class VerificationService:
             freshness_threshold_seconds=freshness_threshold,
             integrity_status="UNVERIFIED",
             scope_status=ScopeStatus.UNKNOWN,
+            classification_status="UNKNOWN",
             applicability_status="UNAVAILABLE",
             quality_status=QualityStatus.UNKNOWN,
             limitations=[f"Evidence reference '{ref_id}' could not be resolved within authorized scope."],
@@ -671,22 +867,25 @@ class VerificationService:
             summary = "No targets were eligible or requested for verification."
         elif blocked_count > 0:
             overall_status = VerificationStatus.BLOCKED
-            summary = f"{blocked_count} verification target(s) blocked due to scope boundary violations."
-        elif conflicting_count > 0:
-            overall_status = VerificationStatus.CONFLICTING
-            summary = f"{conflicting_count} verification target(s) have conflicting evidence sources."
-        elif stale_count > 0 and (unverified_count == 0 and failed_count == 0):
-            overall_status = VerificationStatus.STALE
-            summary = f"{stale_count} verification target(s) rely on stale evidence beyond threshold ({freshness_threshold:.0f}s)."
+            summary = f"{blocked_count} verification target(s) blocked due to scope boundary or clearance restrictions."
         elif failed_count > 0:
             overall_status = VerificationStatus.FAILED
             summary = f"{failed_count} verification check(s) failed evaluation preconditions."
+        elif conflicting_count > 0:
+            overall_status = VerificationStatus.CONFLICTING
+            summary = f"{conflicting_count} verification target(s) have conflicting evidence sources."
+        elif unverified_count > 0:
+            overall_status = VerificationStatus.NOT_VERIFIED
+            summary = f"{unverified_count} of {target_count} target(s) remain unverified due to missing, invalid, or inadequate evidence."
+        elif indeterminate_count > 0:
+            overall_status = VerificationStatus.INDETERMINATE
+            summary = f"{indeterminate_count} target(s) have indeterminate, unverified, or unproven evidence."
+        elif stale_count > 0:
+            overall_status = VerificationStatus.STALE
+            summary = f"{stale_count} verification target(s) rely on stale evidence beyond threshold ({freshness_threshold:.0f}s)."
         elif verified_count == target_count:
             overall_status = VerificationStatus.VERIFIED
             summary = f"All {target_count} target(s) successfully verified by authorized, current evidence."
-        elif unverified_count > 0:
-            overall_status = VerificationStatus.NOT_VERIFIED
-            summary = f"{unverified_count} of {target_count} target(s) remain unverified due to missing or inadequate evidence."
         else:
             overall_status = VerificationStatus.INDETERMINATE
             summary = f"{indeterminate_count} target(s) have indeterminate evidence."

@@ -157,16 +157,57 @@ class EvidenceExistsRule(BaseDeterministicRule):
                 evaluated_at=now_iso,
             )
 
-        # Filter to accessible, scope-authorized items
-        authorized = [
+        # 1. Scope & clearance boundary violation check: fail closed
+        blocked_items = [
             a for a in assessments
-            if a.scope_status == ScopeStatus.AUTHORIZED and a.applicability_status == "APPLICABLE"
+            if a.scope_status in (ScopeStatus.UNAUTHORIZED, ScopeStatus.CROSS_PLANT, ScopeStatus.REJECTED, ScopeStatus.UNTAGGED_PLANT)
+            or a.classification_status in ("BLOCKED", "CLEARANCE_INSUFFICIENT")
         ]
 
-        if not authorized:
+        # 2. Check for missing repository records
+        missing_items = [
+            a for a in assessments
+            if a.applicability_status == "UNAVAILABLE" or a.source_type == "UNKNOWN"
+        ]
+
+        # 3. Authorized and applicable records
+        authorized = [
+            a for a in assessments
+            if a.scope_status == ScopeStatus.AUTHORIZED
+            and a.classification_status in ("AUTHORIZED", "CLEARANCE_SUFFICIENT")
+            and a.applicability_status == "APPLICABLE"
+        ]
+
+        if authorized:
+            ev_ids = [a.evidence_id for a in authorized]
+            if blocked_items:
+                for b in blocked_items:
+                    limitations.append(f"Evidence '{b.evidence_id}' excluded due to scope or clearance boundary restrictions.")
+            return VerificationFinding(
+                finding_id=finding_id,
+                target_type=target_type,
+                target_id=target_id,
+                status=VerificationStatus.VERIFIED,
+                evidence_references=ev_ids,
+                evidence_assessments=assessments,
+                rule_id=self.rule_id,
+                rule_version=self.rule_version,
+                explanation=(
+                    f"Verified presence of {len(authorized)} accessible, scope-authorized evidence record(s) "
+                    f"for target '{target_id}'. Notice: Evidence existence confirms record presence only — "
+                    f"does not self-certify operational completion or outcome."
+                ),
+                limitations=limitations,
+                evaluated_at=now_iso,
+            )
+
+        # If all items are blocked
+        if blocked_items and len(blocked_items) == len(assessments):
             for a in assessments:
                 if a.scope_status != ScopeStatus.AUTHORIZED:
                     limitations.append(f"Evidence '{a.evidence_id}' rejected due to scope boundary violation: {a.scope_status.value}.")
+                elif a.classification_status in ("BLOCKED", "CLEARANCE_INSUFFICIENT"):
+                    limitations.append(f"Evidence '{a.evidence_id}' rejected due to classification clearance restriction.")
             return VerificationFinding(
                 finding_id=finding_id,
                 target_type=target_type,
@@ -176,23 +217,55 @@ class EvidenceExistsRule(BaseDeterministicRule):
                 evidence_assessments=assessments,
                 rule_id=self.rule_id,
                 rule_version=self.rule_version,
-                explanation=f"Evidence exists for target '{target_id}' but was rejected due to scope boundary isolation.",
+                explanation=f"Evidence exists for target '{target_id}' but was rejected due to scope or clearance boundary isolation.",
                 limitations=limitations,
                 evaluated_at=now_iso,
             )
 
-        ev_ids = [a.evidence_id for a in authorized]
+        # If all items are missing/not found
+        if missing_items and len(missing_items) == len(assessments):
+            return VerificationFinding(
+                finding_id=finding_id,
+                target_type=target_type,
+                target_id=target_id,
+                status=VerificationStatus.NOT_VERIFIED,
+                evidence_references=[a.evidence_id for a in assessments],
+                evidence_assessments=assessments,
+                rule_id=self.rule_id,
+                rule_version=self.rule_version,
+                explanation=f"No evidence records found in repository for target '{target_id}'. Condition remains unverified.",
+                limitations=["Evidence repository contains no matching records."],
+                evaluated_at=now_iso,
+            )
+
+        if blocked_items:
+            for b in blocked_items:
+                limitations.append(f"Evidence '{b.evidence_id}' rejected due to scope or clearance boundary violation.")
+            return VerificationFinding(
+                finding_id=finding_id,
+                target_type=target_type,
+                target_id=target_id,
+                status=VerificationStatus.BLOCKED,
+                evidence_references=[a.evidence_id for a in assessments],
+                evidence_assessments=assessments,
+                rule_id=self.rule_id,
+                rule_version=self.rule_version,
+                explanation=f"Target '{target_id}' verification blocked due to scope boundary violation or insufficient classification clearance.",
+                limitations=limitations,
+                evaluated_at=now_iso,
+            )
+
         return VerificationFinding(
             finding_id=finding_id,
             target_type=target_type,
             target_id=target_id,
-            status=VerificationStatus.VERIFIED,
-            evidence_references=ev_ids,
+            status=VerificationStatus.NOT_VERIFIED,
+            evidence_references=[a.evidence_id for a in assessments],
             evidence_assessments=assessments,
             rule_id=self.rule_id,
             rule_version=self.rule_version,
-            explanation=f"Found {len(authorized)} authorized evidence item(s) supporting target '{target_id}'.",
-            limitations=limitations,
+            explanation=f"Evidence for target '{target_id}' does not satisfy existence criteria within authorized scope.",
+            limitations=["Evidence records unresolved or unavailable."],
             evaluated_at=now_iso,
         )
 
@@ -235,13 +308,61 @@ class EvidenceValidatedRule(BaseDeterministicRule):
                 evaluated_at=now_iso,
             )
 
-        invalid_items = [a for a in assessments if a.integrity_status.upper() == "INVALID" or a.quality_status == QualityStatus.INVALID]
-        unverified_items = [a for a in assessments if a.integrity_status.upper() == "UNVERIFIED" or a.quality_status == QualityStatus.UNVERIFIED]
-        valid_items = [a for a in assessments if a.integrity_status.upper() == "VALID" or a.quality_status == QualityStatus.VALID]
+        # 1. Scope & clearance boundary check: fail closed without leaking details
+        blocked_items = [
+            a for a in assessments
+            if a.scope_status in (ScopeStatus.UNAUTHORIZED, ScopeStatus.CROSS_PLANT, ScopeStatus.REJECTED, ScopeStatus.UNTAGGED_PLANT)
+            or a.classification_status in ("BLOCKED", "CLEARANCE_INSUFFICIENT")
+        ]
+        if blocked_items:
+            for b in blocked_items:
+                limitations.append(f"Evidence '{b.evidence_id}' rejected due to scope or clearance boundary violation.")
+            return VerificationFinding(
+                finding_id=finding_id,
+                target_type=target_type,
+                target_id=target_id,
+                status=VerificationStatus.BLOCKED,
+                evidence_references=[a.evidence_id for a in assessments],
+                evidence_assessments=assessments,
+                rule_id=self.rule_id,
+                rule_version=self.rule_version,
+                explanation=f"Target '{target_id}' verification blocked due to scope boundary violation or insufficient classification clearance in supporting evidence.",
+                limitations=limitations,
+                evaluated_at=now_iso,
+            )
 
+        # 2. Explicit conflict check
+        conflicting_items = [
+            a for a in assessments
+            if a.quality_status == QualityStatus.CONFLICTING or a.integrity_status.upper() == "CONFLICTING"
+        ]
+        if conflicting_items:
+            for c in conflicting_items:
+                limitations.append(f"Evidence '{c.evidence_id}' explicitly flagged as CONFLICTING.")
+            return VerificationFinding(
+                finding_id=finding_id,
+                target_type=target_type,
+                target_id=target_id,
+                status=VerificationStatus.CONFLICTING,
+                evidence_references=[a.evidence_id for a in assessments],
+                evidence_assessments=assessments,
+                rule_id=self.rule_id,
+                rule_version=self.rule_version,
+                explanation=f"Conflicting evidence sources detected for target '{target_id}'. Condition cannot be verified.",
+                limitations=limitations,
+                evaluated_at=now_iso,
+            )
+
+        # 3. Invalid items check
+        invalid_items = [
+            a for a in assessments
+            if a.integrity_status.upper() == "INVALID"
+            or a.quality_status == QualityStatus.INVALID
+            or a.applicability_status in ("INAPPLICABLE", "TARGET_MISMATCH")
+        ]
         if invalid_items:
             for inv in invalid_items:
-                limitations.append(f"Evidence '{inv.evidence_id}' failed cryptographic or schema integrity check.")
+                limitations.append(f"Evidence '{inv.evidence_id}' failed integrity validation check.")
             return VerificationFinding(
                 finding_id=finding_id,
                 target_type=target_type,
@@ -256,7 +377,18 @@ class EvidenceValidatedRule(BaseDeterministicRule):
                 evaluated_at=now_iso,
             )
 
-        if unverified_items and not valid_items:
+        # 4. Unverified / unknown / incomplete items check (Mixed collections FAIL CLOSED)
+        unresolved_items = [
+            a for a in assessments
+            if a.integrity_status.upper() in ("UNVERIFIED", "UNKNOWN", "INCOMPLETE")
+            or a.quality_status in (QualityStatus.UNVERIFIED, QualityStatus.UNKNOWN, QualityStatus.INCOMPLETE)
+            or a.classification_status == "UNKNOWN"
+            or a.applicability_status in ("UNKNOWN", "UNAVAILABLE")
+            or a.scope_status == ScopeStatus.UNKNOWN
+        ]
+        if unresolved_items:
+            for unv in unresolved_items:
+                limitations.append(f"Evidence '{unv.evidence_id}' has unresolved status (integrity: '{unv.integrity_status}', classification: '{unv.classification_status}', applicability: '{unv.applicability_status}').")
             return VerificationFinding(
                 finding_id=finding_id,
                 target_type=target_type,
@@ -266,13 +398,37 @@ class EvidenceValidatedRule(BaseDeterministicRule):
                 evidence_assessments=assessments,
                 rule_id=self.rule_id,
                 rule_version=self.rule_version,
-                explanation=f"All evidence records for target '{target_id}' are UNVERIFIED; validation has not been performed.",
-                limitations=["Evidence integrity unverified."],
+                explanation=(
+                    f"Target '{target_id}' contains {len(unresolved_items)} unverified, unknown, or incomplete evidence record(s). "
+                    f"All required evidence must have validated integrity before verification can be confirmed."
+                ),
+                limitations=limitations,
                 evaluated_at=now_iso,
             )
 
-        if unverified_items and valid_items:
-            limitations.append(f"{len(unverified_items)} evidence item(s) remain unverified.")
+        # 5. ALL items must be valid, authorized, and applicable
+        valid_items = [
+            a for a in assessments
+            if a.integrity_status.upper() == "VALID"
+            and a.quality_status == QualityStatus.VALID
+            and a.scope_status == ScopeStatus.AUTHORIZED
+            and a.classification_status in ("AUTHORIZED", "CLEARANCE_SUFFICIENT")
+            and a.applicability_status == "APPLICABLE"
+        ]
+        if len(valid_items) != len(assessments) or not valid_items:
+            return VerificationFinding(
+                finding_id=finding_id,
+                target_type=target_type,
+                target_id=target_id,
+                status=VerificationStatus.INDETERMINATE,
+                evidence_references=[a.evidence_id for a in assessments],
+                evidence_assessments=assessments,
+                rule_id=self.rule_id,
+                rule_version=self.rule_version,
+                explanation=f"Not all evidence records for target '{target_id}' meet validated integrity criteria.",
+                limitations=["Unresolved evidence items."],
+                evaluated_at=now_iso,
+            )
 
         return VerificationFinding(
             finding_id=finding_id,
@@ -283,7 +439,7 @@ class EvidenceValidatedRule(BaseDeterministicRule):
             evidence_assessments=assessments,
             rule_id=self.rule_id,
             rule_version=self.rule_version,
-            explanation=f"Validated {len(valid_items)} evidence item(s) supporting target '{target_id}'.",
+            explanation=f"All {len(valid_items)} supporting evidence record(s) have validated integrity and authorized clearance for target '{target_id}'.",
             limitations=limitations,
             evaluated_at=now_iso,
         )
@@ -331,6 +487,29 @@ class EvidenceFreshRule(BaseDeterministicRule):
                 evaluated_at=now_iso,
             )
 
+        # 1. Scope and clearance boundary check: fail closed
+        blocked_items = [
+            a for a in assessments
+            if a.scope_status in (ScopeStatus.UNAUTHORIZED, ScopeStatus.CROSS_PLANT, ScopeStatus.REJECTED, ScopeStatus.UNTAGGED_PLANT)
+            or a.classification_status in ("BLOCKED", "CLEARANCE_INSUFFICIENT")
+        ]
+        if blocked_items:
+            for b in blocked_items:
+                limitations.append(f"Evidence '{b.evidence_id}' rejected due to scope or clearance boundary violation.")
+            return VerificationFinding(
+                finding_id=finding_id,
+                target_type=target_type,
+                target_id=target_id,
+                status=VerificationStatus.BLOCKED,
+                evidence_references=[a.evidence_id for a in assessments],
+                evidence_assessments=assessments,
+                rule_id=self.rule_id,
+                rule_version=self.rule_version,
+                explanation=f"Target '{target_id}' freshness evaluation blocked due to scope boundary violation or insufficient classification clearance.",
+                limitations=limitations,
+                evaluated_at=now_iso,
+            )
+
         stale_items = []
         missing_ts_items = []
         future_items = []
@@ -339,7 +518,7 @@ class EvidenceFreshRule(BaseDeterministicRule):
         for a in assessments:
             a.freshness_threshold_seconds = threshold
             obs_dt = _parse_iso_timestamp(a.observed_at)
-            if not obs_dt:
+            if not obs_dt or a.freshness_status == FreshnessStatus.TIMESTAMP_MISSING:
                 a.freshness_status = FreshnessStatus.TIMESTAMP_MISSING
                 missing_ts_items.append(a)
                 limitations.append(f"Evidence '{a.evidence_id}' lacks valid observation timestamp; freshness cannot be proven.")
@@ -375,22 +554,8 @@ class EvidenceFreshRule(BaseDeterministicRule):
                 evaluated_at=now_iso,
             )
 
-        if stale_items and not fresh_items:
-            return VerificationFinding(
-                finding_id=finding_id,
-                target_type=target_type,
-                target_id=target_id,
-                status=VerificationStatus.STALE,
-                evidence_references=[a.evidence_id for a in assessments],
-                evidence_assessments=assessments,
-                rule_id=self.rule_id,
-                rule_version=self.rule_version,
-                explanation=f"All available evidence for target '{target_id}' is STALE beyond allowed window ({threshold:.0f}s).",
-                limitations=limitations,
-                evaluated_at=now_iso,
-            )
-
-        if missing_ts_items and not fresh_items:
+        # Missing observation timestamps cannot satisfy freshness
+        if missing_ts_items:
             return VerificationFinding(
                 finding_id=finding_id,
                 target_type=target_type,
@@ -400,14 +565,29 @@ class EvidenceFreshRule(BaseDeterministicRule):
                 evidence_assessments=assessments,
                 rule_id=self.rule_id,
                 rule_version=self.rule_version,
-                explanation=f"Evidence for target '{target_id}' is missing observation timestamps. Freshness cannot be determined.",
+                explanation=f"Evidence for target '{target_id}' is missing observation timestamps. Freshness cannot be determined without authoritative observation time.",
                 limitations=limitations,
                 evaluated_at=now_iso,
             )
 
-        if fresh_items:
+        if stale_items:
+            return VerificationFinding(
+                finding_id=finding_id,
+                target_type=target_type,
+                target_id=target_id,
+                status=VerificationStatus.STALE,
+                evidence_references=[a.evidence_id for a in assessments],
+                evidence_assessments=assessments,
+                rule_id=self.rule_id,
+                rule_version=self.rule_version,
+                explanation=f"Supporting evidence for target '{target_id}' is STALE beyond allowed window ({threshold:.0f}s).",
+                limitations=limitations,
+                evaluated_at=now_iso,
+            )
+
+        if len(fresh_items) == len(assessments) and fresh_items:
             status = VerificationStatus.VERIFIED
-            explanation = f"Found {len(fresh_items)} fresh evidence record(s) within threshold ({threshold:.0f}s) for target '{target_id}'."
+            explanation = f"All {len(fresh_items)} evidence record(s) have verified fresh observation timestamps within threshold ({threshold:.0f}s) for target '{target_id}'."
         else:
             status = VerificationStatus.NOT_VERIFIED
             explanation = f"No fresh evidence satisfied freshness requirements for target '{target_id}'."
@@ -454,7 +634,6 @@ class RequiredEvidencePresentRule(BaseDeterministicRule):
         required_ids: List[str] = parameters.get("required_evidence_ids", [])
 
         if not required_types and not required_ids:
-            # Fallback: at least one evidence item must be present
             if not assessments:
                 return VerificationFinding(
                     finding_id=finding_id,
@@ -469,6 +648,27 @@ class RequiredEvidencePresentRule(BaseDeterministicRule):
                     limitations=["Missing evidence records."],
                     evaluated_at=now_iso,
                 )
+            # Check scope/clearance on attached assessments
+            blocked_items = [
+                a for a in assessments
+                if a.scope_status in (ScopeStatus.UNAUTHORIZED, ScopeStatus.CROSS_PLANT, ScopeStatus.REJECTED, ScopeStatus.UNTAGGED_PLANT)
+                or a.classification_status in ("BLOCKED", "CLEARANCE_INSUFFICIENT")
+            ]
+            if blocked_items:
+                return VerificationFinding(
+                    finding_id=finding_id,
+                    target_type=target_type,
+                    target_id=target_id,
+                    status=VerificationStatus.BLOCKED,
+                    evidence_references=[a.evidence_id for a in assessments],
+                    evidence_assessments=assessments,
+                    rule_id=self.rule_id,
+                    rule_version=self.rule_version,
+                    explanation=f"Target '{target_id}' evidence blocked due to scope or clearance boundary violation.",
+                    limitations=["Evidence blocked due to scope or clearance restrictions."],
+                    evaluated_at=now_iso,
+                )
+
             return VerificationFinding(
                 finding_id=finding_id,
                 target_type=target_type,
@@ -480,6 +680,29 @@ class RequiredEvidencePresentRule(BaseDeterministicRule):
                 rule_version=self.rule_version,
                 explanation=f"All general evidence requirements met for target '{target_id}'.",
                 limitations=[],
+                evaluated_at=now_iso,
+            )
+
+        # Check scope and clearance on present assessments
+        blocked_items = [
+            a for a in assessments
+            if a.scope_status in (ScopeStatus.UNAUTHORIZED, ScopeStatus.CROSS_PLANT, ScopeStatus.REJECTED, ScopeStatus.UNTAGGED_PLANT)
+            or a.classification_status in ("BLOCKED", "CLEARANCE_INSUFFICIENT")
+        ]
+        if blocked_items:
+            for b in blocked_items:
+                limitations.append(f"Evidence '{b.evidence_id}' rejected due to scope or clearance boundary violation.")
+            return VerificationFinding(
+                finding_id=finding_id,
+                target_type=target_type,
+                target_id=target_id,
+                status=VerificationStatus.BLOCKED,
+                evidence_references=[a.evidence_id for a in assessments],
+                evidence_assessments=assessments,
+                rule_id=self.rule_id,
+                rule_version=self.rule_version,
+                explanation=f"Target '{target_id}' verification blocked due to scope boundary violation or insufficient classification clearance in required evidence.",
+                limitations=limitations,
                 evaluated_at=now_iso,
             )
 
@@ -562,7 +785,56 @@ class RequiredEvidenceValidatedRule(BaseDeterministicRule):
                 evaluated_at=now_iso,
             )
 
-        invalid = [a for a in assessments if a.integrity_status.upper() != "VALID"]
+        # 1. Scope & clearance check
+        blocked_items = [
+            a for a in assessments
+            if a.scope_status in (ScopeStatus.UNAUTHORIZED, ScopeStatus.CROSS_PLANT, ScopeStatus.REJECTED, ScopeStatus.UNTAGGED_PLANT)
+            or a.classification_status in ("BLOCKED", "CLEARANCE_INSUFFICIENT")
+        ]
+        if blocked_items:
+            for b in blocked_items:
+                limitations.append(f"Evidence '{b.evidence_id}' rejected due to scope or clearance boundary violation.")
+            return VerificationFinding(
+                finding_id=finding_id,
+                target_type=target_type,
+                target_id=target_id,
+                status=VerificationStatus.BLOCKED,
+                evidence_references=[a.evidence_id for a in assessments],
+                evidence_assessments=assessments,
+                rule_id=self.rule_id,
+                rule_version=self.rule_version,
+                explanation=f"Target '{target_id}' verification blocked due to scope boundary violation or insufficient classification clearance in supporting evidence.",
+                limitations=limitations,
+                evaluated_at=now_iso,
+            )
+
+        # 2. Conflicts
+        conflicting_items = [
+            a for a in assessments
+            if a.quality_status == QualityStatus.CONFLICTING or a.integrity_status.upper() == "CONFLICTING"
+        ]
+        if conflicting_items:
+            return VerificationFinding(
+                finding_id=finding_id,
+                target_type=target_type,
+                target_id=target_id,
+                status=VerificationStatus.CONFLICTING,
+                evidence_references=[a.evidence_id for a in assessments],
+                evidence_assessments=assessments,
+                rule_id=self.rule_id,
+                rule_version=self.rule_version,
+                explanation=f"Conflicting evidence sources detected for target '{target_id}'. Condition cannot be verified.",
+                limitations=["Conflicting evidence sources."],
+                evaluated_at=now_iso,
+            )
+
+        # 3. Invalid items
+        invalid = [
+            a for a in assessments
+            if a.integrity_status.upper() == "INVALID"
+            or a.quality_status == QualityStatus.INVALID
+            or a.applicability_status in ("INAPPLICABLE", "TARGET_MISMATCH")
+        ]
         if invalid:
             for inv in invalid:
                 limitations.append(f"Evidence '{inv.evidence_id}' has integrity status '{inv.integrity_status}'.")
@@ -575,8 +847,58 @@ class RequiredEvidenceValidatedRule(BaseDeterministicRule):
                 evidence_assessments=assessments,
                 rule_id=self.rule_id,
                 rule_version=self.rule_version,
-                explanation=f"Target '{target_id}' has {len(invalid)} unvalidated or invalid evidence item(s).",
+                explanation=f"Target '{target_id}' has {len(invalid)} invalid evidence item(s).",
                 limitations=limitations,
+                evaluated_at=now_iso,
+            )
+
+        # 4. Unverified / unknown items
+        unresolved = [
+            a for a in assessments
+            if a.integrity_status.upper() in ("UNVERIFIED", "UNKNOWN", "INCOMPLETE")
+            or a.quality_status in (QualityStatus.UNVERIFIED, QualityStatus.UNKNOWN, QualityStatus.INCOMPLETE)
+            or a.classification_status == "UNKNOWN"
+            or a.applicability_status in ("UNKNOWN", "UNAVAILABLE")
+            or a.scope_status == ScopeStatus.UNKNOWN
+        ]
+        if unresolved:
+            for unv in unresolved:
+                limitations.append(f"Evidence '{unv.evidence_id}' has unresolved status (integrity: '{unv.integrity_status}', classification: '{unv.classification_status}', applicability: '{unv.applicability_status}').")
+            return VerificationFinding(
+                finding_id=finding_id,
+                target_type=target_type,
+                target_id=target_id,
+                status=VerificationStatus.INDETERMINATE,
+                evidence_references=[a.evidence_id for a in assessments],
+                evidence_assessments=assessments,
+                rule_id=self.rule_id,
+                rule_version=self.rule_version,
+                explanation=f"Target '{target_id}' contains {len(unresolved)} unverified or incomplete evidence item(s).",
+                limitations=limitations,
+                evaluated_at=now_iso,
+            )
+
+        # 5. Valid items
+        valid = [
+            a for a in assessments
+            if a.integrity_status.upper() == "VALID"
+            and a.quality_status == QualityStatus.VALID
+            and a.scope_status == ScopeStatus.AUTHORIZED
+            and a.classification_status in ("AUTHORIZED", "CLEARANCE_SUFFICIENT")
+            and a.applicability_status == "APPLICABLE"
+        ]
+        if len(valid) != len(assessments) or not valid:
+            return VerificationFinding(
+                finding_id=finding_id,
+                target_type=target_type,
+                target_id=target_id,
+                status=VerificationStatus.INDETERMINATE,
+                evidence_references=[a.evidence_id for a in assessments],
+                evidence_assessments=assessments,
+                rule_id=self.rule_id,
+                rule_version=self.rule_version,
+                explanation=f"Target '{target_id}' evidence items are not fully validated.",
+                limitations=["Incomplete validation."],
                 evaluated_at=now_iso,
             )
 
@@ -589,7 +911,7 @@ class RequiredEvidenceValidatedRule(BaseDeterministicRule):
             evidence_assessments=assessments,
             rule_id=self.rule_id,
             rule_version=self.rule_version,
-            explanation=f"All {len(assessments)} supporting evidence record(s) are present and validated for target '{target_id}'.",
+            explanation=f"All {len(assessments)} supporting evidence record(s) are present, cleared, and validated for target '{target_id}'.",
             limitations=[],
             evaluated_at=now_iso,
         )
@@ -635,9 +957,12 @@ class EvidenceScopeMatchRule(BaseDeterministicRule):
 
         scope_violations = []
         for a in assessments:
-            if a.scope_status != ScopeStatus.AUTHORIZED:
+            if a.scope_status in (ScopeStatus.UNAUTHORIZED, ScopeStatus.CROSS_PLANT, ScopeStatus.REJECTED, ScopeStatus.UNTAGGED_PLANT):
                 scope_violations.append(a)
                 limitations.append(f"Evidence '{a.evidence_id}' scope status is '{a.scope_status.value}'.")
+            elif a.classification_status in ("BLOCKED", "CLEARANCE_INSUFFICIENT"):
+                scope_violations.append(a)
+                limitations.append(f"Evidence '{a.evidence_id}' classification clearance status is '{a.classification_status}'.")
 
         if scope_violations:
             return VerificationFinding(
@@ -649,7 +974,7 @@ class EvidenceScopeMatchRule(BaseDeterministicRule):
                 evidence_assessments=assessments,
                 rule_id=self.rule_id,
                 rule_version=self.rule_version,
-                explanation=f"Target '{target_id}' blocked due to {len(scope_violations)} scope boundary violation(s).",
+                explanation=f"Target '{target_id}' blocked due to {len(scope_violations)} scope boundary or clearance violation(s).",
                 limitations=limitations,
                 evaluated_at=now_iso,
             )
@@ -663,7 +988,7 @@ class EvidenceScopeMatchRule(BaseDeterministicRule):
             evidence_assessments=assessments,
             rule_id=self.rule_id,
             rule_version=self.rule_version,
-            explanation=f"All {len(assessments)} evidence item(s) strictly match tenant, workspace, and plant boundaries.",
+            explanation=f"All {len(assessments)} evidence item(s) strictly match tenant, workspace, plant boundaries, and clearance tier.",
             limitations=[],
             evaluated_at=now_iso,
         )
@@ -705,6 +1030,27 @@ class RequiredFieldsPresentRule(BaseDeterministicRule):
                 rule_version=self.rule_version,
                 explanation=f"No evidence records available to evaluate required fields for target '{target_id}'.",
                 limitations=["No evidence records."],
+                evaluated_at=now_iso,
+            )
+
+        # Check scope and clearance
+        blocked_items = [
+            a for a in assessments
+            if a.scope_status in (ScopeStatus.UNAUTHORIZED, ScopeStatus.CROSS_PLANT, ScopeStatus.REJECTED, ScopeStatus.UNTAGGED_PLANT)
+            or a.classification_status in ("BLOCKED", "CLEARANCE_INSUFFICIENT")
+        ]
+        if blocked_items:
+            return VerificationFinding(
+                finding_id=finding_id,
+                target_type=target_type,
+                target_id=target_id,
+                status=VerificationStatus.BLOCKED,
+                evidence_references=[a.evidence_id for a in assessments],
+                evidence_assessments=assessments,
+                rule_id=self.rule_id,
+                rule_version=self.rule_version,
+                explanation=f"Target '{target_id}' evaluation blocked due to scope or clearance restrictions.",
+                limitations=["Evidence blocked due to scope or clearance restrictions."],
                 evaluated_at=now_iso,
             )
 
@@ -783,6 +1129,27 @@ class SourceConsistencyRule(BaseDeterministicRule):
                 rule_version=self.rule_version,
                 explanation=f"Only {len(assessments)} source(s) available for target '{target_id}'. Multi-source consistency requires at least 2 independent sources.",
                 limitations=["Insufficient corroborating sources."],
+                evaluated_at=now_iso,
+            )
+
+        # Check scope and clearance
+        blocked_items = [
+            a for a in assessments
+            if a.scope_status in (ScopeStatus.UNAUTHORIZED, ScopeStatus.CROSS_PLANT, ScopeStatus.REJECTED, ScopeStatus.UNTAGGED_PLANT)
+            or a.classification_status in ("BLOCKED", "CLEARANCE_INSUFFICIENT")
+        ]
+        if blocked_items:
+            return VerificationFinding(
+                finding_id=finding_id,
+                target_type=target_type,
+                target_id=target_id,
+                status=VerificationStatus.BLOCKED,
+                evidence_references=[a.evidence_id for a in assessments],
+                evidence_assessments=assessments,
+                rule_id=self.rule_id,
+                rule_version=self.rule_version,
+                explanation=f"Target '{target_id}' multi-source consistency evaluation blocked due to scope or clearance restrictions.",
+                limitations=["Evidence blocked due to scope or clearance restrictions."],
                 evaluated_at=now_iso,
             )
 

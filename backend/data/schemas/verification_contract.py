@@ -161,6 +161,8 @@ class ScopeStatus(str, Enum):
     CROSS_WORKSPACE = "CROSS_WORKSPACE"
     CROSS_PLANT = "CROSS_PLANT"
     UNTAGGED_PLANT = "UNTAGGED_PLANT"
+    UNAUTHORIZED = "UNAUTHORIZED"
+    REJECTED = "REJECTED"
     UNKNOWN = "UNKNOWN"
 
 
@@ -205,8 +207,8 @@ class EvidenceAssessment(BaseModel):
     freshness_threshold_seconds: Optional[float] = Field(default=None, ge=0.0, description="Applicable threshold in seconds")
     integrity_status: str = Field(default="UNKNOWN", max_length=64, description="Integrity check outcome (e.g. VALID, INVALID, UNVERIFIED)")
     scope_status: ScopeStatus = Field(default=ScopeStatus.UNKNOWN, description="Scope boundary matching status")
-    classification_status: str = Field(default="AUTHORIZED", max_length=64, description="Data classification clearance status")
-    applicability_status: str = Field(default="APPLICABLE", max_length=64, description="Target applicability status")
+    classification_status: str = Field(default="UNKNOWN", max_length=64, description="Data classification clearance status")
+    applicability_status: str = Field(default="UNKNOWN", max_length=64, description="Target applicability status")
     quality_status: QualityStatus = Field(default=QualityStatus.UNKNOWN, description="Overall quality classification")
     limitations: List[str] = Field(default_factory=list, max_length=20, description="Known caveats or limitations of this evidence")
 
