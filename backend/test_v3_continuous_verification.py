@@ -2149,3 +2149,363 @@ def test_provenance_does_not_disclose_blocked_evidence_ids(v_service, analyst_id
     # The blocked record ev_rec_02 MUST NOT be disclosed in provenance.evidence_ids!
     assert "ev_rec_02" not in run.provenance.evidence_ids
     assert "ev_rec_01" in run.provenance.evidence_ids
+
+
+# =============================================================================
+# 10. PROMPT 36C — ADVERSARIAL ATTACK TESTS FOR TRUSTED RULE PARAMETERS
+# =============================================================================
+
+def test_case_a_caller_attempts_to_downgrade_required_evidence(v_service, analyst_identity, sample_mission, e_repo):
+    """
+    Case A — Caller attempts to downgrade required evidence:
+    Mission requires evidence A and B. A is accessible, B is blocked.
+    Caller supplies optional_evidence_ids = [B].
+    Expected: request rejected with VerificationValidationError / ValueError, or result remains BLOCKED.
+    Never VERIFIED.
+    """
+    # Seed accessible evidence A in plant_01 and explanation prerequisite
+    with e_repo._lock, e_repo._get_connection() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO evidence_explanations (
+                explanation_id, target_type, target_id, tenant_id, workspace_id, plant_id,
+                fingerprint, assessment_timestamp, algorithm_version, contract_version,
+                is_partial, summary, supporting_evidence_count, excluded_evidence_count,
+                payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "exp_prov_01", "CRITERION", "crit_01", "tenant_alpha", "workspace_prod", "plant_01",
+                "fp_prov1", "2026-10-12T00:00:00+00:00", "1.0", "1.0",
+                0, "test prov", 1, 0, "{}", "2026-10-12T00:00:00+00:00"
+            )
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO evidence_records (
+                evidence_id, explanation_id, tenant_id, workspace_id, plant_id,
+                source_type, source_record_id, provenance, validation_status,
+                payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "ev_case_a_acc", "exp_prov_01", "tenant_alpha", "workspace_prod", "plant_01",
+                "TELEMETRY_LOG", "tel_001", "OBSERVED", "VALID",
+                json.dumps({"classification": "INTERNAL", "temp": 25.0}),
+                "2026-10-12T00:00:00+00:00"
+            )
+        )
+        # Seed blocked evidence B in plant_02 (cross-plant boundary violation)
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO evidence_records (
+                evidence_id, explanation_id, tenant_id, workspace_id, plant_id,
+                source_type, source_record_id, provenance, validation_status,
+                payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "ev_case_a_blk", "exp_prov_01", "tenant_alpha", "workspace_prod", "plant_02",
+                "POWER_METRIC", "pwr_001", "OBSERVED", "VALID",
+                json.dumps({"classification": "INTERNAL", "power": 100.0}),
+                "2026-10-12T00:00:00+00:00"
+            )
+        )
+        conn.commit()
+
+    # 1. API / Request validation boundary: caller supplies optional_evidence_ids
+    # Must be rejected at request creation or service invocation
+    with pytest.raises((VerificationValidationError, ValueError)):
+        req = VerificationRequest(
+            rule_parameters={"optional_evidence_ids": ["ev_case_a_blk"]},
+            rule_type=RuleType.EVIDENCE_EXISTS,
+        )
+        v_service.request_verification(analyst_identity, sample_mission.mission_id, req)
+
+    # 2. Rule evaluation boundary: even if optional_evidence_ids is passed directly to rule
+    rule = EvidenceExistsRule()
+    assess_a, _ = v_service._resolve_evidence_item(
+        "ev_case_a_acc", sample_mission, analyst_identity, 3600.0, datetime.now(timezone.utc)
+    )
+    assess_b, _ = v_service._resolve_evidence_item(
+        "ev_case_a_blk", sample_mission, analyst_identity, 3600.0, datetime.now(timezone.utc)
+    )
+    finding = rule.evaluate(
+        target_id="step_test",
+        target_type=VerificationTargetType.STEP,
+        assessments=[assess_a, assess_b],
+        mission_scope={"tenant_id": "tenant_alpha", "workspace_id": "workspace_prod", "plant_id": "plant_01"},
+        parameters={"optional_evidence_ids": ["ev_case_a_blk"]},
+    )
+    # MUST be BLOCKED, NEVER VERIFIED!
+    assert finding.status == VerificationStatus.BLOCKED
+    assert finding.status != VerificationStatus.VERIFIED
+    # Non-disclosure: blocked identifier is completely redacted
+    assert "ev_case_a_blk" not in finding.evidence_references
+    assert "ev_case_a_acc" in finding.evidence_references
+    assert "ev_case_a_blk" not in finding.explanation
+    assert "ev_case_a_blk" not in str(finding.limitations)
+    assert not any(a.evidence_id == "ev_case_a_blk" for a in finding.evidence_assessments)
+
+
+def test_case_b_caller_attempts_to_downgrade_all_requirements(v_service, analyst_identity, sample_mission):
+    """
+    Case B — Caller attempts to downgrade all requirements:
+    Mission contains required evidence. Caller marks every reference optional using request.rule_parameters.
+    Expected: caller cannot change mission requirements; request rejected.
+    """
+    with pytest.raises((VerificationValidationError, ValueError)):
+        VerificationRequest(
+            rule_parameters={"optional_evidence_ids": ["ev_rec_01", "ev_rec_02"]},
+            rule_type=RuleType.EVIDENCE_EXISTS,
+        )
+
+
+def test_case_c_caller_attempts_to_override_required_references(v_service, analyst_identity, sample_mission):
+    """
+    Case C — Caller attempts to override required references:
+    Authoritative mission requires A and B. Caller supplies required_evidence_ids containing only A.
+    Expected: request is rejected, and authoritative requirements cannot be dropped.
+    """
+    with pytest.raises((VerificationValidationError, ValueError)):
+        VerificationRequest(
+            rule_parameters={"required_evidence_ids": ["ev_rec_01"]},
+            rule_type=RuleType.REQUIRED_EVIDENCE_PRESENT,
+        )
+
+
+def test_case_d_caller_attempts_to_inject_evidence_payloads(v_service, analyst_identity, sample_mission, e_repo):
+    """
+    Case D — Caller attempts to inject evidence payloads:
+    Caller supplies fabricated evidence_payloads in rule_parameters.
+    Expected: caller payload injection is rejected and server-resolved payloads remain authoritative.
+    """
+    # 1. Request rejection when trying to inject protected evidence_payloads
+    with pytest.raises((VerificationValidationError, ValueError)):
+        VerificationRequest(
+            rule_parameters={"evidence_payloads": {"ev_rec_01": {"temp": 999.0, "forged": True}}},
+        )
+
+
+def test_case_e_legitimate_accessible_evidence(v_service, analyst_identity, sample_mission, e_repo):
+    """
+    Case E — Legitimate accessible evidence:
+    All authoritative required evidence is accessible.
+    Expected: EVIDENCE_EXISTS returns VERIFIED with notice that existence confirms presence only.
+    """
+    with e_repo._lock, e_repo._get_connection() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO evidence_explanations (
+                explanation_id, target_type, target_id, tenant_id, workspace_id, plant_id,
+                fingerprint, assessment_timestamp, algorithm_version, contract_version,
+                is_partial, summary, supporting_evidence_count, excluded_evidence_count,
+                payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "exp_prov_01", "CRITERION", "crit_01", "tenant_alpha", "workspace_prod", "plant_01",
+                "fp_prov1", "2026-10-12T00:00:00+00:00", "1.0", "1.0",
+                0, "test prov", 1, 0, "{}", "2026-10-12T00:00:00+00:00"
+            )
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO evidence_records (
+                evidence_id, explanation_id, tenant_id, workspace_id, plant_id,
+                source_type, source_record_id, provenance, validation_status,
+                payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "ev_case_e_01", "exp_prov_01", "tenant_alpha", "workspace_prod", "plant_01",
+                "TELEMETRY_LOG", "tel_001", "OBSERVED", "VALID",
+                json.dumps({"classification": "INTERNAL", "temp": 25.0}),
+                "2026-10-12T00:00:00+00:00"
+            )
+        )
+        conn.commit()
+
+    rule = EvidenceExistsRule()
+    assess, _ = v_service._resolve_evidence_item(
+        "ev_case_e_01", sample_mission, analyst_identity, 3600.0, datetime.now(timezone.utc)
+    )
+    finding = rule.evaluate(
+        target_id="crit_test",
+        target_type=VerificationTargetType.CRITERION,
+        assessments=[assess],
+        mission_scope={"tenant_id": "tenant_alpha", "workspace_id": "workspace_prod", "plant_id": "plant_01"},
+        parameters={},
+    )
+    assert finding.status == VerificationStatus.VERIFIED
+    assert "ev_case_e_01" in finding.evidence_references
+    assert len(finding.evidence_assessments) == 1
+    assert "Notice: Evidence existence confirms record presence only — does not self-certify operational completion or outcome." in finding.explanation
+
+
+def test_case_f_mixed_required_evidence_accessible_plus_blocked(v_service, analyst_identity, sample_mission, e_repo):
+    """
+    Case F — Mixed required evidence: Accessible + blocked.
+    Expected: BLOCKED, no inaccessible identifiers disclosed.
+    """
+    with e_repo._lock, e_repo._get_connection() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO evidence_explanations (
+                explanation_id, target_type, target_id, tenant_id, workspace_id, plant_id,
+                fingerprint, assessment_timestamp, algorithm_version, contract_version,
+                is_partial, summary, supporting_evidence_count, excluded_evidence_count,
+                payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "exp_prov_01", "CRITERION", "crit_01", "tenant_alpha", "workspace_prod", "plant_01",
+                "fp_prov1", "2026-10-12T00:00:00+00:00", "1.0", "1.0",
+                0, "test prov", 1, 0, "{}", "2026-10-12T00:00:00+00:00"
+            )
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO evidence_records (
+                evidence_id, explanation_id, tenant_id, workspace_id, plant_id,
+                source_type, source_record_id, provenance, validation_status,
+                payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "ev_case_f_acc", "exp_prov_01", "tenant_alpha", "workspace_prod", "plant_01",
+                "TELEMETRY_LOG", "tel_001", "OBSERVED", "VALID",
+                json.dumps({"classification": "INTERNAL", "temp": 25.0}),
+                "2026-10-12T00:00:00+00:00"
+            )
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO evidence_records (
+                evidence_id, explanation_id, tenant_id, workspace_id, plant_id,
+                source_type, source_record_id, provenance, validation_status,
+                payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "ev_case_f_blk", "exp_prov_01", "tenant_alpha", "workspace_prod", "plant_02",
+                "POWER_METRIC", "pwr_001", "OBSERVED", "VALID",
+                json.dumps({"classification": "INTERNAL", "power": 100.0}),
+                "2026-10-12T00:00:00+00:00"
+            )
+        )
+        conn.commit()
+
+    rule = EvidenceExistsRule()
+    assess_a, _ = v_service._resolve_evidence_item(
+        "ev_case_f_acc", sample_mission, analyst_identity, 3600.0, datetime.now(timezone.utc)
+    )
+    assess_b, _ = v_service._resolve_evidence_item(
+        "ev_case_f_blk", sample_mission, analyst_identity, 3600.0, datetime.now(timezone.utc)
+    )
+    finding = rule.evaluate(
+        target_id="step_test",
+        target_type=VerificationTargetType.STEP,
+        assessments=[assess_a, assess_b],
+        mission_scope={"tenant_id": "tenant_alpha", "workspace_id": "workspace_prod", "plant_id": "plant_01"},
+        parameters={},
+    )
+    assert finding.status == VerificationStatus.BLOCKED
+    assert finding.evidence_references == ["ev_case_f_acc"]
+    assert len(finding.evidence_assessments) == 1
+    assert "ev_case_f_blk" not in finding.evidence_references
+    assert "ev_case_f_blk" not in finding.explanation
+    assert "ev_case_f_blk" not in str(finding.limitations)
+
+
+def test_case_g_mixed_unresolved_evidence_accessible_plus_unknown(v_service, analyst_identity, sample_mission, e_repo):
+    """
+    Case G — Mixed unresolved evidence: Accessible + unknown.
+    Expected: INDETERMINATE, no unresolved identifiers disclosed.
+    """
+    with e_repo._lock, e_repo._get_connection() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO evidence_explanations (
+                explanation_id, target_type, target_id, tenant_id, workspace_id, plant_id,
+                fingerprint, assessment_timestamp, algorithm_version, contract_version,
+                is_partial, summary, supporting_evidence_count, excluded_evidence_count,
+                payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "exp_prov_01", "CRITERION", "crit_01", "tenant_alpha", "workspace_prod", "plant_01",
+                "fp_prov1", "2026-10-12T00:00:00+00:00", "1.0", "1.0",
+                0, "test prov", 1, 0, "{}", "2026-10-12T00:00:00+00:00"
+            )
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO evidence_records (
+                evidence_id, explanation_id, tenant_id, workspace_id, plant_id,
+                source_type, source_record_id, provenance, validation_status,
+                payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "ev_case_g_acc", "exp_prov_01", "tenant_alpha", "workspace_prod", "plant_01",
+                "TELEMETRY_LOG", "tel_001", "OBSERVED", "VALID",
+                json.dumps({"classification": "INTERNAL", "temp": 25.0}),
+                "2026-10-12T00:00:00+00:00"
+            )
+        )
+        conn.commit()
+
+    rule = EvidenceExistsRule()
+    assess_a, _ = v_service._resolve_evidence_item(
+        "ev_case_g_acc", sample_mission, analyst_identity, 3600.0, datetime.now(timezone.utc)
+    )
+    assess_u, _ = v_service._resolve_evidence_item(
+        "ev_case_g_unknown_999", sample_mission, analyst_identity, 3600.0, datetime.now(timezone.utc)
+    )
+    finding = rule.evaluate(
+        target_id="step_test",
+        target_type=VerificationTargetType.STEP,
+        assessments=[assess_a, assess_u],
+        mission_scope={"tenant_id": "tenant_alpha", "workspace_id": "workspace_prod", "plant_id": "plant_01"},
+        parameters={},
+    )
+    assert finding.status == VerificationStatus.INDETERMINATE
+    assert finding.evidence_references == ["ev_case_g_acc"]
+    assert len(finding.evidence_assessments) == 1
+    assert "ev_case_g_unknown_999" not in finding.evidence_references
+    assert "ev_case_g_unknown_999" not in finding.explanation
+    assert "ev_case_g_unknown_999" not in str(finding.limitations)
+
+
+def test_case_h_trusted_optional_evidence_boundary():
+    """
+    Case H — Trusted optional evidence boundary verification:
+    Confirms that no target-level optional evidence contract exists in MissionSuccessCriterion
+    or MissionPlannedStep, and all parameters attempting to infer optionality fail closed.
+    """
+    # Confirm MissionSuccessCriterion and MissionPlannedStep do NOT expose optional evidence fields
+    assert not hasattr(MissionSuccessCriterion, "optional_evidence")
+    assert not hasattr(MissionSuccessCriterion, "optional_evidence_ids")
+    assert not hasattr(MissionPlannedStep, "optional_evidence")
+    assert not hasattr(MissionPlannedStep, "optional_evidence_ids")
+
+    # In EvidenceExistsRule, optional_evidence_ids is not supported and fails closed to treating as required
+    rule = EvidenceExistsRule()
+    assess = EvidenceAssessment(
+        evidence_id="ev_blocked_test",
+        source_type="SENSOR",
+        observed_at="2026-10-12T12:00:00+00:00",
+        scope_status=ScopeStatus.CROSS_PLANT,
+        classification_status="AUTHORIZED",
+        applicability_status="APPLICABLE",
+    )
+    finding = rule.evaluate(
+        "target_h",
+        VerificationTargetType.CRITERION,
+        [assess],
+        {},
+        {"optional_evidence_ids": ["ev_blocked_test"]},
+    )
+    assert finding.status == VerificationStatus.BLOCKED
+    assert finding.evidence_references == []

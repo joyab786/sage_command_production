@@ -157,14 +157,11 @@ class EvidenceExistsRule(BaseDeterministicRule):
                 evaluated_at=now_iso,
             )
 
-        # Distinguish optional evidence from required evidence if contract provides distinction
-        optional_ids = set(parameters.get("optional_evidence_ids") or [])
-        if optional_ids:
-            required_assessments = [a for a in assessments if a.evidence_id not in optional_ids]
-            optional_assessments = [a for a in assessments if a.evidence_id in optional_ids]
-        else:
-            required_assessments = list(assessments)
-            optional_assessments = []
+        # In accordance with Prompt 36C security requirements:
+        # All resolved evidence references are treated as strictly required.
+        # The optional_evidence_ids feature is disabled because no persisted,
+        # server-authoritative optional-evidence contract exists for targets.
+        required_assessments = list(assessments)
 
         def _is_authorized(a: EvidenceAssessment) -> bool:
             return (
@@ -184,11 +181,9 @@ class EvidenceExistsRule(BaseDeterministicRule):
         blocked_req = [a for a in required_assessments if _is_blocked(a)]
         unknown_req = [a for a in required_assessments if not _is_authorized(a) and not _is_blocked(a)]
 
-        authorized_opt = [a for a in optional_assessments if _is_authorized(a)]
-
         # Caller-visible non-disclosure boundary:
         # Never disclose inaccessible evidence IDs, payloads, or detailed assessments
-        visible_assessments = list(authorized_req) + list(authorized_opt)
+        visible_assessments = list(authorized_req)
         visible_evidence_refs = [a.evidence_id for a in visible_assessments]
 
         # Non-disclosing limitations: describe reason without leaking inaccessible identifiers
@@ -236,18 +231,6 @@ class EvidenceExistsRule(BaseDeterministicRule):
                 f"for target '{target_id}'. Notice: Evidence existence confirms record presence only — "
                 f"does not self-certify operational completion or outcome."
             )
-        elif not required_assessments and optional_assessments:
-            if authorized_opt:
-                status = VerificationStatus.VERIFIED
-                explanation = (
-                    f"Verified presence of {len(authorized_opt)} accessible optional evidence record(s) "
-                    f"for target '{target_id}'. Notice: Evidence existence confirms record presence only — "
-                    f"does not self-certify operational completion or outcome."
-                )
-            else:
-                status = VerificationStatus.NOT_VERIFIED
-                explanation = f"No optional evidence records found in repository for target '{target_id}'."
-                limitations = ["Optional evidence repository contains no matching records within authorized scope."]
         else:
             status = VerificationStatus.INDETERMINATE
             explanation = f"Evidence for target '{target_id}' does not satisfy existence criteria within authorized scope."
@@ -653,13 +636,19 @@ class RequiredEvidencePresentRule(BaseDeterministicRule):
                 or a.classification_status in ("BLOCKED", "CLEARANCE_INSUFFICIENT")
             ]
             if blocked_items:
+                authorized_items = [
+                    a for a in assessments
+                    if a.scope_status == ScopeStatus.AUTHORIZED
+                    and a.classification_status in ("AUTHORIZED", "CLEARANCE_SUFFICIENT")
+                    and a.applicability_status == "APPLICABLE"
+                ]
                 return VerificationFinding(
                     finding_id=finding_id,
                     target_type=target_type,
                     target_id=target_id,
                     status=VerificationStatus.BLOCKED,
-                    evidence_references=[a.evidence_id for a in assessments],
-                    evidence_assessments=assessments,
+                    evidence_references=[a.evidence_id for a in authorized_items],
+                    evidence_assessments=authorized_items,
                     rule_id=self.rule_id,
                     rule_version=self.rule_version,
                     explanation=f"Target '{target_id}' evidence blocked due to scope or clearance boundary violation.",
@@ -688,15 +677,31 @@ class RequiredEvidencePresentRule(BaseDeterministicRule):
             or a.classification_status in ("BLOCKED", "CLEARANCE_INSUFFICIENT")
         ]
         if blocked_items:
-            for b in blocked_items:
-                limitations.append(f"Evidence '{b.evidence_id}' rejected due to scope or clearance boundary violation.")
+            has_clearance_block = any(
+                b.classification_status in ("BLOCKED", "CLEARANCE_INSUFFICIENT", "UNKNOWN")
+                for b in blocked_items
+            )
+            has_scope_block = any(
+                b.scope_status != ScopeStatus.AUTHORIZED
+                for b in blocked_items
+            )
+            if has_clearance_block:
+                limitations.append("One or more required evidence references could not be verified due to classification clearance restrictions.")
+            if has_scope_block:
+                limitations.append("One or more required evidence references could not be verified due to scope boundary restrictions.")
+            authorized_items = [
+                a for a in assessments
+                if a.scope_status == ScopeStatus.AUTHORIZED
+                and a.classification_status in ("AUTHORIZED", "CLEARANCE_SUFFICIENT")
+                and a.applicability_status == "APPLICABLE"
+            ]
             return VerificationFinding(
                 finding_id=finding_id,
                 target_type=target_type,
                 target_id=target_id,
                 status=VerificationStatus.BLOCKED,
-                evidence_references=[a.evidence_id for a in assessments],
-                evidence_assessments=assessments,
+                evidence_references=[a.evidence_id for a in authorized_items],
+                evidence_assessments=authorized_items,
                 rule_id=self.rule_id,
                 rule_version=self.rule_version,
                 explanation=f"Target '{target_id}' verification blocked due to scope boundary violation or insufficient classification clearance in required evidence.",

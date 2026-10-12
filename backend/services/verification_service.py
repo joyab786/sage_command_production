@@ -54,6 +54,7 @@ try:
         VerificationAuditRecord,
         VerificationRequest,
         VerificationRunSummary,
+        PROHIBITED_CALLER_RULE_PARAMETERS,
         RULE_SET_VERSION,
         EVALUATOR_VERSION,
         validate_identifier,
@@ -122,6 +123,7 @@ except (ImportError, ModuleNotFoundError):
         VerificationAuditRecord,
         VerificationRequest,
         VerificationRunSummary,
+        PROHIBITED_CALLER_RULE_PARAMETERS,
         RULE_SET_VERSION,
         EVALUATOR_VERSION,
         validate_identifier,
@@ -761,6 +763,20 @@ class VerificationService:
         else:
             rule_to_use = self.rule_registry.get_rule_by_type(RuleType.EVIDENCE_FRESH)
 
+        # Validate caller rule parameters against security boundary
+        if request.rule_parameters:
+            for k in request.rule_parameters:
+                if str(k).lower() in {p.lower() for p in PROHIBITED_CALLER_RULE_PARAMETERS}:
+                    raise VerificationValidationError(
+                        f"Prohibited rule parameter '{k}'. "
+                        f"Callers cannot override authoritative verification requirements, payloads, or scope boundaries."
+                    )
+
+        safe_caller_params = {
+            k: v for k, v in (request.rule_parameters or {}).items()
+            if str(k).lower() not in {p.lower() for p in PROHIBITED_CALLER_RULE_PARAMETERS}
+        }
+
         # 4. Identify verification targets
         target_crits = []
         target_steps = []
@@ -838,11 +854,11 @@ class VerificationService:
                     all_evidence_timestamps[assess.evidence_id] = assess.observed_at
                     all_evidence_payloads[assess.evidence_id] = payload
 
-            crit_params = dict(request.rule_parameters or {})
-            crit_params.setdefault("freshness_threshold_seconds", freshness_threshold)
+            crit_params = dict(safe_caller_params)
+            crit_params["freshness_threshold_seconds"] = freshness_threshold
             crit_params["evidence_payloads"] = all_evidence_payloads
             if crit.required_evidence_type:
-                crit_params.setdefault("required_evidence_types", [crit.required_evidence_type])
+                crit_params["required_evidence_types"] = [crit.required_evidence_type]
 
             finding = rule_to_use.evaluate(
                 target_id=crit.criterion_id,
@@ -875,11 +891,11 @@ class VerificationService:
                     all_evidence_timestamps[assess.evidence_id] = assess.observed_at
                     all_evidence_payloads[assess.evidence_id] = payload
 
-            step_params = dict(request.rule_parameters or {})
-            step_params.setdefault("freshness_threshold_seconds", freshness_threshold)
+            step_params = dict(safe_caller_params)
+            step_params["freshness_threshold_seconds"] = freshness_threshold
             step_params["evidence_payloads"] = all_evidence_payloads
             if step.required_evidence:
-                step_params.setdefault("required_evidence_ids", list(step.required_evidence))
+                step_params["required_evidence_ids"] = list(step.required_evidence)
 
             finding = rule_to_use.evaluate(
                 target_id=step.step_id,

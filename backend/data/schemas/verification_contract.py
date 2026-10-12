@@ -440,6 +440,39 @@ class VerificationAuditRecord(BaseModel):
 # 8. API REQUEST / RESPONSE CONTRACTS
 # =============================================================================
 
+PROHIBITED_CALLER_RULE_PARAMETERS: Set[str] = {
+    # Evidence requirements & optionality overrides
+    "optional_evidence_ids",
+    "required_evidence_ids",
+    "required_evidence_types",
+    "evidence_payloads",
+    "evidence_ids",
+    "evidence_records",
+    # Scope and plant isolation overrides
+    "mission_scope",
+    "scope",
+    "tenant_id",
+    "workspace_id",
+    "plant_id",
+    "session_id",
+    # Classification and clearance decisions
+    "classification",
+    "classification_status",
+    "clearance",
+    "clearance_level",
+    # Authorization & assessment status overrides
+    "authorization_status",
+    "scope_status",
+    "integrity_status",
+    "quality_status",
+    "freshness_status",
+    "status",
+    "verification_status",
+    "risk_score",
+    "risk_level",
+}
+
+
 class VerificationRequest(BaseModel):
     """
     Payload to request continuous verification of a mission.
@@ -491,6 +524,23 @@ class VerificationRequest(BaseModel):
     def validate_request_ids(cls, v: Optional[str], info) -> Optional[str]:
         if v is not None:
             return validate_identifier(v, info.field_name)
+        return v
+
+    @field_validator("rule_parameters")
+    @classmethod
+    def validate_rule_parameters(cls, v: Dict[str, Any]) -> Dict[str, Any]:
+        if not v:
+            return {}
+        if len(v) > 20:
+            raise ValueError(f"Rule parameters count ({len(v)}) exceeds maximum permitted (20).")
+        for k in v:
+            if not isinstance(k, str):
+                raise ValueError("Rule parameter keys must be strings.")
+            if k.lower() in {p.lower() for p in PROHIBITED_CALLER_RULE_PARAMETERS}:
+                raise ValueError(
+                    f"Prohibited rule parameter '{k}'. "
+                    f"Callers cannot override authoritative verification requirements, payloads, or scope boundaries."
+                )
         return v
 
 
