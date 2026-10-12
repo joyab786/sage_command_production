@@ -19,7 +19,8 @@ OPERATIONAL EXECUTION AUTHORITY, AUTONOMOUS EXECUTION, OR PHYSICAL MACHINE CONTR
 """
 
 import logging
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
+from contextlib import contextmanager, asynccontextmanager
 from typing import Dict, Any, Optional, List
 from langchain_core.tools import tool
 
@@ -50,17 +51,50 @@ _verification_identity_context_var: ContextVar[Optional[Identity]] = ContextVar(
 )
 
 
-def set_active_verification_identity(identity: Optional[Identity]) -> None:
+def set_active_verification_identity(identity: Optional[Identity]) -> Token:
     """
     Binds trusted, server-authoritative Identity context for verification tool execution.
-    Must be called by server orchestration before invoking model tool nodes.
+    Returns ContextVar Token for safe reset in finally blocks.
     """
-    _verification_identity_context_var.set(identity)
+    return _verification_identity_context_var.set(identity)
+
+
+def reset_active_verification_identity(token: Token) -> None:
+    """
+    Resets active verification identity context using the token from set_active_verification_identity.
+    """
+    _verification_identity_context_var.reset(token)
 
 
 def get_active_verification_identity() -> Optional[Identity]:
     """Retrieves active trusted Identity context from server environment."""
     return _verification_identity_context_var.get()
+
+
+@contextmanager
+def active_verification_identity(identity: Optional[Identity]):
+    """
+    Token-safe synchronous context manager for authoritative verification identity lifecycle.
+    Guarantees reset of context variable in finally block, preventing cross-request leaks.
+    """
+    token = set_active_verification_identity(identity)
+    try:
+        yield identity
+    finally:
+        reset_active_verification_identity(token)
+
+
+@asynccontextmanager
+async def async_active_verification_identity(identity: Optional[Identity]):
+    """
+    Token-safe asynchronous context manager for authoritative verification identity lifecycle.
+    Guarantees reset of context variable in finally block, preventing cross-request leaks.
+    """
+    token = set_active_verification_identity(identity)
+    try:
+        yield identity
+    finally:
+        reset_active_verification_identity(token)
 
 
 @tool

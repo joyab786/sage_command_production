@@ -148,7 +148,10 @@ try:
         request_mission_verification_tool,
         get_mission_verification_findings_tool,
         set_active_verification_identity,
+        reset_active_verification_identity,
         get_active_verification_identity,
+        active_verification_identity,
+        async_active_verification_identity,
     )
 except (ImportError, ModuleNotFoundError):
     from backend.server import app
@@ -220,7 +223,10 @@ except (ImportError, ModuleNotFoundError):
         request_mission_verification_tool,
         get_mission_verification_findings_tool,
         set_active_verification_identity,
+        reset_active_verification_identity,
         get_active_verification_identity,
+        active_verification_identity,
+        async_active_verification_identity,
     )
 
 
@@ -1522,17 +1528,624 @@ def test_agent_tool_cannot_forge_identity_via_kwargs(monkeypatch, v_service, sam
         from backend.tools import verification_tools as vt
     monkeypatch.setattr(vt, "verification_service", v_service)
 
-    # Trusted identity is for tenant_alpha, workspace_prod, plant_01
-    vt.set_active_verification_identity(analyst_identity)
+    # Trusted identity is for tenant_alpha, workspace_prod, plant_01; reset in finally
+    with vt.active_verification_identity(analyst_identity):
+        res_str = request_mission_verification_tool.invoke({
+            "mission_id": sample_mission.mission_id,
+            "tenant_id": "forged_tenant_evil",
+            "workspace_id": "forged_workspace_evil",
+            "plant_id": "forged_plant_999",
+            "roles": ["ADMIN", "SUPERUSER"],
+        })
+        # Operation executes strictly under analyst_identity (tenant_alpha), ignoring model kwargs
+        assert "[VERIFICATION COMPLETED]" in res_str
+        assert sample_mission.mission_id in res_str
 
-    # LLM attempts to pass forged cross-tenant and cross-plant arguments
-    res_str = request_mission_verification_tool.invoke({
-        "mission_id": sample_mission.mission_id,
-        "tenant_id": "forged_tenant_evil",
-        "workspace_id": "forged_workspace_evil",
-        "plant_id": "forged_plant_999",
-        "roles": ["ADMIN", "SUPERUSER"],
-    })
-    # Operation executes strictly under analyst_identity (tenant_alpha), ignoring model kwargs
-    assert "[VERIFICATION COMPLETED]" in res_str
-    assert sample_mission.mission_id in res_str
+
+# =============================================================================
+# 9. PROMPT 36B HARDENING TESTS: TRUSTED IDENTITY, NON-DISCLOSURE & ADAPTERS
+# =============================================================================
+
+# --- 9.1 IDENTITY CONTEXT LIFECYCLE, RESET & ISOLATION ---
+
+def test_active_verification_identity_context_manager_lifecycle(analyst_identity):
+    """Context manager sets and resets ContextVar correctly on success."""
+    assert get_active_verification_identity() is None
+    with active_verification_identity(analyst_identity) as ident:
+        assert ident == analyst_identity
+        assert get_active_verification_identity() == analyst_identity
+    # Guaranteed reset after exiting context
+    assert get_active_verification_identity() is None
+
+
+def test_active_verification_identity_context_manager_reset_on_exception(analyst_identity):
+    """ContextVar is reliably reset even if an exception occurs inside the context block."""
+    assert get_active_verification_identity() is None
+    with pytest.raises(RuntimeError, match="Simulated worker failure"):
+        with active_verification_identity(analyst_identity):
+            assert get_active_verification_identity() == analyst_identity
+            raise RuntimeError("Simulated worker failure")
+    # Must fail closed and be None
+    assert get_active_verification_identity() is None
+
+
+@pytest.mark.asyncio
+async def test_async_active_verification_identity_lifecycle(analyst_identity):
+    """Async context manager sets and resets ContextVar correctly on success and exception."""
+    assert get_active_verification_identity() is None
+    async with async_active_verification_identity(analyst_identity) as ident:
+        assert ident == analyst_identity
+        assert get_active_verification_identity() == analyst_identity
+    assert get_active_verification_identity() is None
+
+    with pytest.raises(ValueError, match="Async worker error"):
+        async with async_active_verification_identity(analyst_identity):
+            assert get_active_verification_identity() == analyst_identity
+            raise ValueError("Async worker error")
+    assert get_active_verification_identity() is None
+
+
+@pytest.mark.asyncio
+async def test_concurrent_async_tasks_isolated_identity_context(analyst_identity, viewer_identity):
+    """Concurrent async tasks running for different identities cannot observe each other's context."""
+    import asyncio
+
+    async def task_worker(identity: Identity, expected_user: str, duration: float):
+        async with async_active_verification_identity(identity):
+            current = get_active_verification_identity()
+            assert current is not None
+            assert current.user_id == expected_user
+            await asyncio.sleep(duration)
+            current_after = get_active_verification_identity()
+            assert current_after is not None
+            assert current_after.user_id == expected_user
+            return current_after.user_id
+
+    # Spawn 10 concurrent tasks interleaved
+    tasks = []
+    for i in range(10):
+        if i % 2 == 0:
+            tasks.append(task_worker(analyst_identity, "analyst_01", 0.02))
+        else:
+            tasks.append(task_worker(viewer_identity, "viewer_01", 0.03))
+
+    results = await asyncio.gather(*tasks)
+    assert len(results) == 10
+    assert results.count("analyst_01") == 5
+    assert results.count("viewer_01") == 5
+    assert get_active_verification_identity() is None
+
+
+def test_sequential_requests_cannot_reuse_previous_identity(analyst_identity, sample_mission, monkeypatch, v_service):
+    """Sequential requests handled by the same worker cannot reuse the prior caller's identity."""
+    try:
+        from tools import verification_tools as vt
+    except ImportError:
+        from backend.tools import verification_tools as vt
+    monkeypatch.setattr(vt, "verification_service", v_service)
+
+    # Request 1: Authenticated caller
+    with vt.active_verification_identity(analyst_identity):
+        res1 = vt.request_mission_verification_tool.invoke({"mission_id": sample_mission.mission_id})
+        assert "[VERIFICATION COMPLETED]" in res1
+
+    # Request 2: Subsequent unauthenticated caller on same thread/worker
+    res2 = vt.request_mission_verification_tool.invoke({"mission_id": sample_mission.mission_id})
+    assert "[VERIFICATION BLOCKED]" in res2
+    assert "Trusted caller identity context is unavailable" in res2
+
+
+def test_unauthorized_or_missing_identity_never_persists_verification(temp_vdb, sample_mission):
+    """Missing or unauthorized identity never writes verification runs or audit records to repository."""
+    repo = VerificationRepository(db_path=temp_vdb)
+    # Ensure active context is None
+    set_active_verification_identity(None)
+    res = request_mission_verification_tool.invoke({"mission_id": sample_mission.mission_id})
+    assert "[VERIFICATION BLOCKED]" in res
+
+    # Repository should be completely untouched
+    runs, _ = repo.list_runs(
+        tenant_id=sample_mission.scope.tenant_id,
+        workspace_id=sample_mission.scope.workspace_id,
+        mission_id=sample_mission.mission_id,
+    )
+    assert len(runs) == 0
+
+
+# --- 9.2 EVIDENCE-EXISTENCE AGGREGATION & NON-DISCLOSURE ---
+
+def test_evidence_exists_one_accessible_required_record():
+    """One accessible required record returns VERIFIED with exact non-disclosing payload."""
+    rule = EvidenceExistsRule()
+    assess = EvidenceAssessment(
+        evidence_id="ev_001",
+        source_type="SENSOR",
+        observed_at="2026-10-12T12:00:00+00:00",
+        scope_status=ScopeStatus.AUTHORIZED,
+        classification_status="AUTHORIZED",
+        applicability_status="APPLICABLE",
+    )
+    finding = rule.evaluate("crit_01", VerificationTargetType.CRITERION, [assess], {}, {})
+    assert finding.status == VerificationStatus.VERIFIED
+    assert finding.evidence_references == ["ev_001"]
+    assert len(finding.evidence_assessments) == 1
+    assert finding.evidence_assessments[0].evidence_id == "ev_001"
+    assert finding.limitations == []
+    assert "confirms record presence only" in finding.explanation
+
+
+def test_evidence_exists_all_required_records_accessible():
+    """Multiple required records all accessible returns VERIFIED with exact payload."""
+    rule = EvidenceExistsRule()
+    a1 = EvidenceAssessment(
+        evidence_id="ev_001",
+        source_type="SENSOR",
+        observed_at="2026-10-12T12:00:00+00:00",
+        scope_status=ScopeStatus.AUTHORIZED,
+        classification_status="AUTHORIZED",
+        applicability_status="APPLICABLE",
+    )
+    a2 = EvidenceAssessment(
+        evidence_id="ev_002",
+        source_type="SENSOR",
+        observed_at="2026-10-12T12:00:00+00:00",
+        scope_status=ScopeStatus.AUTHORIZED,
+        classification_status="AUTHORIZED",
+        applicability_status="APPLICABLE",
+    )
+    finding = rule.evaluate("step_01", VerificationTargetType.STEP, [a1, a2], {}, {})
+    assert finding.status == VerificationStatus.VERIFIED
+    assert finding.evidence_references == ["ev_001", "ev_002"]
+    assert len(finding.evidence_assessments) == 2
+    assert finding.limitations == []
+
+
+def test_evidence_exists_accessible_plus_blocked_required_record():
+    """Accessible + blocked required record returns BLOCKED and does NOT disclose blocked ID or assessment."""
+    rule = EvidenceExistsRule()
+    accessible_ev = EvidenceAssessment(
+        evidence_id="ev_pub_01",
+        source_type="SENSOR",
+        observed_at="2026-10-12T12:00:00+00:00",
+        scope_status=ScopeStatus.AUTHORIZED,
+        classification_status="AUTHORIZED",
+        applicability_status="APPLICABLE",
+    )
+    blocked_ev = EvidenceAssessment(
+        evidence_id="ev_secret_99",
+        source_type="CONFIDENTIAL_SENSOR",
+        observed_at="2026-10-12T12:00:00+00:00",
+        scope_status=ScopeStatus.AUTHORIZED,
+        classification_status="CLEARANCE_INSUFFICIENT",
+        applicability_status="APPLICABLE",
+    )
+    finding = rule.evaluate("crit_01", VerificationTargetType.CRITERION, [accessible_ev, blocked_ev], {}, {})
+    # MUST NOT be promoted to VERIFIED
+    assert finding.status == VerificationStatus.BLOCKED
+    # Blocked record ID MUST NOT appear in evidence_references
+    assert finding.evidence_references == ["ev_pub_01"]
+    assert "ev_secret_99" not in finding.evidence_references
+    # Blocked assessment MUST NOT appear in evidence_assessments
+    assert len(finding.evidence_assessments) == 1
+    assert finding.evidence_assessments[0].evidence_id == "ev_pub_01"
+    # Blocked record ID MUST NOT appear in limitations or explanation
+    for lim in finding.limitations:
+        assert "ev_secret_99" not in lim
+    assert "ev_secret_99" not in finding.explanation
+
+
+def test_evidence_exists_accessible_plus_unknown_required_record():
+    """Accessible + unknown/unresolved required record returns INDETERMINATE without disclosing unknown ID."""
+    rule = EvidenceExistsRule()
+    accessible_ev = EvidenceAssessment(
+        evidence_id="ev_pub_01",
+        source_type="SENSOR",
+        observed_at="2026-10-12T12:00:00+00:00",
+        scope_status=ScopeStatus.AUTHORIZED,
+        classification_status="AUTHORIZED",
+        applicability_status="APPLICABLE",
+    )
+    unknown_ev = EvidenceAssessment(
+        evidence_id="ev_missing_55",
+        source_type="UNKNOWN",
+        observed_at=None,
+        scope_status=ScopeStatus.UNKNOWN,
+        classification_status="UNKNOWN",
+        applicability_status="UNAVAILABLE",
+    )
+    finding = rule.evaluate("crit_01", VerificationTargetType.CRITERION, [accessible_ev, unknown_ev], {}, {})
+    assert finding.status == VerificationStatus.INDETERMINATE
+    assert finding.evidence_references == ["ev_pub_01"]
+    assert "ev_missing_55" not in finding.evidence_references
+    assert len(finding.evidence_assessments) == 1
+    assert finding.evidence_assessments[0].evidence_id == "ev_pub_01"
+    assert "ev_missing_55" not in str(finding.limitations)
+    assert "ev_missing_55" not in finding.explanation
+
+
+def test_evidence_exists_accessible_plus_untagged_plant_record():
+    """Accessible + untagged plant record returns BLOCKED and does NOT disclose untagged record ID."""
+    rule = EvidenceExistsRule()
+    accessible_ev = EvidenceAssessment(
+        evidence_id="ev_pub_01",
+        source_type="SENSOR",
+        observed_at="2026-10-12T12:00:00+00:00",
+        scope_status=ScopeStatus.AUTHORIZED,
+        classification_status="AUTHORIZED",
+        applicability_status="APPLICABLE",
+    )
+    untagged_ev = EvidenceAssessment(
+        evidence_id="ev_untagged_88",
+        source_type="SENSOR",
+        observed_at="2026-10-12T12:00:00+00:00",
+        scope_status=ScopeStatus.UNTAGGED_PLANT,
+        classification_status="AUTHORIZED",
+        applicability_status="APPLICABLE",
+    )
+    finding = rule.evaluate("step_01", VerificationTargetType.STEP, [accessible_ev, untagged_ev], {}, {})
+    assert finding.status == VerificationStatus.BLOCKED
+    assert finding.evidence_references == ["ev_pub_01"]
+    assert "ev_untagged_88" not in finding.evidence_references
+    assert len(finding.evidence_assessments) == 1
+    assert "ev_untagged_88" not in str(finding.limitations)
+    assert "ev_untagged_88" not in finding.explanation
+
+
+def test_evidence_exists_all_requested_records_inaccessible():
+    """All requested records blocked returns BLOCKED with empty visible refs and no leaked IDs."""
+    rule = EvidenceExistsRule()
+    b1 = EvidenceAssessment(
+        evidence_id="ev_cross_plant_01",
+        source_type="SENSOR",
+        observed_at="2026-10-12T12:00:00+00:00",
+        scope_status=ScopeStatus.CROSS_PLANT,
+        classification_status="AUTHORIZED",
+        applicability_status="APPLICABLE",
+    )
+    b2 = EvidenceAssessment(
+        evidence_id="ev_classified_topsecret",
+        source_type="SENSOR",
+        observed_at="2026-10-12T12:00:00+00:00",
+        scope_status=ScopeStatus.AUTHORIZED,
+        classification_status="CLEARANCE_INSUFFICIENT",
+        applicability_status="APPLICABLE",
+    )
+    finding = rule.evaluate("step_01", VerificationTargetType.STEP, [b1, b2], {}, {})
+    assert finding.status == VerificationStatus.BLOCKED
+    assert finding.evidence_references == []
+    assert finding.evidence_assessments == []
+    assert len(finding.limitations) > 0
+    for lim in finding.limitations:
+        assert "ev_cross_plant_01" not in lim
+        assert "ev_classified_topsecret" not in lim
+    assert "ev_cross_plant_01" not in finding.explanation
+    assert "ev_classified_topsecret" not in finding.explanation
+
+
+def test_evidence_exists_record_absent():
+    """Missing/absent records return NOT_VERIFIED with empty payload."""
+    rule = EvidenceExistsRule()
+    absent_ev = EvidenceAssessment(
+        evidence_id="ev_nonexistent",
+        source_type="UNKNOWN",
+        observed_at=None,
+        scope_status=ScopeStatus.UNKNOWN,
+        classification_status="UNKNOWN",
+        applicability_status="UNAVAILABLE",
+    )
+    finding = rule.evaluate("crit_01", VerificationTargetType.CRITERION, [absent_ev], {}, {})
+    assert finding.status == VerificationStatus.NOT_VERIFIED
+    assert finding.evidence_references == []
+    assert finding.evidence_assessments == []
+    assert len(finding.limitations) > 0
+
+
+def test_evidence_exists_optional_evidence_only():
+    """Optional evidence only returns VERIFIED when accessible optional evidence is present."""
+    rule = EvidenceExistsRule()
+    opt_ev = EvidenceAssessment(
+        evidence_id="ev_opt_01",
+        source_type="SENSOR",
+        observed_at="2026-10-12T12:00:00+00:00",
+        scope_status=ScopeStatus.AUTHORIZED,
+        classification_status="AUTHORIZED",
+        applicability_status="APPLICABLE",
+    )
+    params = {"optional_evidence_ids": ["ev_opt_01"]}
+    finding = rule.evaluate("crit_01", VerificationTargetType.CRITERION, [opt_ev], {}, params)
+    assert finding.status == VerificationStatus.VERIFIED
+    assert finding.evidence_references == ["ev_opt_01"]
+    assert len(finding.evidence_assessments) == 1
+
+
+# --- 9.3 AUTHORITATIVE VALIDATION SIGNALS & CLASSIFICATION HARDENING ---
+
+def test_action_status_and_hash_do_not_infer_validity(v_service, analyst_identity, sample_mission):
+    """Action store SUCCEEDED status and hash do NOT infer validity; must return UNVERIFIED."""
+    try:
+        from data.schemas.action_contract import (
+            Action,
+            ActionType,
+            ActionStatus,
+            ActionTarget,
+            ActionReason,
+        )
+    except (ImportError, ModuleNotFoundError):
+        from backend.data.schemas.action_contract import (
+            Action,
+            ActionType,
+            ActionStatus,
+            ActionTarget,
+            ActionReason,
+        )
+    action = Action(
+        action_id="act_test_validity",
+        action_type=ActionType.REORDER_INVENTORY,
+        tenant_id=sample_mission.scope.tenant_id,
+        workspace_id=sample_mission.scope.workspace_id,
+        session_id=analyst_identity.session_id,
+        target=ActionTarget(
+            resource_id="res_01",
+            resource_type="INVENTORY_ITEM",
+            plant_id=sample_mission.scope.plant_id,
+        ),
+        parameters={"sku": "SKU-100", "qty": 50, "classification": "INTERNAL"},
+        reason=ActionReason(reason_code="RESTOCK", summary="Operational restock justification"),
+        status=ActionStatus.SUCCEEDED,
+    )
+    action_store.save(action)
+
+    assess, payload = v_service._resolve_evidence_item(
+        ref_id=action.action_id,
+        mission=sample_mission,
+        identity=analyst_identity,
+        freshness_threshold=3600.0,
+        eval_dt=datetime.now(timezone.utc),
+    )
+    # MUST be UNVERIFIED, not VALID
+    assert assess.integrity_status == "UNVERIFIED"
+    assert assess.quality_status == QualityStatus.UNVERIFIED
+    assert assess.observed_at is None
+    assert any("Action proposal records workflow state" in lim for lim in assess.limitations)
+
+
+def test_decision_status_and_fingerprint_do_not_infer_validity(v_service, analyst_identity, sample_mission):
+    """Decision Engine RECOMMENDED status and fingerprint do NOT infer validity; must return UNVERIFIED."""
+    try:
+        from data.schemas.decision_engine_contract import (
+            DecisionEvaluation,
+            DecisionOutcomeStatus,
+            DecisionType,
+            DecisionRecommendation,
+        )
+    except (ImportError, ModuleNotFoundError):
+        from backend.data.schemas.decision_engine_contract import (
+            DecisionEvaluation,
+            DecisionOutcomeStatus,
+            DecisionType,
+            DecisionRecommendation,
+        )
+    dec_id = f"dec_test_validity_{uuid.uuid4().hex[:8]}"
+    dec = DecisionEvaluation(
+        decision_id=dec_id,
+        problem_id="prob_test_1",
+        tenant_id=sample_mission.scope.tenant_id,
+        workspace_id=sample_mission.scope.workspace_id,
+        plant_id=sample_mission.scope.plant_id,
+        decision_type=DecisionType.RESOURCE_ALLOCATION,
+        status=DecisionOutcomeStatus.RECOMMENDED,
+        recommendation=DecisionRecommendation(
+            recommended_option_id="opt_1",
+            recommendation_status=DecisionOutcomeStatus.RECOMMENDED,
+            primary_rationale="Optimal efficiency under current constraints",
+        ),
+        fingerprint="fp_sha256_mock_1234567890",
+        assessment_timestamp="2026-10-12T10:00:00Z",
+        metadata={"classification": "INTERNAL"},
+    )
+    v_service.decision_repo.save_evaluation(dec)
+
+    assess, _ = v_service._resolve_evidence_item(
+        ref_id=dec.decision_id,
+        mission=sample_mission,
+        identity=analyst_identity,
+        freshness_threshold=3600.0,
+        eval_dt=datetime.now(timezone.utc),
+    )
+    # MUST be UNVERIFIED, not VALID
+    assert assess.integrity_status == "UNVERIFIED"
+    assert assess.quality_status == QualityStatus.UNVERIFIED
+    assert assess.observed_at is None
+    assert any("Decision evaluation represents analytical optimization" in lim for lim in assess.limitations)
+
+
+def test_incident_status_and_fingerprint_do_not_infer_validity(v_service, analyst_identity, sample_mission):
+    """Incident RESOLVED status does NOT infer validity; uses detected_at only for observation timestamp."""
+    try:
+        from data.schemas.incident_contract import (
+            IncidentContract,
+            IncidentCategory,
+            IncidentSeverity,
+            IncidentPriority,
+            IncidentLifecycle,
+        )
+    except (ImportError, ModuleNotFoundError):
+        from backend.data.schemas.incident_contract import (
+            IncidentContract,
+            IncidentCategory,
+            IncidentSeverity,
+            IncidentPriority,
+            IncidentLifecycle,
+        )
+    inc_id = f"inc_test_validity_{uuid.uuid4().hex[:8]}"
+    inc = IncidentContract(
+        incident_id=inc_id,
+        tenant_id=sample_mission.scope.tenant_id,
+        workspace_id=sample_mission.scope.workspace_id,
+        plant_id=sample_mission.scope.plant_id,
+        category=IncidentCategory.OPERATIONAL,
+        severity=IncidentSeverity.MEDIUM,
+        priority=IncidentPriority.NORMAL,
+        status=IncidentLifecycle.RESOLVED,
+        title="Pump Bearing Temperature Spike",
+        detected_at="2026-10-12T10:00:00Z",
+        opened_at="2026-10-12T10:05:00Z",
+        resolved_at="2026-10-12T11:00:00Z",
+        updated_at="2026-10-12T11:00:00Z",
+        incident_fingerprint=f"inc_fp_mock_{uuid.uuid4().hex[:8]}",
+    )
+    v_service.incident_repo.save_incident(inc)
+
+    assess, _ = v_service._resolve_evidence_item(
+        ref_id=inc.incident_id,
+        mission=sample_mission,
+        identity=analyst_identity,
+        freshness_threshold=86400.0,
+        eval_dt=datetime.now(timezone.utc),
+    )
+    # MUST be UNVERIFIED, not VALID
+    assert assess.integrity_status == "UNVERIFIED"
+    assert assess.quality_status == QualityStatus.UNVERIFIED
+    # Observation time is detected_at strictly; not opened_at or resolved_at
+    assert assess.observed_at == "2026-10-12T10:00:00Z"
+    assert any("Incident record reflects operational tracking status" in lim for lim in assess.limitations)
+
+
+def test_rca_status_and_fingerprint_do_not_infer_validity(v_service, analyst_identity, sample_mission):
+    """RCA COMPLETED status does NOT infer validity; completion time is not observation time."""
+    try:
+        from data.schemas.rca_contract import RcaAnalysis, RcaAnalysisStatus
+    except (ImportError, ModuleNotFoundError):
+        from backend.data.schemas.rca_contract import RcaAnalysis, RcaAnalysisStatus
+    rca_id = f"rca_test_validity_{uuid.uuid4().hex[:8]}"
+    rca = RcaAnalysis(
+        analysis_id=rca_id,
+        incident_id=f"inc_ref_{uuid.uuid4().hex[:8]}",
+        tenant_id=sample_mission.scope.tenant_id,
+        workspace_id=sample_mission.scope.workspace_id,
+        plant_id=sample_mission.scope.plant_id,
+        status=RcaAnalysisStatus.COMPLETED,
+        started_at="2026-10-12T10:00:00Z",
+        completed_at="2026-10-12T11:00:00Z",
+        method_version="1.0",
+        input_fingerprint=f"rca_fp_mock_{uuid.uuid4().hex[:8]}",
+    )
+    v_service.rca_repo.create_analysis(rca)
+
+    assess, _ = v_service._resolve_evidence_item(
+        ref_id=rca.analysis_id,
+        mission=sample_mission,
+        identity=analyst_identity,
+        freshness_threshold=86400.0,
+        eval_dt=datetime.now(timezone.utc),
+    )
+    # MUST be UNVERIFIED, not VALID
+    assert assess.integrity_status == "UNVERIFIED"
+    assert assess.quality_status == QualityStatus.UNVERIFIED
+    assert assess.observed_at is None
+    assert any("RCA record represents investigation synthesis" in lim for lim in assess.limitations)
+
+
+def test_missing_or_malformed_classification_fails_closed_to_unknown(v_service, analyst_identity, sample_mission, e_repo):
+    """Missing or unsupported classification metadata fails closed to UNKNOWN, never defaults to INTERNAL."""
+    with e_repo._lock, e_repo._get_connection() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO evidence_explanations (
+                explanation_id, target_type, target_id, tenant_id, workspace_id, plant_id,
+                fingerprint, assessment_timestamp, algorithm_version, contract_version,
+                is_partial, summary, supporting_evidence_count, excluded_evidence_count,
+                payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "exp_class_01", "CRITERION", "crit_01", "tenant_alpha", "workspace_prod", "plant_01",
+                "fp_c1", "2026-10-12T00:00:00+00:00", "1.0", "1.0",
+                0, "test explanation", 1, 0, "{}", "2026-10-12T00:00:00+00:00"
+            )
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO evidence_records (
+                evidence_id, explanation_id, tenant_id, workspace_id, plant_id,
+                source_type, source_record_id, provenance, validation_status,
+                payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "ev_rec_noclass", "exp_class_01", "tenant_alpha", "workspace_prod", "plant_01",
+                "TELEMETRY_LOG", "tel_001", "OBSERVED", "VALID",
+                json.dumps({"temp": 25.0}),  # No classification field!
+                "2026-10-12T00:00:00+00:00"
+            )
+        )
+        conn.commit()
+
+    assess, _ = v_service._resolve_evidence_item(
+        ref_id="ev_rec_noclass",
+        mission=sample_mission,
+        identity=analyst_identity,
+        freshness_threshold=86400.0,
+        eval_dt=datetime.now(timezone.utc),
+    )
+    # Must fail closed to UNKNOWN; must NOT be promoted to INTERNAL or AUTHORIZED
+    assert assess.classification_status == "UNKNOWN"
+    assert assess.applicability_status == "UNKNOWN"
+
+
+def test_provenance_does_not_disclose_blocked_evidence_ids(v_service, analyst_identity, sample_mission, e_repo):
+    """Verification provenance evidence_ids must NOT include inaccessible/blocked evidence IDs."""
+    with e_repo._lock, e_repo._get_connection() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO evidence_explanations (
+                explanation_id, target_type, target_id, tenant_id, workspace_id, plant_id,
+                fingerprint, assessment_timestamp, algorithm_version, contract_version,
+                is_partial, summary, supporting_evidence_count, excluded_evidence_count,
+                payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "exp_prov_01", "CRITERION", "crit_01", "tenant_alpha", "workspace_prod", "plant_01",
+                "fp_prov1", "2026-10-12T00:00:00+00:00", "1.0", "1.0",
+                0, "test prov", 1, 0, "{}", "2026-10-12T00:00:00+00:00"
+            )
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO evidence_records (
+                evidence_id, explanation_id, tenant_id, workspace_id, plant_id,
+                source_type, source_record_id, provenance, validation_status,
+                payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "ev_rec_01", "exp_prov_01", "tenant_alpha", "workspace_prod", "plant_01",
+                "TELEMETRY_LOG", "tel_001", "OBSERVED", "VALID",
+                json.dumps({"classification": "INTERNAL", "temp": 25.0}),
+                "2026-10-12T00:00:00+00:00"
+            )
+        )
+        # Blocked record in plant_02
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO evidence_records (
+                evidence_id, explanation_id, tenant_id, workspace_id, plant_id,
+                source_type, source_record_id, provenance, validation_status,
+                payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "ev_rec_02", "exp_prov_01", "tenant_alpha", "workspace_prod", "plant_02",
+                "POWER_METRIC", "pwr_001", "OBSERVED", "VALID",
+                json.dumps({"classification": "INTERNAL", "power": 100.0}),
+                "2026-10-12T00:00:00+00:00"
+            )
+        )
+        conn.commit()
+
+    req = VerificationRequest()
+    run = v_service.request_verification(analyst_identity, sample_mission.mission_id, req)
+    # The blocked record ev_rec_02 MUST NOT be disclosed in provenance.evidence_ids!
+    assert "ev_rec_02" not in run.provenance.evidence_ids
+    assert "ev_rec_01" in run.provenance.evidence_ids

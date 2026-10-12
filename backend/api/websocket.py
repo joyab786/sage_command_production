@@ -16,6 +16,7 @@ try:
     from data.schemas.execution_contract import ExecutionRequest
     from services.action_store import action_store
     from data.schemas.action_contract import ActionStatus
+    from tools.verification_tools import active_verification_identity
 except (ImportError, ModuleNotFoundError):
     from backend.core.config import SAGE_AUTH_ENABLED, IS_PRODUCTION, SAGE_MAX_REQUEST_SIZE, DEFAULT_DB_PATH
     from backend.core.auth import get_auth_provider, Identity
@@ -28,6 +29,7 @@ except (ImportError, ModuleNotFoundError):
     from backend.data.schemas.execution_contract import ExecutionRequest
     from backend.services.action_store import action_store
     from backend.data.schemas.action_contract import ActionStatus
+    from backend.tools.verification_tools import active_verification_identity
 
 router = APIRouter()
 
@@ -126,7 +128,8 @@ async def websocket_endpoint(websocket: WebSocket):
                         "session_id": identity.session_id,
                         "connection_id": "sqlite_main"
                     }
-                    result = await asyncio.to_thread(_invoke_graph, input_state, config)
+                    with active_verification_identity(identity):
+                        result = await asyncio.to_thread(_invoke_graph, input_state, config)
                     
                     # Intercept Security Intrusion Threat Detection
                     if result and result.get("security_status") == "CRITICAL_THREAT":

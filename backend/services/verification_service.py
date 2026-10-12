@@ -272,11 +272,26 @@ class VerificationService:
         Resolves an individual evidence reference through canonical subsystem interfaces.
         Validates tenant, workspace, plant scope, classification clearance, integrity, and freshness.
         Enforces strict timestamp semantics: observation time is never synthesized from creation/ingestion time.
+        Enforces authoritative validation signals: operational status or hashes alone do not establish validity.
+        Fails closed on missing or unsupported classification (never defaults to INTERNAL).
         Returns both EvidenceAssessment and the resolved raw payload dictionary.
         """
         m_tenant = mission.scope.tenant_id
         m_ws = mission.scope.workspace_id
         m_plant = mission.scope.plant_id
+
+        # Authoritative classification contract tiers
+        valid_classification_tiers: Dict[str, int] = {
+            "PUBLIC": 1,
+            "1": 1,
+            "INTERNAL": 1,
+            "CONFIDENTIAL": 2,
+            "2": 2,
+            "RESTRICTED": 3,
+            "3": 3,
+            "TOP_SECRET": 4,
+            "4": 4,
+        }
 
         # 1. Check EvidenceExplainabilityRepository
         rec = self.evidence_repo.get_evidence_record_scoped(ref_id, m_tenant, m_ws)
@@ -289,17 +304,15 @@ class VerificationService:
             else:
                 scope_status = ScopeStatus.AUTHORIZED
 
-            # Classification clearance
+            # Classification clearance: missing/unsupported fails closed to UNKNOWN (no INTERNAL fallback)
             rec_payload = rec.get("payload") or {}
-            rec_class = str(rec_payload.get("classification") or rec.get("classification") or "INTERNAL").upper()
-            req_clearance = 1
-            if rec_class in ("CONFIDENTIAL", "2"):
-                req_clearance = 2
-            elif rec_class in ("RESTRICTED", "3"):
-                req_clearance = 3
-            elif rec_class in ("TOP_SECRET", "4"):
-                req_clearance = 4
-            classification_status = self._evaluate_clearance(identity, req_clearance)
+            raw_class = rec_payload.get("classification") or rec.get("classification")
+            if raw_class is not None and str(raw_class).strip().upper() in valid_classification_tiers:
+                rec_class = str(raw_class).strip().upper()
+                req_clearance = valid_classification_tiers[rec_class]
+                classification_status = self._evaluate_clearance(identity, req_clearance)
+            else:
+                classification_status = "UNKNOWN"
 
             val_status = str(rec.get("validation_status", "UNKNOWN")).upper()
             # Strict timestamp semantics: observation time is strictly observed_at; never fallback to created_at
@@ -322,7 +335,7 @@ class VerificationService:
             else:
                 freshness_status = FreshnessStatus.TIMESTAMP_MISSING
 
-            # Integrity and quality
+            # Authoritative integrity: validated only if authoritative validation process recorded VALID
             if val_status == "VALID":
                 integrity_status = "VALID"
                 quality_status = QualityStatus.VALID
@@ -341,9 +354,13 @@ class VerificationService:
 
             applicability_status = (
                 "APPLICABLE"
-                if (scope_status == ScopeStatus.AUTHORIZED and classification_status == "AUTHORIZED")
+                if (scope_status == ScopeStatus.AUTHORIZED and classification_status in ("AUTHORIZED", "CLEARANCE_SUFFICIENT"))
                 else "UNKNOWN"
             )
+
+            limitations = []
+            if not observed_at:
+                limitations.append("Evidence record missing observed_at primary observation timestamp.")
 
             assessment = EvidenceAssessment(
                 evidence_id=ref_id,
@@ -359,7 +376,7 @@ class VerificationService:
                 classification_status=classification_status,
                 applicability_status=applicability_status,
                 quality_status=quality_status,
-                limitations=[],
+                limitations=limitations,
             )
             return assessment, rec_payload
 
@@ -374,7 +391,15 @@ class VerificationService:
             else:
                 scope_status = ScopeStatus.AUTHORIZED
 
-            classification_status = self._evaluate_clearance(identity, 1)
+            # Action proposal schema does not define a formal classification level; fail closed to UNKNOWN
+            act_params = act.parameters if isinstance(act.parameters, dict) else (
+                act.parameters.model_dump() if hasattr(act.parameters, "model_dump") else {}
+            )
+            raw_act_class = act_params.get("classification")
+            if raw_act_class and str(raw_act_class).strip().upper() in valid_classification_tiers:
+                classification_status = self._evaluate_clearance(identity, valid_classification_tiers[str(raw_act_class).strip().upper()])
+            else:
+                classification_status = "UNKNOWN"
 
             # Action proposals do not carry physical sensor observation timestamps
             observed_at = None
@@ -382,27 +407,17 @@ class VerificationService:
             freshness_status = FreshnessStatus.TIMESTAMP_MISSING
             freshness_sec = None
 
-            # Integrity check against action cryptographic hash
-            has_valid_hash = bool(act.action_hash and act.action_hash == act.compute_hash())
-            if has_valid_hash and act.status in ("SUCCEEDED", "READY", "APPROVED"):
-                integrity_status = "VALID"
-                quality_status = QualityStatus.VALID
-            elif act.status in ("FAILED", "ROLLBACK_FAILED", "CANCELLED", "REJECTED"):
-                integrity_status = "INVALID"
-                quality_status = QualityStatus.INVALID
-            else:
-                integrity_status = "UNVERIFIED"
-                quality_status = QualityStatus.UNVERIFIED
+            # Operational status (SUCCEEDED, READY, APPROVED) and internal parameter hash
+            # do NOT constitute authoritative evidentiary validation.
+            integrity_status = "UNVERIFIED"
+            quality_status = QualityStatus.UNVERIFIED
 
             applicability_status = (
                 "APPLICABLE"
-                if (scope_status == ScopeStatus.AUTHORIZED and classification_status == "AUTHORIZED")
+                if (scope_status == ScopeStatus.AUTHORIZED and classification_status in ("AUTHORIZED", "CLEARANCE_SUFFICIENT"))
                 else "UNKNOWN"
             )
 
-            payload = act.parameters if isinstance(act.parameters, dict) else (
-                act.parameters.model_dump() if hasattr(act.parameters, "model_dump") else {}
-            )
             assessment = EvidenceAssessment(
                 evidence_id=ref_id,
                 source_type="ACTION_RECORD",
@@ -417,15 +432,24 @@ class VerificationService:
                 classification_status=classification_status,
                 applicability_status=applicability_status,
                 quality_status=quality_status,
-                limitations=["Action proposal does not contain primary physical observation timestamp."],
+                limitations=[
+                    "Action proposal records workflow state; authoritative evidence validation is not available.",
+                    "Action proposal does not contain primary physical observation timestamp.",
+                ],
             )
-            return assessment, payload
+            return assessment, act_params
 
         # 3. Check DecisionEngineRepository
         dec = self.decision_repo.get_by_id(ref_id, m_tenant, m_ws, m_plant)
         if dec:
             scope_status = ScopeStatus.AUTHORIZED
-            classification_status = self._evaluate_clearance(identity, 1)
+
+            dec_meta = dec.metadata or {}
+            raw_dec_class = dec_meta.get("classification")
+            if raw_dec_class and str(raw_dec_class).strip().upper() in valid_classification_tiers:
+                classification_status = self._evaluate_clearance(identity, valid_classification_tiers[str(raw_dec_class).strip().upper()])
+            else:
+                classification_status = "UNKNOWN"
 
             # Decision evaluation is an analytical assessment, not a physical sensor observation
             observed_at = None
@@ -433,23 +457,16 @@ class VerificationService:
             freshness_status = FreshnessStatus.TIMESTAMP_MISSING
             freshness_sec = None
 
-            if dec.fingerprint and dec.status.value in ("OPTIMAL", "ACCEPTABLE", "SUBOPTIMAL"):
-                integrity_status = "VALID"
-                quality_status = QualityStatus.VALID
-            elif dec.status.value in ("REJECTED", "FAILED"):
-                integrity_status = "INVALID"
-                quality_status = QualityStatus.INVALID
-            else:
-                integrity_status = "UNVERIFIED"
-                quality_status = QualityStatus.UNVERIFIED
+            # Analytical decision status (OPTIMAL) and evaluation fingerprint do NOT establish evidence integrity
+            integrity_status = "UNVERIFIED"
+            quality_status = QualityStatus.UNVERIFIED
 
             applicability_status = (
                 "APPLICABLE"
-                if (scope_status == ScopeStatus.AUTHORIZED and classification_status == "AUTHORIZED")
+                if (scope_status == ScopeStatus.AUTHORIZED and classification_status in ("AUTHORIZED", "CLEARANCE_SUFFICIENT"))
                 else "UNKNOWN"
             )
 
-            payload = dec.metadata or {}
             assessment = EvidenceAssessment(
                 evidence_id=ref_id,
                 source_type="DECISION_RECORD",
@@ -464,9 +481,12 @@ class VerificationService:
                 classification_status=classification_status,
                 applicability_status=applicability_status,
                 quality_status=quality_status,
-                limitations=["Decision evaluation contains analytical assessment timestamp, not sensor observation."],
+                limitations=[
+                    "Decision evaluation represents analytical optimization; authoritative evidence validation is not available.",
+                    "Decision evaluation contains analytical assessment timestamp, not sensor observation.",
+                ],
             )
-            return assessment, payload
+            return assessment, dec_meta
 
         # 4. Check IncidentRepository
         inc = self.incident_repo.get_incident_scoped(ref_id, m_tenant, m_ws)
@@ -479,9 +499,13 @@ class VerificationService:
             else:
                 scope_status = ScopeStatus.AUTHORIZED
 
-            classification_status = self._evaluate_clearance(identity, 1)
+            raw_inc_class = getattr(inc, "classification", None)
+            if raw_inc_class and str(raw_inc_class).strip().upper() in valid_classification_tiers:
+                classification_status = self._evaluate_clearance(identity, valid_classification_tiers[str(raw_inc_class).strip().upper()])
+            else:
+                classification_status = "UNKNOWN"
 
-            # Observation timestamp is detected_at; do not substitute created_at or opened_at
+            # Authoritative observation timestamp is detected_at; strictly no fallback to opened_at/created_at
             observed_at = getattr(inc, "detected_at", None)
             received_at = getattr(inc, "opened_at", None) or getattr(inc, "created_at", None)
 
@@ -500,16 +524,13 @@ class VerificationService:
             else:
                 freshness_status = FreshnessStatus.TIMESTAMP_MISSING
 
-            if getattr(inc, "incident_fingerprint", None) and inc.status.value in ("OPEN", "ACKNOWLEDGED", "RESOLVED", "CLOSED"):
-                integrity_status = "VALID"
-                quality_status = QualityStatus.VALID
-            else:
-                integrity_status = "UNVERIFIED"
-                quality_status = QualityStatus.UNVERIFIED
+            # Incident ticket tracking status (RESOLVED/CLOSED) does not establish evidence integrity
+            integrity_status = "UNVERIFIED"
+            quality_status = QualityStatus.UNVERIFIED
 
             applicability_status = (
                 "APPLICABLE"
-                if (scope_status == ScopeStatus.AUTHORIZED and classification_status == "AUTHORIZED")
+                if (scope_status == ScopeStatus.AUTHORIZED and classification_status in ("AUTHORIZED", "CLEARANCE_SUFFICIENT"))
                 else "UNKNOWN"
             )
 
@@ -519,6 +540,10 @@ class VerificationService:
                 "priority": inc.priority.value,
                 "title": inc.title,
             }
+            inc_limitations = ["Incident record reflects operational tracking status; independent evidence validation is not available."]
+            if not observed_at:
+                inc_limitations.append("Incident record missing detected_at observation timestamp.")
+
             assessment = EvidenceAssessment(
                 evidence_id=ref_id,
                 source_type="INCIDENT_RECORD",
@@ -533,7 +558,7 @@ class VerificationService:
                 classification_status=classification_status,
                 applicability_status=applicability_status,
                 quality_status=quality_status,
-                limitations=[] if observed_at else ["Incident record missing detected_at observation timestamp."],
+                limitations=inc_limitations,
             )
             return assessment, payload
 
@@ -548,27 +573,24 @@ class VerificationService:
             else:
                 scope_status = ScopeStatus.AUTHORIZED
 
-            # Root Cause Analyses require elevated clearance (Level 2 Confidential)
-            classification_status = self._evaluate_clearance(identity, 2)
+            raw_rca_class = getattr(rca, "classification", None)
+            if raw_rca_class and str(raw_rca_class).strip().upper() in valid_classification_tiers:
+                classification_status = self._evaluate_clearance(identity, valid_classification_tiers[str(raw_rca_class).strip().upper()])
+            else:
+                classification_status = "UNKNOWN"
 
             observed_at = None
             received_at = getattr(rca, "completed_at", None) or getattr(rca, "started_at", None)
             freshness_status = FreshnessStatus.TIMESTAMP_MISSING
             freshness_sec = None
 
-            if getattr(rca, "input_fingerprint", None) and rca.status.value == "COMPLETED":
-                integrity_status = "VALID"
-                quality_status = QualityStatus.VALID
-            elif rca.status.value in ("FAILED", "CANCELLED"):
-                integrity_status = "INVALID"
-                quality_status = QualityStatus.INVALID
-            else:
-                integrity_status = "UNVERIFIED"
-                quality_status = QualityStatus.UNVERIFIED
+            # Investigation completion status does not establish evidence integrity
+            integrity_status = "UNVERIFIED"
+            quality_status = QualityStatus.UNVERIFIED
 
             applicability_status = (
                 "APPLICABLE"
-                if (scope_status == ScopeStatus.AUTHORIZED and classification_status == "AUTHORIZED")
+                if (scope_status == ScopeStatus.AUTHORIZED and classification_status in ("AUTHORIZED", "CLEARANCE_SUFFICIENT"))
                 else "UNKNOWN"
             )
 
@@ -587,7 +609,10 @@ class VerificationService:
                 classification_status=classification_status,
                 applicability_status=applicability_status,
                 quality_status=quality_status,
-                limitations=["RCA record represents investigation synthesis, not primary observation."],
+                limitations=[
+                    "RCA record represents investigation synthesis; authoritative evidence validation is not available.",
+                    "RCA record represents investigation synthesis, not primary observation.",
+                ],
             )
             return assessment, payload
 
@@ -603,32 +628,34 @@ class VerificationService:
                 scope_status = ScopeStatus.AUTHORIZED
 
             # Check memory entry classification clearance
-            mem_class_str = str(getattr(mem, "classification", "INTERNAL")).upper()
-            req_clear = 1
-            if mem_class_str in ("CONFIDENTIAL", "2"):
-                req_clear = 2
-            elif mem_class_str in ("RESTRICTED", "3"):
-                req_clear = 3
-            classification_status = self._evaluate_clearance(identity, req_clear)
+            raw_mem_class = getattr(mem, "classification", None)
+            if raw_mem_class is not None:
+                mem_class_val = getattr(raw_mem_class, "value", str(raw_mem_class)).strip().upper()
+                if mem_class_val in valid_classification_tiers:
+                    req_clear = valid_classification_tiers[mem_class_val]
+                    classification_status = self._evaluate_clearance(identity, req_clear)
+                else:
+                    classification_status = "UNKNOWN"
+            else:
+                classification_status = "UNKNOWN"
 
             observed_at = None
             received_at = mem.created_at.isoformat() if hasattr(mem.created_at, "isoformat") else str(mem.created_at)
             freshness_status = FreshnessStatus.TIMESTAMP_MISSING
             freshness_sec = None
 
-            if mem.status.value in ("VERIFIED", "ACTIVE") and mem.epistemic_status.value == "VERIFIED_OUTCOME":
+            # Authoritative validation source: check memory verification_status
+            mem_ver_status = getattr(getattr(mem, "verification_status", None), "value", str(getattr(mem, "verification_status", ""))).upper()
+            if mem_ver_status == "VERIFIED":
                 integrity_status = "VALID"
                 quality_status = QualityStatus.VALID
-            elif mem.status.value in ("REVOKED", "REJECTED"):
-                integrity_status = "INVALID"
-                quality_status = QualityStatus.INVALID
             else:
                 integrity_status = "UNVERIFIED"
                 quality_status = QualityStatus.UNVERIFIED
 
             applicability_status = (
                 "APPLICABLE"
-                if (scope_status == ScopeStatus.AUTHORIZED and classification_status == "AUTHORIZED")
+                if (scope_status == ScopeStatus.AUTHORIZED and classification_status in ("AUTHORIZED", "CLEARANCE_SUFFICIENT"))
                 else "UNKNOWN"
             )
 
@@ -801,9 +828,15 @@ class VerificationService:
             for ref in ev_refs:
                 assess, payload = self._resolve_evidence_item(ref, mission, identity, freshness_threshold, eval_dt)
                 assessments.append(assess)
-                all_consumed_evidence_ids.append(assess.evidence_id)
-                all_evidence_timestamps[assess.evidence_id] = assess.observed_at
-                all_evidence_payloads[assess.evidence_id] = payload
+                is_accessible = (
+                    assess.scope_status == ScopeStatus.AUTHORIZED
+                    and assess.classification_status in ("AUTHORIZED", "CLEARANCE_SUFFICIENT")
+                    and assess.applicability_status == "APPLICABLE"
+                )
+                if is_accessible:
+                    all_consumed_evidence_ids.append(assess.evidence_id)
+                    all_evidence_timestamps[assess.evidence_id] = assess.observed_at
+                    all_evidence_payloads[assess.evidence_id] = payload
 
             crit_params = dict(request.rule_parameters or {})
             crit_params.setdefault("freshness_threshold_seconds", freshness_threshold)
@@ -832,9 +865,15 @@ class VerificationService:
             for ref in ev_refs:
                 assess, payload = self._resolve_evidence_item(ref, mission, identity, freshness_threshold, eval_dt)
                 assessments.append(assess)
-                all_consumed_evidence_ids.append(assess.evidence_id)
-                all_evidence_timestamps[assess.evidence_id] = assess.observed_at
-                all_evidence_payloads[assess.evidence_id] = payload
+                is_accessible = (
+                    assess.scope_status == ScopeStatus.AUTHORIZED
+                    and assess.classification_status in ("AUTHORIZED", "CLEARANCE_SUFFICIENT")
+                    and assess.applicability_status == "APPLICABLE"
+                )
+                if is_accessible:
+                    all_consumed_evidence_ids.append(assess.evidence_id)
+                    all_evidence_timestamps[assess.evidence_id] = assess.observed_at
+                    all_evidence_payloads[assess.evidence_id] = payload
 
             step_params = dict(request.rule_parameters or {})
             step_params.setdefault("freshness_threshold_seconds", freshness_threshold)

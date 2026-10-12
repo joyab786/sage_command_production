@@ -157,115 +157,113 @@ class EvidenceExistsRule(BaseDeterministicRule):
                 evaluated_at=now_iso,
             )
 
-        # 1. Scope & clearance boundary violation check: fail closed
-        blocked_items = [
-            a for a in assessments
-            if a.scope_status in (ScopeStatus.UNAUTHORIZED, ScopeStatus.CROSS_PLANT, ScopeStatus.REJECTED, ScopeStatus.UNTAGGED_PLANT)
-            or a.classification_status in ("BLOCKED", "CLEARANCE_INSUFFICIENT")
-        ]
+        # Distinguish optional evidence from required evidence if contract provides distinction
+        optional_ids = set(parameters.get("optional_evidence_ids") or [])
+        if optional_ids:
+            required_assessments = [a for a in assessments if a.evidence_id not in optional_ids]
+            optional_assessments = [a for a in assessments if a.evidence_id in optional_ids]
+        else:
+            required_assessments = list(assessments)
+            optional_assessments = []
 
-        # 2. Check for missing repository records
-        missing_items = [
-            a for a in assessments
-            if a.applicability_status == "UNAVAILABLE" or a.source_type == "UNKNOWN"
-        ]
+        def _is_authorized(a: EvidenceAssessment) -> bool:
+            return (
+                a.scope_status == ScopeStatus.AUTHORIZED
+                and a.classification_status in ("AUTHORIZED", "CLEARANCE_SUFFICIENT")
+                and a.applicability_status == "APPLICABLE"
+            )
 
-        # 3. Authorized and applicable records
-        authorized = [
-            a for a in assessments
-            if a.scope_status == ScopeStatus.AUTHORIZED
-            and a.classification_status in ("AUTHORIZED", "CLEARANCE_SUFFICIENT")
-            and a.applicability_status == "APPLICABLE"
-        ]
+        def _is_blocked(a: EvidenceAssessment) -> bool:
+            return (
+                a.scope_status in (ScopeStatus.UNAUTHORIZED, ScopeStatus.CROSS_PLANT, ScopeStatus.REJECTED, ScopeStatus.UNTAGGED_PLANT)
+                or a.classification_status in ("BLOCKED", "CLEARANCE_INSUFFICIENT")
+                or (a.classification_status == "UNKNOWN" and a.source_type != "UNKNOWN")
+            )
 
-        if authorized:
-            ev_ids = [a.evidence_id for a in authorized]
-            if blocked_items:
-                for b in blocked_items:
-                    limitations.append(f"Evidence '{b.evidence_id}' excluded due to scope or clearance boundary restrictions.")
-            return VerificationFinding(
-                finding_id=finding_id,
-                target_type=target_type,
-                target_id=target_id,
-                status=VerificationStatus.VERIFIED,
-                evidence_references=ev_ids,
-                evidence_assessments=assessments,
-                rule_id=self.rule_id,
-                rule_version=self.rule_version,
-                explanation=(
-                    f"Verified presence of {len(authorized)} accessible, scope-authorized evidence record(s) "
+        authorized_req = [a for a in required_assessments if _is_authorized(a)]
+        blocked_req = [a for a in required_assessments if _is_blocked(a)]
+        unknown_req = [a for a in required_assessments if not _is_authorized(a) and not _is_blocked(a)]
+
+        authorized_opt = [a for a in optional_assessments if _is_authorized(a)]
+
+        # Caller-visible non-disclosure boundary:
+        # Never disclose inaccessible evidence IDs, payloads, or detailed assessments
+        visible_assessments = list(authorized_req) + list(authorized_opt)
+        visible_evidence_refs = [a.evidence_id for a in visible_assessments]
+
+        # Non-disclosing limitations: describe reason without leaking inaccessible identifiers
+        if blocked_req:
+            has_clearance_block = any(
+                b.classification_status in ("BLOCKED", "CLEARANCE_INSUFFICIENT", "UNKNOWN")
+                for b in blocked_req
+            )
+            has_scope_block = any(
+                b.scope_status != ScopeStatus.AUTHORIZED
+                for b in blocked_req
+            )
+            if has_clearance_block:
+                limitations.append("One or more required evidence references could not be verified due to classification clearance restrictions.")
+            if has_scope_block:
+                limitations.append("One or more required evidence references could not be verified due to scope boundary restrictions.")
+        elif unknown_req:
+            if authorized_req:
+                limitations.append("One or more required evidence references could not be resolved within authorized scope.")
+            else:
+                limitations.append("Evidence repository contains no matching records within authorized scope.")
+
+        # Deterministic status aggregation:
+        # Never promote mixed collection to VERIFIED when required evidence is blocked or missing
+        if blocked_req:
+            status = VerificationStatus.BLOCKED
+            explanation = (
+                f"Target '{target_id}' verification blocked: one or more required evidence references "
+                f"cannot be assessed within authorized scope or clearance boundaries."
+            )
+        elif unknown_req:
+            if authorized_req:
+                status = VerificationStatus.INDETERMINATE
+                explanation = (
+                    f"Target '{target_id}' verification indeterminate: one or more required evidence records "
+                    f"are unresolved or unavailable within authorized scope."
+                )
+            else:
+                status = VerificationStatus.NOT_VERIFIED
+                explanation = f"No evidence records found in repository for target '{target_id}'. Condition remains unverified."
+        elif authorized_req and len(authorized_req) == len(required_assessments):
+            status = VerificationStatus.VERIFIED
+            explanation = (
+                f"Verified presence of {len(authorized_req)} accessible, scope-authorized evidence record(s) "
+                f"for target '{target_id}'. Notice: Evidence existence confirms record presence only — "
+                f"does not self-certify operational completion or outcome."
+            )
+        elif not required_assessments and optional_assessments:
+            if authorized_opt:
+                status = VerificationStatus.VERIFIED
+                explanation = (
+                    f"Verified presence of {len(authorized_opt)} accessible optional evidence record(s) "
                     f"for target '{target_id}'. Notice: Evidence existence confirms record presence only — "
                     f"does not self-certify operational completion or outcome."
-                ),
-                limitations=limitations,
-                evaluated_at=now_iso,
-            )
-
-        # If all items are blocked
-        if blocked_items and len(blocked_items) == len(assessments):
-            for a in assessments:
-                if a.scope_status != ScopeStatus.AUTHORIZED:
-                    limitations.append(f"Evidence '{a.evidence_id}' rejected due to scope boundary violation: {a.scope_status.value}.")
-                elif a.classification_status in ("BLOCKED", "CLEARANCE_INSUFFICIENT"):
-                    limitations.append(f"Evidence '{a.evidence_id}' rejected due to classification clearance restriction.")
-            return VerificationFinding(
-                finding_id=finding_id,
-                target_type=target_type,
-                target_id=target_id,
-                status=VerificationStatus.BLOCKED,
-                evidence_references=[a.evidence_id for a in assessments],
-                evidence_assessments=assessments,
-                rule_id=self.rule_id,
-                rule_version=self.rule_version,
-                explanation=f"Evidence exists for target '{target_id}' but was rejected due to scope or clearance boundary isolation.",
-                limitations=limitations,
-                evaluated_at=now_iso,
-            )
-
-        # If all items are missing/not found
-        if missing_items and len(missing_items) == len(assessments):
-            return VerificationFinding(
-                finding_id=finding_id,
-                target_type=target_type,
-                target_id=target_id,
-                status=VerificationStatus.NOT_VERIFIED,
-                evidence_references=[a.evidence_id for a in assessments],
-                evidence_assessments=assessments,
-                rule_id=self.rule_id,
-                rule_version=self.rule_version,
-                explanation=f"No evidence records found in repository for target '{target_id}'. Condition remains unverified.",
-                limitations=["Evidence repository contains no matching records."],
-                evaluated_at=now_iso,
-            )
-
-        if blocked_items:
-            for b in blocked_items:
-                limitations.append(f"Evidence '{b.evidence_id}' rejected due to scope or clearance boundary violation.")
-            return VerificationFinding(
-                finding_id=finding_id,
-                target_type=target_type,
-                target_id=target_id,
-                status=VerificationStatus.BLOCKED,
-                evidence_references=[a.evidence_id for a in assessments],
-                evidence_assessments=assessments,
-                rule_id=self.rule_id,
-                rule_version=self.rule_version,
-                explanation=f"Target '{target_id}' verification blocked due to scope boundary violation or insufficient classification clearance.",
-                limitations=limitations,
-                evaluated_at=now_iso,
-            )
+                )
+            else:
+                status = VerificationStatus.NOT_VERIFIED
+                explanation = f"No optional evidence records found in repository for target '{target_id}'."
+                limitations = ["Optional evidence repository contains no matching records within authorized scope."]
+        else:
+            status = VerificationStatus.INDETERMINATE
+            explanation = f"Evidence for target '{target_id}' does not satisfy existence criteria within authorized scope."
+            limitations = ["Evidence records unresolved or unavailable."]
 
         return VerificationFinding(
             finding_id=finding_id,
             target_type=target_type,
             target_id=target_id,
-            status=VerificationStatus.NOT_VERIFIED,
-            evidence_references=[a.evidence_id for a in assessments],
-            evidence_assessments=assessments,
+            status=status,
+            evidence_references=visible_evidence_refs,
+            evidence_assessments=visible_assessments,
             rule_id=self.rule_id,
             rule_version=self.rule_version,
-            explanation=f"Evidence for target '{target_id}' does not satisfy existence criteria within authorized scope.",
-            limitations=["Evidence records unresolved or unavailable."],
+            explanation=explanation,
+            limitations=limitations,
             evaluated_at=now_iso,
         )
 
