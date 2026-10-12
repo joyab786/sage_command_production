@@ -367,12 +367,54 @@ Eight mandatory adversarial attack cases (A through H) were implemented in [back
 
 ---
 
-## 17. Status Summary
+---
 
-- **Continuous Verification Engine**: `IMPLEMENTED` & `HARDENED (Prompt 36A, 36B & 36C)`
+## 17. Universal Evidence Scope Enforcement & Non-Disclosure Hardening (Prompt 36D)
+
+Prompt 36D corrected the remaining Continuous Verification security defects across the verification rule subsystem:
+
+### A. Universal Scope-Status Enforcement
+- **Comprehensive Scope Vocabulary:** All 8 registered rules enforce authoritative evaluation of the complete `ScopeStatus` vocabulary:
+  - Unauthorized / cross-boundary statuses: `CROSS_TENANT`, `CROSS_WORKSPACE`, `CROSS_PLANT`, `UNAUTHORIZED`, `REJECTED`, `UNTAGGED_PLANT`.
+  - Missing or unknown scope: `UNKNOWN`.
+  - Fully authorized boundary: `AUTHORIZED`.
+- **Fail-Closed Guarantees:**
+  - Any assessment explicitly marked with an unauthorized or cross-boundary scope status fails closed and returns `BLOCKED`. It can **never** independently or jointly support a `VERIFIED` result.
+  - `EvidenceScopeMatchRule` was specifically hardened: previously omitting `CROSS_TENANT` and `CROSS_WORKSPACE`, it now strictly verifies that every evaluated assessment is `AUTHORIZED` and returns `BLOCKED` for any cross-boundary item.
+  - Unknown scope (`UNKNOWN` or `None`) fails closed according to rule semantics, returning `INDETERMINATE` (or `NOT_VERIFIED` for missing records). Rules never report all scope checks passed when scope state is unknown.
+  - Valid integrity status (cryptographic hashes, valid payloads, or operational status) can **never** override an unauthorized scope status.
+  - Mixed accessible and cross-boundary collections fail closed to `BLOCKED`. Accessible evidence never promotes inaccessible evidence to verified.
+
+### B. Universal Evidence Non-Disclosure
+- **Zero Information Leakage:** Every return path in every registered rule sanitizes caller-visible fields to prevent information leakage:
+  - `VerificationFinding.evidence_references`: Contains only evidence IDs authorized for caller disclosure.
+  - `VerificationFinding.evidence_assessments`: Contains only assessment models authorized for caller disclosure; blocked, cross-boundary, and unresolved entries are completely filtered out.
+  - `VerificationFinding.explanation`: Contains generic rationale; never interpolates blocked or unresolved evidence IDs.
+  - `VerificationFinding.limitations`: Uses generic non-disclosing messages (e.g., *"One or more evidence references could not be verified due to scope boundary restrictions."*), never revealing specific IDs or existence in other tenants/plants.
+  - `VerificationRun.provenance.evidence_ids`: Restricted strictly to authorized, accessible evidence items.
+  - Stored run records and audit payloads preserve the identical sanitized boundary across subsequent retrieval.
+- **Direct Rule Invocation Safety:** Because rules can be invoked directly by tests or internal components independently of `VerificationService`, shared helpers (`is_evidence_scope_violation`, `is_evidence_clearance_violation`, `is_evidence_blocked`, `is_evidence_authorized_for_disclosure`, `sanitize_finding_disclosure`, `generate_non_disclosing_limitations`) are enforced directly within each rule's `evaluate()` method.
+
+### C. Rule-Selection Integrity & Diagnostic Boundary
+- **Deterministic Rule Identification:** When a caller selects a rule via `VerificationRequest.rule_type`, the resulting finding clearly identifies the evaluated rule (e.g., `RULE_EVIDENCE_EXISTS_V1`).
+- **Diagnostic Caveat:** Diagnostic rules such as `EVIDENCE_EXISTS` evaluate evidence presence and validity, but do not certify operational completion, physical execution, freshness, or multi-source agreement:
+  - `VerificationRun.summary` includes an explicit disclaimer: *"DIAGNOSTIC ONLY: Evidence existence check does not certify authoritative mission completion, freshness, or multi-source consistency."*
+  - `VerificationRun.provenance.limitations` records the diagnostic non-certification constraint.
+  - A diagnostic `VERIFIED` result cannot silently certify stronger mission requirements or mutate mission state (missions remain `ACCEPTED`).
+  - Authoritative mission requirements cannot be replaced or bypassed by caller-controlled `rule_parameters`.
+
+---
+
+## 18. Status Summary
+
+- **Continuous Verification Engine**: `IMPLEMENTED` & `HARDENED (Prompt 36, 36A, 36B, 36C & 36D)`
+- **Universal Scope Enforcement**: `IMPLEMENTED & ENFORCED` across all 8 registered rules
+- **Universal Evidence Non-Disclosure**: `IMPLEMENTED & VERIFIED` across all return paths, findings, provenance, and storage
 - **Rule Parameter Boundary**: `ENFORCED` (Prohibited parameters rejected, server parameters authoritative)
 - **Authoritative Optionality**: `DISABLED & FAIL-CLOSED` (No trusted contract; all target evidence required)
 - **Deterministic Rule Registry**: `IMPLEMENTED` (8 rules, fail-closed aggregation, strict non-disclosure)
+- **Direct Rule Invocation Safety**: `IMPLEMENTED` (Shared helpers in rules module, self-defending rules)
+- **Rule-Selection Integrity**: `ENFORCED` (Explicit rule ID, diagnostic caveat notice, server-governed parameters)
 - **Scope & Plant Isolation**: `IMPLEMENTED` (Fail-closed, non-disclosing)
 - **Trusted Identity Propagation**: `IMPLEMENTED & INTEGRATED` (Token-safe context in WebSocket orchestrator)
 - **Agent Tools Registration**: `DELIBERATELY UNREGISTERED` (Unregistered from `copilot_tools.py` pending Prompt 37)

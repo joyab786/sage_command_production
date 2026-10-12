@@ -164,7 +164,7 @@ Prompt 36B resolved remaining architectural gaps identified during remote review
 - **Case G (Mixed Unresolved):** Verified accessible + unknown evidence evaluates to `INDETERMINATE` with unknown IDs redacted.
 - **Case H (Trusted Optionality):** Proved no optional contract exists on mission schemas and optional parameters fail closed.
 
-### C. Test Verification Metrics
+### C. Test Verification Metrics (Prompt 36C Baseline)
 - **Continuous Verification Suite (`backend/test_v3_continuous_verification.py`):** 76 tests (100% passed in 9.98s).
 - **Mission Regression Suite (`backend/test_v3_mission_architecture.py`):** 74 tests (100% passed in 6.64s).
 - **Subsystem Regression Suite:** 309 tests (100% passed in 23.24s) across Evidence Explainability (140), Organizational Memory (83), Root Cause Analysis (30), and Incident Management (56).
@@ -172,7 +172,49 @@ Prompt 36B resolved remaining architectural gaps identified during remote review
 
 ---
 
-## 8. Known Limitations
+## 8. Prompt 36D Hardening & Universal Scope Enforcement
+
+Prompt 36D corrected the remaining security defects in Continuous Verification identified during independent review of Prompt 36C:
+
+### A. Universal Scope Enforcement Across All 8 Rules
+1. **Defects Closed:**
+   - Multiple verification rules previously omitted `CROSS_TENANT` and `CROSS_WORKSPACE` in scope checks, and exposed inaccessible/unresolved evidence IDs or metadata in caller-visible findings.
+   - `EvidenceScopeMatchRule` previously could return `VERIFIED` on cross-tenant or cross-workspace evidence.
+2. **Universal Scope Vocabulary:** Every registered rule (`EvidenceExistsRule`, `EvidenceValidatedRule`, `EvidenceFreshRule`, `RequiredEvidencePresentRule`, `RequiredEvidenceValidatedRule`, `EvidenceScopeMatchRule`, `RequiredFieldsPresentRule`, `SourceConsistencyRule`) now strictly evaluates:
+   - Unauthorized / cross-boundary statuses: `CROSS_TENANT`, `CROSS_WORKSPACE`, `CROSS_PLANT`, `UNAUTHORIZED`, `REJECTED`, `UNTAGGED_PLANT` -> `BLOCKED`.
+   - Unknown scope: `UNKNOWN` -> `INDETERMINATE` (fail-closed).
+   - Valid cryptographic or operational integrity can never override unauthorized scope.
+   - Mixed accessible and cross-boundary collections fail closed to `BLOCKED`.
+
+### B. Universal Non-Disclosure
+1. **Redaction of Inaccessible Identifiers:** Blocked and unresolved evidence IDs are completely redacted from `evidence_references`, `evidence_assessments`, `explanation`, `limitations`, run `provenance.evidence_ids`, and persisted records.
+2. **Non-Disclosing Limitations:** Explanations and limitations use generic messages (e.g., *"One or more evidence references could not be evaluated within the authorized scope."*) that never disclose inaccessible IDs or existence in other tenants/plants.
+3. **Direct Rule Invocation Safety:** Shared evaluation helpers within `verification_rules.py` enforce these boundaries directly on rule invocation, guaranteeing safety even when rules are invoked independently of `VerificationService`.
+
+### C. Rule-Selection Integrity & Diagnostic Notice
+1. **Rule Identification:** Findings explicitly record the rule evaluated (e.g., `RULE_EVIDENCE_EXISTS_V1`).
+2. **Diagnostic Disclaimer:** Evaluating `EVIDENCE_EXISTS` produces an explicit summary disclaimer (*"DIAGNOSTIC ONLY: Evidence existence check does not certify authoritative mission completion..."*) and records the constraint in run provenance limitations.
+3. **Mission Boundary:** Diagnostic verification cannot certify stronger requirements or mutate mission state (missions remain `ACCEPTED`).
+
+### D. Verified Test Metrics (Prompt 36D)
+- **Continuous Verification Suite (`backend/test_v3_continuous_verification.py`):** 94 tests (100% passed in 8.81s).
+  - Scope Matrix: 6 unauthorized scope statuses (`CROSS_TENANT`, `CROSS_WORKSPACE`, `CROSS_PLANT`, `UNAUTHORIZED`, `REJECTED`, `UNTAGGED_PLANT`) tested across all 8 rules -> all returned `BLOCKED` with full non-disclosure.
+  - Unknown Scope: Tested across all 8 rules -> all failed closed to `INDETERMINATE`/`NOT_VERIFIED`.
+  - Integrity Override Defense: Verified valid integrity cannot bypass unauthorized scope across all 8 rules.
+  - Baseline & Mixed Collections: Verified fully authorized collections produce `VERIFIED`; mixed collections fail closed to `BLOCKED` with blocked IDs redacted.
+  - End-to-End Serialization & Persistence: Verified serialized runs and repository retrievals contain zero leaked IDs.
+  - Rule Selection Diagnostic Notice: Verified diagnostic notice is recorded and mission state preserved.
+- **Mission Architecture Regression Suite (`backend/test_v3_mission_architecture.py`):** 74 passed, 0 failed in 6.36s.
+- **Evidence Explainability Suite (`backend/test_v3_evidence_explainability.py`):** 140 passed, 0 failed in 6.68s.
+- **Organizational Memory Suite (`backend/test_v3_organizational_memory.py`):** 83 passed, 0 failed in 8.52s.
+- **Root Cause Analysis Suite (`backend/test_v3_root_cause_analysis.py`):** 30 passed, 0 failed in 6.09s.
+- **Incident Management Suite (`backend/test_v3_incident_management.py`):** 56 passed, 0 failed in 10.52s.
+- **Confidence Uncertainty & Authorization Suite (`backend/test_v3_confidence_uncertainty.py`, `backend/test_v3_authorization.py`):** 171 passed, 0 failed in 7.81s.
+- **Combined Prompt 36D Verification Test Count:** **648 passed, 0 failed, 0 skipped** across all executed suites.
+
+---
+
+## 9. Known Limitations
 
 1. **Synchronous Polling vs. Event-Driven Push**: Evidence evaluation is performed on demand during a verification request. Streaming continuous re-evaluation upon telemetry event emission is architecturally prepared but scheduled for Prompt 37.
 2. **Deterministic Rules Bound**: The current rule registry implements 8 explicit deterministic rule types. Non-deterministic probabilistic models are intentionally not permitted to decide verification outcomes.
@@ -182,9 +224,9 @@ Prompt 36B resolved remaining architectural gaps identified during remote review
 
 ---
 
-## 9. Explicitly Deferred Capabilities
+## 10. Explicitly Deferred Capabilities
 
-The following capabilities are explicitly deferred from Prompts 36, 36A, 36B & 36C:
+The following capabilities are explicitly deferred from Prompts 36, 36A, 36B, 36C & 36D:
 - Autonomous mission execution or dispatch.
 - Direct SCADA / PLC write commands.
 - Operational database updates or deletions.
@@ -194,7 +236,7 @@ The following capabilities are explicitly deferred from Prompts 36, 36A, 36B & 3
 
 ---
 
-## 10. Lineage and Git Lineage
+## 11. Lineage and Git Lineage
 
 - **Prompt 36 Starting Baseline:** `de6dac99df8c1285b33076eeb58d37b0656c1dcc`
 - **Prompt 36A Starting Baseline:** `663f3a491f84a97e580f575fd711d82e87f67f45`
@@ -202,5 +244,7 @@ The following capabilities are explicitly deferred from Prompts 36, 36A, 36B & 3
 - **Prompt 36B Starting Baseline:** `be2c111ec934e3bac7f06781d2081b8762fd1c0a`
 - **Prompt 36B Implementation Commit:** `c51f471e9a930ff292a1feaa06132049c303f26b`
 - **Prompt 36C Starting Baseline:** `6dc2de3bc96c6f12a57cf539d173c1973d3463e4`
+- **Prompt 36C Implementation Commit:** `c9fc5eec253bcad43fdddbb71d9a263ba8903c73`
+- **Prompt 36D Starting Baseline:** `7bb9ff70de4d1c948319f8250216818c63b9e97e`
 - **Target Branch:** `main`
 - **Repository:** `joyab786/sage_command_production`
