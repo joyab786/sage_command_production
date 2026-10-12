@@ -145,18 +145,46 @@ Prompt 36B resolved remaining architectural gaps identified during remote review
 
 ---
 
-## 7. Known Limitations
+## 7. Trusted Rule Parameters & Evidence Optionality Security Fix (Prompt 36C)
+
+### A. Security Defect Resolution
+1. **Vulnerability Closed:** In `EvidenceExistsRule`, caller-supplied `optional_evidence_ids` in `request.rule_parameters` previously could downgrade blocked evidence to optional, promoting unverified findings to `VERIFIED`.
+2. **Authoritative Optionality Audit:** Audited `MissionSuccessCriterion` and `MissionPlannedStep`. Found zero trusted contracts or schema fields for optional evidence. As required by security policy, `optional_evidence_ids` in `EvidenceExistsRule` was disabled/removed. All mission evidence references are treated as strictly required.
+3. **Rule-Parameter Boundary Protected:** Added `PROHIBITED_CALLER_RULE_PARAMETERS` to reject client tampering with required evidence IDs, types, payloads, scopes, classifications, and verification statuses at both the Pydantic validator and service layers.
+4. **Direct Server Assignment:** Server-resolved evidence payloads and requirement types are directly assigned in rule parameters; client payloads cannot override server-controlled evidence.
+5. **Aggregation & Non-Disclosure:** Re-asserted that any blocked reference forces `BLOCKED` (never `VERIFIED`), and any unresolved reference forces `INDETERMINATE`. Blocked/inaccessible identifiers are completely excluded from `evidence_references`, `evidence_assessments`, `explanation`, `limitations`, and `provenance`.
+
+### B. Adversarial Attack Tests (Cases A–H)
+- **Case A (Downgrade Attempt):** Verified caller cannot downgrade required blocked evidence to optional (returns `BLOCKED` with no identifier leaks).
+- **Case B (All Downgrade):** Verified caller cannot mark all requirements optional (rejected with `422 Unprocessable Entity`).
+- **Case C (Override Requirements):** Verified caller cannot supply subset of required evidence IDs (rejected with `422`).
+- **Case D (Payload Injection):** Verified caller cannot inject synthetic `evidence_payloads` (rejected with `422`).
+- **Case E (Legitimate Evidence):** Verified accessible required evidence evaluates to `VERIFIED` with non-certification notice.
+- **Case F (Mixed Blocked):** Verified accessible + blocked evidence evaluates to `BLOCKED` with blocked IDs redacted.
+- **Case G (Mixed Unresolved):** Verified accessible + unknown evidence evaluates to `INDETERMINATE` with unknown IDs redacted.
+- **Case H (Trusted Optionality):** Proved no optional contract exists on mission schemas and optional parameters fail closed.
+
+### C. Test Verification Metrics
+- **Continuous Verification Suite (`backend/test_v3_continuous_verification.py`):** 76 tests (100% passed in 9.98s).
+- **Mission Regression Suite (`backend/test_v3_mission_architecture.py`):** 74 tests (100% passed in 6.64s).
+- **Subsystem Regression Suite:** 309 tests (100% passed in 23.24s) across Evidence Explainability (140), Organizational Memory (83), Root Cause Analysis (30), and Incident Management (56).
+- **Combined Test Count:** 459 passed, 0 failed across all active suites.
+
+---
+
+## 8. Known Limitations
 
 1. **Synchronous Polling vs. Event-Driven Push**: Evidence evaluation is performed on demand during a verification request. Streaming continuous re-evaluation upon telemetry event emission is architecturally prepared but scheduled for Prompt 37.
 2. **Deterministic Rules Bound**: The current rule registry implements 8 explicit deterministic rule types. Non-deterministic probabilistic models are intentionally not permitted to decide verification outcomes.
 3. **Cross-Subsystem Adapters**: Evidence resolution queries existing SQLite stores (`ActionStore`, `DecisionEngineRepository`, `IncidentRepository`, `EvidenceExplainabilityRepository`, `RcaRepository`, `OrganizationalMemoryRepository`). Distributed federated databases beyond local SQLite stores rely on the existing `DatabaseConnectionGateway`.
 4. **Agent Tools Registration**: Verification tools are deliberately not registered in the default `copilot_tools` agent registry pending Prompt 37 closed-loop copilot integration.
+5. **Optional Evidence Support**: Optional evidence is currently unsupported because no server-authoritative contract exists in mission schemas. All mission evidence references are treated as strictly required.
 
 ---
 
-## 8. Explicitly Deferred Capabilities
+## 9. Explicitly Deferred Capabilities
 
-The following capabilities are explicitly deferred from Prompts 36, 36A & 36B:
+The following capabilities are explicitly deferred from Prompts 36, 36A, 36B & 36C:
 - Autonomous mission execution or dispatch.
 - Direct SCADA / PLC write commands.
 - Operational database updates or deletions.
@@ -166,11 +194,13 @@ The following capabilities are explicitly deferred from Prompts 36, 36A & 36B:
 
 ---
 
-## 9. Lineage and Git Lineage
+## 10. Lineage and Git Lineage
 
 - **Prompt 36 Starting Baseline:** `de6dac99df8c1285b33076eeb58d37b0656c1dcc`
 - **Prompt 36A Starting Baseline:** `663f3a491f84a97e580f575fd711d82e87f67f45`
 - **Prompt 36A Implementation Commit:** `28ee5bd4346a4b2d6fc2b5fb1a812a2d5ccd129c`
 - **Prompt 36B Starting Baseline:** `be2c111ec934e3bac7f06781d2081b8762fd1c0a`
+- **Prompt 36B Implementation Commit:** `c51f471e9a930ff292a1feaa06132049c303f26b`
+- **Prompt 36C Starting Baseline:** `6dc2de3bc96c6f12a57cf539d173c1973d3463e4`
 - **Target Branch:** `main`
 - **Repository:** `joyab786/sage_command_production`

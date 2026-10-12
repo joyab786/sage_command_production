@@ -320,9 +320,58 @@ Records are never marked `VALID` solely from workflow completion statuses (`COMP
 
 ---
 
-## 16. Status Summary
+## 16. Trusted Rule Parameters & Evidence Optionality Boundary Security Fix (Prompt 36C)
 
-- **Continuous Verification Engine**: `IMPLEMENTED` & `HARDENED (Prompt 36A & 36B)`
+Prompt 36C addressed a critical security boundary defect in rule parameter handling and evidence optionality:
+
+### A. Authoritative Source of Evidence Requirements & Optionality Finding
+- **Authoritative Source:** The mission contract is the single authoritative source of evidence requirements:
+  - For `MissionSuccessCriterion`: `required_evidence: List[MissionEvidenceRequirement]` defines authoritative requirements.
+  - For `MissionPlannedStep`: `required_evidence_ids: List[str]` defines authoritative step evidence IDs.
+- **Optionality Audit:** Investigation of `backend/data/schemas/mission_contract.py` confirmed that **no trusted contract or schema field for optional evidence exists**. Neither `MissionSuccessCriterion` nor `MissionPlannedStep` exposes optional evidence fields.
+- **Fail-Closed Resolution:** In accordance with prompt specifications, because no trusted, server-authoritative representation of optional evidence exists, the `optional_evidence_ids` feature in `EvidenceExistsRule` was completely disabled. Every evidence reference defined in the authoritative mission is strictly required. Optionality is never inferred from caller parameters, model responses, frontend state, or agent arguments.
+
+### B. Rule-Parameter Boundary Protection
+- **Prohibited Rule Parameters:** Added `PROHIBITED_CALLER_RULE_PARAMETERS` to [backend/data/schemas/verification_contract.py](file:///E:/js/sage_command_production/backend/data/schemas/verification_contract.py) defining parameters callers are strictly forbidden from supplying:
+  - `optional_evidence_ids`
+  - `required_evidence_ids`
+  - `required_evidence_types`
+  - `evidence_payloads`
+  - Mission scope parameters (`tenant_id`, `workspace_id`, `plant_id`, `session_id`)
+  - Classification and clearance decisions (`classification_status`, `clearance_level`, `classification_tier`)
+  - Authorization decisions (`scope_status`, `authorization_status`, `is_accessible`)
+  - Server-calculated metrics or statuses (`status`, `validation_status`, `verified_count`, `quality_status`)
+- **Enforcement Layers:**
+  1. **Schema Validation:** `VerificationRequest` applies a Pydantic `@field_validator("rule_parameters")` rejecting requests containing prohibited keys with HTTP 422 / `ValueError`.
+  2. **Service Layer Defense:** `VerificationService.request_verification` validates `request.rule_parameters` and raises `VerificationValidationError` if any prohibited key is present.
+  3. **Direct Server Assignment:** In `VerificationService._verify_criterion` and `_verify_step`, server-resolved evidence payloads and requirement types are directly assigned to rule parameters (`crit_params["evidence_payloads"] = ...`, `step_params["evidence_payloads"] = ...`), replacing previous `setdefault` calls. Client parameters can never override or inject fabricated evidence payloads.
+
+### C. Hardened Aggregation and Semantic Boundaries
+- **Record Presence Only:** `EvidenceExistsRule` verifies database record presence only. It does not certify operational completion, physical execution, or real-world success.
+- **Aggregation Logic:**
+  - Any inaccessible or cross-boundary reference -> `BLOCKED` (never `VERIFIED`).
+  - Any unresolved or missing reference -> `INDETERMINATE`.
+  - All authoritative references present and accessible -> `VERIFIED`.
+- **Strict Non-Disclosure:** Blocked and unknown record identifiers are completely redacted from `evidence_references`, `evidence_assessments`, `explanation`, `limitations`, and run `provenance.evidence_ids`. Blocked evidence existence is never disclosed.
+
+### D. Security Verification & Adversarial Attack Suite
+Eight mandatory adversarial attack cases (A through H) were implemented in [backend/test_v3_continuous_verification.py](file:///E:/js/sage_command_production/backend/test_v3_continuous_verification.py) and verified:
+- **Case A (Downgrade Attempt):** Caller supplying `optional_evidence_ids` for blocked evidence is rejected; rule returns `BLOCKED` with no identifier leaks.
+- **Case B (All Downgrade Attempt):** Caller attempting to mark all requirements optional is rejected at request validation.
+- **Case C (Override Requirements):** Caller attempting to pass reduced `required_evidence_ids` is rejected.
+- **Case D (Payload Injection):** Caller attempting to pass fabricated `evidence_payloads` is rejected.
+- **Case E (Legitimate Evidence):** All accessible required evidence returns `VERIFIED` with non-certification notice.
+- **Case F (Mixed Blocked):** Accessible + blocked evidence returns `BLOCKED` with blocked IDs redacted.
+- **Case G (Mixed Unresolved):** Accessible + unknown evidence returns `INDETERMINATE` with unknown IDs redacted.
+- **Case H (Trusted Optionality Contract):** Proves no optional contract exists and optional parameters fail closed.
+
+---
+
+## 17. Status Summary
+
+- **Continuous Verification Engine**: `IMPLEMENTED` & `HARDENED (Prompt 36A, 36B & 36C)`
+- **Rule Parameter Boundary**: `ENFORCED` (Prohibited parameters rejected, server parameters authoritative)
+- **Authoritative Optionality**: `DISABLED & FAIL-CLOSED` (No trusted contract; all target evidence required)
 - **Deterministic Rule Registry**: `IMPLEMENTED` (8 rules, fail-closed aggregation, strict non-disclosure)
 - **Scope & Plant Isolation**: `IMPLEMENTED` (Fail-closed, non-disclosing)
 - **Trusted Identity Propagation**: `IMPLEMENTED & INTEGRATED` (Token-safe context in WebSocket orchestrator)
