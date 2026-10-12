@@ -695,7 +695,7 @@ class VerificationService:
             classification_status="UNKNOWN",
             applicability_status="UNAVAILABLE",
             quality_status=QualityStatus.UNKNOWN,
-            limitations=[f"Evidence reference '{ref_id}' could not be resolved within authorized scope."],
+            limitations=["One or more evidence references could not be evaluated within the authorized scope."],
         )
         return assessment, {}
 
@@ -940,7 +940,14 @@ class VerificationService:
             summary = f"{stale_count} verification target(s) rely on stale evidence beyond threshold ({freshness_threshold:.0f}s)."
         elif verified_count == target_count:
             overall_status = VerificationStatus.VERIFIED
-            summary = f"All {target_count} target(s) successfully verified by authorized, current evidence."
+            if rule_to_use.rule_type == RuleType.EVIDENCE_EXISTS:
+                summary = (
+                    f"All {target_count} target(s) verified under diagnostic rule '{rule_to_use.rule_id}'. "
+                    f"DIAGNOSTIC ONLY: Evidence existence check does not certify authoritative mission completion, freshness, or multi-source consistency."
+                )
+                all_limitations.append("Diagnostic evaluation only (EVIDENCE_EXISTS): does not certify authoritative mission completion, freshness, or multi-source consistency.")
+            else:
+                summary = f"All {target_count} target(s) successfully verified by authorized, current evidence."
         else:
             overall_status = VerificationStatus.INDETERMINATE
             summary = f"{indeterminate_count} target(s) have indeterminate evidence."

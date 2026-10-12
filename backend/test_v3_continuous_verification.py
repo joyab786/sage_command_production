@@ -1148,10 +1148,17 @@ def test_cross_plant_evidence_marked_blocked(v_service, analyst_identity, sample
     req = VerificationRequest(target_type=VerificationTargetType.CRITERION, target_id="crit_01")
     run = v_service.request_verification(analyst_identity, sample_mission.mission_id, req)
     assert run.target_count == 1
-    # Evidence was rejected due to scope boundary
+    assert run.status == VerificationStatus.BLOCKED
+    # Evidence was rejected due to scope boundary, non-disclosure must redact blocked assessments
     finding = run.findings[0]
-    assess = finding.evidence_assessments[0]
-    assert assess.scope_status == ScopeStatus.CROSS_PLANT
+    assert finding.status == VerificationStatus.BLOCKED
+    assert finding.evidence_assessments == []
+    assert finding.evidence_references == []
+    assert "ev_rec_01" not in str(finding.limitations)
+    assert "ev_rec_01" not in finding.explanation
+    # Verify internal scope status resolution without exposing to caller
+    internal_assess, _ = v_service._resolve_evidence_item("ev_rec_01", sample_mission, analyst_identity, 3600.0, datetime.now(timezone.utc))
+    assert internal_assess.scope_status == ScopeStatus.CROSS_PLANT
 
 
 def test_untagged_plant_evidence_fails_closed(v_service, analyst_identity, sample_mission, e_repo):
@@ -1190,9 +1197,16 @@ def test_untagged_plant_evidence_fails_closed(v_service, analyst_identity, sampl
 
     req = VerificationRequest(target_type=VerificationTargetType.CRITERION, target_id="crit_01")
     run = v_service.request_verification(analyst_identity, sample_mission.mission_id, req)
+    assert run.status == VerificationStatus.BLOCKED
     finding = run.findings[0]
-    assess = finding.evidence_assessments[0]
-    assert assess.scope_status == ScopeStatus.UNTAGGED_PLANT
+    assert finding.status == VerificationStatus.BLOCKED
+    assert finding.evidence_assessments == []
+    assert finding.evidence_references == []
+    assert "ev_rec_01" not in str(finding.limitations)
+    assert "ev_rec_01" not in finding.explanation
+    # Verify internal scope status resolution without exposing to caller
+    internal_assess, _ = v_service._resolve_evidence_item("ev_rec_01", sample_mission, analyst_identity, 3600.0, datetime.now(timezone.utc))
+    assert internal_assess.scope_status == ScopeStatus.UNTAGGED_PLANT
 
 
 # =============================================================================
@@ -2509,3 +2523,409 @@ def test_case_h_trusted_optional_evidence_boundary():
     )
     assert finding.status == VerificationStatus.BLOCKED
     assert finding.evidence_references == []
+
+
+# =============================================================================
+# PROMPT 36D: UNIVERSAL EVIDENCE SCOPE ENFORCEMENT & NON-DISCLOSURE HARDENING
+# =============================================================================
+
+ALL_8_RULES = [
+    EvidenceExistsRule(),
+    EvidenceValidatedRule(),
+    EvidenceFreshRule(),
+    RequiredEvidencePresentRule(),
+    RequiredEvidenceValidatedRule(),
+    EvidenceScopeMatchRule(),
+    RequiredFieldsPresentRule(),
+    SourceConsistencyRule(),
+]
+
+ALL_UNAUTHORIZED_SCOPES = [
+    ScopeStatus.CROSS_TENANT,
+    ScopeStatus.CROSS_WORKSPACE,
+    ScopeStatus.CROSS_PLANT,
+    ScopeStatus.UNAUTHORIZED,
+    ScopeStatus.REJECTED,
+    ScopeStatus.UNTAGGED_PLANT,
+]
+
+
+def _build_test_params_for_rule(auth_id="ev_auth_01", blocked_id="ev_blocked_01"):
+    return {
+        "required_evidence_types": ["SENSOR"],
+        "required_evidence_ids": [auth_id],
+        "required_fields": ["reading"],
+        "metric_key": "reading",
+        "tolerance": 0.1,
+        "freshness_threshold_seconds": 3600.0,
+        "evidence_payloads": {
+            auth_id: {"reading": 42.0},
+            blocked_id: {"reading": 42.0},
+            "ev_auth_02": {"reading": 42.0},
+        },
+    }
+
+
+def _build_authorized_assessment(ev_id="ev_auth_01", source_type="SENSOR"):
+    now_iso = datetime.now(timezone.utc).isoformat()
+    return EvidenceAssessment(
+        evidence_id=ev_id,
+        source_type=source_type,
+        observed_at=now_iso,
+        received_at=now_iso,
+        freshness_status=FreshnessStatus.CURRENT,
+        freshness_seconds=10.0,
+        freshness_threshold_seconds=3600.0,
+        integrity_status="VALID",
+        scope_status=ScopeStatus.AUTHORIZED,
+        classification_status="AUTHORIZED",
+        applicability_status="APPLICABLE",
+        quality_status=QualityStatus.VALID,
+    )
+
+
+def _build_unauthorized_assessment(scope_status: ScopeStatus, ev_id="ev_blocked_01", source_type="SENSOR"):
+    now_iso = datetime.now(timezone.utc).isoformat()
+    return EvidenceAssessment(
+        evidence_id=ev_id,
+        source_type=source_type,
+        observed_at=now_iso,
+        received_at=now_iso,
+        freshness_status=FreshnessStatus.CURRENT,
+        freshness_seconds=10.0,
+        freshness_threshold_seconds=3600.0,
+        integrity_status="VALID",  # Valid integrity explicitly set
+        scope_status=scope_status,
+        classification_status="AUTHORIZED",
+        applicability_status="APPLICABLE",
+        quality_status=QualityStatus.VALID,
+    )
+
+
+@pytest.mark.parametrize("scope_status", ALL_UNAUTHORIZED_SCOPES)
+def test_prompt36d_scope_matrix_unauthorized_statuses_never_verified(scope_status):
+    """
+    Scope Matrix: CROSS_TENANT, CROSS_WORKSPACE, CROSS_PLANT, UNAUTHORIZED,
+    REJECTED, UNTAGGED_PLANT never produce VERIFIED across all 8 rules.
+    """
+    blocked_id = f"ev_blocked_{scope_status.value.lower()}"
+    assessment = _build_unauthorized_assessment(scope_status, ev_id=blocked_id)
+    params = _build_test_params_for_rule(blocked_id=blocked_id)
+    mission_scope = {"tenant_id": "tenant_alpha", "workspace_id": "workspace_prod", "plant_id": "plant_01"}
+
+    for rule in ALL_8_RULES:
+        finding = rule.evaluate("target_scope_matrix", VerificationTargetType.CRITERION, [assessment], mission_scope, params)
+        assert finding.status != VerificationStatus.VERIFIED, (
+            f"Rule '{rule.rule_id}' falsely returned VERIFIED for scope status '{scope_status}'!"
+        )
+        assert finding.status == VerificationStatus.BLOCKED, (
+            f"Rule '{rule.rule_id}' did not return BLOCKED for unauthorized scope status '{scope_status}'!"
+        )
+        # Non-disclosure assertions
+        assert finding.evidence_references == [], f"Rule '{rule.rule_id}' disclosed blocked evidence reference!"
+        assert finding.evidence_assessments == [], f"Rule '{rule.rule_id}' disclosed blocked assessment!"
+        assert blocked_id not in finding.explanation
+        assert blocked_id not in str(finding.limitations)
+
+
+def test_prompt36d_scope_matrix_unknown_scope_never_verified():
+    """
+    Scope Matrix: UNKNOWN scope cannot produce a falsely authorized result across all 8 rules.
+    """
+    unknown_id = "ev_unknown_scope_01"
+    now_iso = datetime.now(timezone.utc).isoformat()
+    assessment = EvidenceAssessment(
+        evidence_id=unknown_id,
+        source_type="SENSOR",
+        observed_at=now_iso,
+        received_at=now_iso,
+        freshness_status=FreshnessStatus.CURRENT,
+        integrity_status="VALID",
+        scope_status=ScopeStatus.UNKNOWN,
+        classification_status="AUTHORIZED",
+        applicability_status="APPLICABLE",
+        quality_status=QualityStatus.VALID,
+    )
+    params = _build_test_params_for_rule(blocked_id=unknown_id)
+    mission_scope = {"tenant_id": "tenant_alpha", "workspace_id": "workspace_prod", "plant_id": "plant_01"}
+
+    for rule in ALL_8_RULES:
+        finding = rule.evaluate("target_unknown", VerificationTargetType.CRITERION, [assessment], mission_scope, params)
+        assert finding.status != VerificationStatus.VERIFIED, (
+            f"Rule '{rule.rule_id}' falsely returned VERIFIED for UNKNOWN scope!"
+        )
+        assert finding.status in (VerificationStatus.INDETERMINATE, VerificationStatus.NOT_VERIFIED), (
+            f"Rule '{rule.rule_id}' did not fail closed to INDETERMINATE/NOT_VERIFIED for UNKNOWN scope!"
+        )
+        assert unknown_id not in finding.evidence_references
+        assert unknown_id not in [a.evidence_id for a in finding.evidence_assessments]
+        assert unknown_id not in finding.explanation
+        assert unknown_id not in str(finding.limitations)
+
+
+@pytest.mark.parametrize("scope_status", ALL_UNAUTHORIZED_SCOPES)
+def test_prompt36d_scope_matrix_valid_integrity_cannot_override_scope(scope_status):
+    """
+    Scope Matrix: Valid integrity status cannot override an unauthorized scope status.
+    """
+    blocked_id = f"ev_valid_integ_{scope_status.value.lower()}"
+    assessment = _build_unauthorized_assessment(scope_status, ev_id=blocked_id)
+    # Ensure all integrity and quality signals are explicitly valid
+    assessment.integrity_status = "VALID"
+    assessment.quality_status = QualityStatus.VALID
+    assessment.classification_status = "AUTHORIZED"
+    assessment.applicability_status = "APPLICABLE"
+
+    params = _build_test_params_for_rule(blocked_id=blocked_id)
+    mission_scope = {"tenant_id": "tenant_alpha", "workspace_id": "workspace_prod", "plant_id": "plant_01"}
+
+    for rule in ALL_8_RULES:
+        finding = rule.evaluate("target_override", VerificationTargetType.CRITERION, [assessment], mission_scope, params)
+        assert finding.status == VerificationStatus.BLOCKED
+        assert finding.status != VerificationStatus.VERIFIED
+        assert finding.evidence_references == []
+        assert finding.evidence_assessments == []
+
+
+def test_prompt36d_all_rules_authorized_baseline():
+    """
+    Rule Coverage: Fully authorized assessment with minimum required conditions produces VERIFIED.
+    """
+    auth1 = _build_authorized_assessment("ev_auth_01")
+    auth2 = _build_authorized_assessment("ev_auth_02")
+    params = _build_test_params_for_rule("ev_auth_01")
+    mission_scope = {"tenant_id": "tenant_alpha", "workspace_id": "workspace_prod", "plant_id": "plant_01"}
+
+    for rule in ALL_8_RULES:
+        # SourceConsistencyRule requires at least 2 sources
+        assessments = [auth1, auth2] if isinstance(rule, SourceConsistencyRule) else [auth1]
+        finding = rule.evaluate("target_baseline", VerificationTargetType.CRITERION, assessments, mission_scope, params)
+        assert finding.status == VerificationStatus.VERIFIED, (
+            f"Rule '{rule.rule_id}' failed to verify fully authorized evidence!"
+        )
+        assert len(finding.evidence_references) >= 1
+        assert len(finding.evidence_assessments) >= 1
+        assert "ev_auth_01" in finding.evidence_references
+
+
+def test_prompt36d_all_rules_mixed_collection_fails_closed_and_redacts():
+    """
+    Rule Coverage: Mixed authorized and cross-boundary collection never produces VERIFIED,
+    and blocked IDs are redacted from references, assessments, explanations, and limitations.
+    """
+    auth = _build_authorized_assessment("ev_auth_01")
+    blocked = _build_unauthorized_assessment(ScopeStatus.CROSS_TENANT, ev_id="ev_cross_tenant_99")
+    params = _build_test_params_for_rule(auth_id="ev_auth_01", blocked_id="ev_cross_tenant_99")
+    mission_scope = {"tenant_id": "tenant_alpha", "workspace_id": "workspace_prod", "plant_id": "plant_01"}
+
+    for rule in ALL_8_RULES:
+        finding = rule.evaluate("target_mixed", VerificationTargetType.CRITERION, [auth, blocked], mission_scope, params)
+        assert finding.status != VerificationStatus.VERIFIED, (
+            f"Rule '{rule.rule_id}' falsely returned VERIFIED for mixed accessible/inaccessible collection!"
+        )
+        assert finding.status == VerificationStatus.BLOCKED, (
+            f"Rule '{rule.rule_id}' did not return BLOCKED for mixed collection!"
+        )
+        # Redaction check: blocked ID must NEVER appear
+        assert "ev_cross_tenant_99" not in finding.evidence_references
+        assert "ev_cross_tenant_99" not in [a.evidence_id for a in finding.evidence_assessments]
+        assert "ev_cross_tenant_99" not in finding.explanation
+        assert "ev_cross_tenant_99" not in str(finding.limitations)
+
+
+def test_prompt36d_all_rules_unresolved_non_disclosure():
+    """
+    Rule Coverage: Unresolved/inaccessible identifiers are not leaked in findings.
+    """
+    unresolved = EvidenceAssessment(
+        evidence_id="ev_unresolved_secret_01",
+        source_type="UNKNOWN",
+        observed_at=None,
+        received_at=None,
+        freshness_status=FreshnessStatus.UNKNOWN,
+        integrity_status="UNVERIFIED",
+        scope_status=ScopeStatus.UNKNOWN,
+        classification_status="UNKNOWN",
+        applicability_status="UNAVAILABLE",
+        quality_status=QualityStatus.UNKNOWN,
+    )
+    params = _build_test_params_for_rule(blocked_id="ev_unresolved_secret_01")
+    mission_scope = {"tenant_id": "tenant_alpha", "workspace_id": "workspace_prod", "plant_id": "plant_01"}
+
+    for rule in ALL_8_RULES:
+        finding = rule.evaluate("target_unres", VerificationTargetType.CRITERION, [unresolved], mission_scope, params)
+        assert finding.status != VerificationStatus.VERIFIED
+        assert "ev_unresolved_secret_01" not in finding.evidence_references
+        assert "ev_unresolved_secret_01" not in [a.evidence_id for a in finding.evidence_assessments]
+        assert "ev_unresolved_secret_01" not in finding.explanation
+        assert "ev_unresolved_secret_01" not in str(finding.limitations)
+
+
+def test_prompt36d_end_to_end_serialized_run_and_provenance_non_disclosure(
+    v_service, analyst_identity, sample_mission, e_repo
+):
+    """
+    Response and Persistence: Complete serialized finding, serialized run, and provenance
+    never disclose blocked evidence IDs, and subsequent retrieval retains the same boundary.
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with e_repo._lock, e_repo._get_connection() as conn:
+        # Seed authorized evidence ev_rec_01 for crit_01
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO evidence_explanations (
+                explanation_id, target_type, target_id, tenant_id, workspace_id, plant_id,
+                fingerprint, assessment_timestamp, algorithm_version, contract_version,
+                is_partial, summary, supporting_evidence_count, excluded_evidence_count,
+                payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "exp_p36d_auth", "CRITERION", "crit_01", "tenant_alpha", "workspace_prod", "plant_01",
+                "fp_p36d_auth", now_iso, "1.0", "1.0",
+                0, "test auth explanation", 1, 0, "{}", now_iso
+            )
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO evidence_records (
+                evidence_id, explanation_id, tenant_id, workspace_id, plant_id,
+                source_type, source_record_id, provenance, validation_status,
+                payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "ev_rec_01", "exp_p36d_auth", "tenant_alpha", "workspace_prod", "plant_01",
+                "TELEMETRY_LOG", "tel_001", "OBSERVED", "VALID",
+                json.dumps({"temp": 25.0, "classification": "INTERNAL"}), now_iso
+            )
+        )
+        # Seed cross-plant blocked evidence ev_rec_02 for crit_02 in plant_02
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO evidence_explanations (
+                explanation_id, target_type, target_id, tenant_id, workspace_id, plant_id,
+                fingerprint, assessment_timestamp, algorithm_version, contract_version,
+                is_partial, summary, supporting_evidence_count, excluded_evidence_count,
+                payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "exp_p36d_blocked", "CRITERION", "crit_02", "tenant_alpha", "workspace_prod", "plant_02",
+                "fp_p36d_blk", now_iso, "1.0", "1.0",
+                0, "test blocked explanation", 1, 0, "{}", now_iso
+            )
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO evidence_records (
+                evidence_id, explanation_id, tenant_id, workspace_id, plant_id,
+                source_type, source_record_id, provenance, validation_status,
+                payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "ev_rec_02", "exp_p36d_blocked", "tenant_alpha", "workspace_prod", "plant_02",
+                "POWER_METRIC", "tel_002", "OBSERVED", "VALID",
+                json.dumps({"power": 100.0, "classification": "INTERNAL"}), now_iso
+            )
+        )
+        conn.commit()
+
+    req = VerificationRequest()
+    run = v_service.request_verification(analyst_identity, sample_mission.mission_id, req)
+    assert run.status == VerificationStatus.BLOCKED
+
+    # 1. Serialized run provenance check
+    run_dict = run.model_dump()
+    assert "ev_rec_02" not in run_dict["provenance"]["evidence_ids"]
+    assert "ev_rec_01" in run_dict["provenance"]["evidence_ids"]
+
+    # 2. Serialized finding check for blocked target (crit_02)
+    blocked_finding = next(f for f in run_dict["findings"] if f["target_id"] == "crit_02")
+    assert blocked_finding["status"] == "BLOCKED"
+    assert "ev_rec_02" not in blocked_finding["evidence_references"]
+    assert "ev_rec_02" not in [a["evidence_id"] for a in blocked_finding["evidence_assessments"]]
+    assert "ev_rec_02" not in blocked_finding["explanation"]
+    assert "ev_rec_02" not in str(blocked_finding["limitations"])
+
+    # Authorized item (crit_01) is preserved
+    auth_finding = next(f for f in run_dict["findings"] if f["target_id"] == "crit_01")
+    assert "ev_rec_01" in auth_finding["evidence_references"]
+
+    # 3. Subsequent retrieval check
+    retrieved_run = v_service.repository.get_run(
+        sample_mission.scope.tenant_id,
+        sample_mission.scope.workspace_id,
+        sample_mission.mission_id,
+        run.verification_id,
+    )
+    assert retrieved_run is not None
+    retrieved_dict = retrieved_run.model_dump()
+    assert "ev_rec_02" not in retrieved_dict["provenance"]["evidence_ids"]
+    retrieved_blocked = next(f for f in retrieved_dict["findings"] if f["target_id"] == "crit_02")
+    assert "ev_rec_02" not in retrieved_blocked["evidence_references"]
+    assert "ev_rec_02" not in str(retrieved_blocked["limitations"])
+
+
+def test_prompt36d_rule_selection_diagnostic_caveat(v_service, analyst_identity, sample_mission, e_repo):
+    """
+    Rule Selection: Selecting EVIDENCE_EXISTS when authoritative requirement demands stronger validation
+    clearly identifies the rule, records diagnostic non-certification in summary and limitations,
+    and cannot be misrepresented as satisfying the stronger requirement.
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with e_repo._lock, e_repo._get_connection() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO evidence_explanations (
+                explanation_id, target_type, target_id, tenant_id, workspace_id, plant_id,
+                fingerprint, assessment_timestamp, algorithm_version, contract_version,
+                is_partial, summary, supporting_evidence_count, excluded_evidence_count,
+                payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "exp_p36d_diag", "CRITERION", "crit_01", "tenant_alpha", "workspace_prod", "plant_01",
+                "fp_p36d_diag", now_iso, "1.0", "1.0",
+                0, "test diag explanation", 1, 0, "{}", now_iso
+            )
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO evidence_records (
+                evidence_id, explanation_id, tenant_id, workspace_id, plant_id,
+                source_type, source_record_id, provenance, validation_status,
+                payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "ev_rec_01", "exp_p36d_diag", "tenant_alpha", "workspace_prod", "plant_01",
+                "TELEMETRY_LOG", "tel_001", "OBSERVED", "VALID",
+                json.dumps({"temp": 25.0, "classification": "INTERNAL"}), now_iso
+            )
+        )
+        conn.commit()
+
+    req = VerificationRequest(
+        target_type=VerificationTargetType.CRITERION,
+        target_id="crit_01",
+        rule_type=RuleType.EVIDENCE_EXISTS,
+    )
+    run = v_service.request_verification(analyst_identity, sample_mission.mission_id, req)
+    assert run.status == VerificationStatus.VERIFIED
+    finding = run.findings[0]
+
+    # Clearly identifies the evaluated rule
+    assert finding.rule_id == "RULE_EVIDENCE_EXISTS_V1"
+
+    # Run summary explicitly records diagnostic non-certification notice
+    assert "DIAGNOSTIC ONLY" in run.summary
+    assert "does not certify" in run.summary
+
+    # Provenance limitations record diagnostic notice
+    assert any("DIAGNOSTIC" in lim.upper() for lim in run.provenance.limitations)
+
+    # Mission status remains ACCEPTED, not EXECUTED or COMPLETED
+    saved_m = v_service.mission_service.get_mission(analyst_identity, sample_mission.mission_id)
+    assert saved_m.status == MissionStatus.ACCEPTED
