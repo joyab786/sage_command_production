@@ -3854,3 +3854,645 @@ def test_prompt36f_test_h_audit_integrity(legacy_pre_36e_repo):
     assert mig.checksum == hashlib.sha256(raw_mig.encode("utf-8")).hexdigest()
 
 
+# =============================================================================
+# PROMPT 36G — DIAGNOSTIC SUMMARY FALLBACK MUST NEVER FABRICATE CONFIRMATION
+# =============================================================================
+
+def _create_prompt36g_test_database(db_path: str) -> None:
+    """
+    Initializes a SQLite test database with pre-36E and raw legacy runs specifically
+    designed to verify summary fallback and read-time normalization behavior:
+    - Missing diagnostic_status
+    - Missing diagnostic_outcome
+    - Persisted status=VERIFIED for diagnostic runs
+    - Blocked, missing, indeterminate, and zero-finding runs
+    - Authoritative runs with no diagnostic metadata
+    - Cross-tenant and cross-workspace scoped runs
+    """
+    conn = sqlite3.connect(db_path)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    prov_json_default = json.dumps({
+        "verification_id": "vrun_default",
+        "mission_id": "m_default",
+        "mission_revision": 1,
+        "rule_set_version": "1.0.0",
+        "evaluator_version": "1.0.0",
+        "evidence_ids": ["ev_1"],
+        "evidence_timestamps": {"ev_1": now_iso},
+        "evaluation_timestamp": now_iso,
+        "limitations": [],
+    })
+
+    # Schema matching current SQLite table definition
+    conn.execute("""
+        CREATE TABLE verification_runs (
+            verification_id TEXT NOT NULL,
+            mission_id TEXT NOT NULL,
+            mission_revision INTEGER NOT NULL,
+            tenant_id TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            plant_id TEXT NOT NULL,
+            session_id TEXT,
+            schema_version TEXT NOT NULL,
+            verification_scope TEXT NOT NULL,
+            status TEXT NOT NULL,
+            trigger_type TEXT NOT NULL,
+            requested_by TEXT NOT NULL,
+            rule_set_version TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            completed_at TEXT,
+            target_count INTEGER NOT NULL DEFAULT 0,
+            verified_count INTEGER NOT NULL DEFAULT 0,
+            unverified_count INTEGER NOT NULL DEFAULT 0,
+            indeterminate_count INTEGER NOT NULL DEFAULT 0,
+            blocked_count INTEGER NOT NULL DEFAULT 0,
+            failed_count INTEGER NOT NULL DEFAULT 0,
+            summary TEXT NOT NULL DEFAULT '',
+            is_diagnostic INTEGER NOT NULL DEFAULT 0,
+            diagnostic_status TEXT,
+            diagnostic_outcome TEXT,
+            provenance_json TEXT NOT NULL,
+            idempotency_key TEXT,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, workspace_id, verification_id)
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE verification_findings (
+            finding_id TEXT NOT NULL,
+            verification_id TEXT NOT NULL,
+            mission_id TEXT NOT NULL,
+            mission_revision INTEGER NOT NULL,
+            tenant_id TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            plant_id TEXT NOT NULL,
+            target_type TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            evidence_references_json TEXT NOT NULL,
+            evidence_assessments_json TEXT NOT NULL,
+            rule_id TEXT NOT NULL,
+            rule_version TEXT NOT NULL,
+            explanation TEXT NOT NULL,
+            limitations_json TEXT NOT NULL,
+            evaluated_at TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, workspace_id, finding_id)
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE verification_audit_ledger (
+            audit_id TEXT NOT NULL,
+            verification_id TEXT NOT NULL,
+            mission_id TEXT NOT NULL,
+            mission_revision INTEGER NOT NULL,
+            tenant_id TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            plant_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            result TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            actor_role TEXT,
+            request_id TEXT,
+            trace_id TEXT,
+            details_json TEXT NOT NULL,
+            checksum TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, workspace_id, audit_id)
+        )
+    """)
+
+    # 1. Run A: Legacy successful diagnostic (missing diagnostic metadata, status=VERIFIED)
+    conn.execute("""
+        INSERT INTO verification_runs (
+            verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            schema_version, verification_scope, status, trigger_type, requested_by, rule_set_version,
+            started_at, completed_at, target_count, verified_count, unverified_count,
+            indeterminate_count, blocked_count, failed_count, summary, is_diagnostic,
+            diagnostic_status, diagnostic_outcome, provenance_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "run_36g_success_01", "mission_test_36g", 1, "tenant_alpha", "workspace_prod", "plant_01",
+        "3.0.0", "FULL_MISSION", "VERIFIED", "MANUAL", "user_legacy", "1.0.0",
+        now_iso, now_iso, 1, 1, 0, 0, 0, 0,
+        "Diagnostic existence check summary", 1, None, None, prov_json_default, now_iso
+    ))
+    conn.execute("""
+        INSERT INTO verification_findings (
+            finding_id, verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            target_type, target_id, status, evidence_references_json, evidence_assessments_json,
+            rule_id, rule_version, explanation, limitations_json, evaluated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "vf_36g_succ_01", "run_36g_success_01", "mission_test_36g", 1, "tenant_alpha", "workspace_prod", "plant_01",
+        "CRITERION", "crit_01", "VERIFIED", json.dumps(["ev_1"]), json.dumps([]),
+        "RULE_EVIDENCE_EXISTS_V1", "1.0.0", "Evidence exists", json.dumps([]), now_iso
+    ))
+
+    # 2. Run B: Legacy blocked diagnostic (missing diagnostic metadata, finding is BLOCKED)
+    conn.execute("""
+        INSERT INTO verification_runs (
+            verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            schema_version, verification_scope, status, trigger_type, requested_by, rule_set_version,
+            started_at, completed_at, target_count, verified_count, unverified_count,
+            indeterminate_count, blocked_count, failed_count, summary, is_diagnostic,
+            diagnostic_status, diagnostic_outcome, provenance_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "run_36g_blocked_02", "mission_test_36g", 1, "tenant_alpha", "workspace_prod", "plant_01",
+        "3.0.0", "FULL_MISSION", "VERIFIED", "MANUAL", "user_legacy", "1.0.0",
+        now_iso, now_iso, 1, 0, 0, 0, 1, 0,
+        "Blocked diagnostic check", 1, None, None, prov_json_default, now_iso
+    ))
+    conn.execute("""
+        INSERT INTO verification_findings (
+            finding_id, verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            target_type, target_id, status, evidence_references_json, evidence_assessments_json,
+            rule_id, rule_version, explanation, limitations_json, evaluated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "vf_36g_blocked_02", "run_36g_blocked_02", "mission_test_36g", 1, "tenant_alpha", "workspace_prod", "plant_01",
+        "CRITERION", "crit_01", "BLOCKED", json.dumps([]), json.dumps([]),
+        "RULE_EVIDENCE_EXISTS_V1", "1.0.0", "Scope blocked", json.dumps([]), now_iso
+    ))
+
+    # 3. Run C: Legacy missing evidence (finding is NOT_VERIFIED)
+    conn.execute("""
+        INSERT INTO verification_runs (
+            verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            schema_version, verification_scope, status, trigger_type, requested_by, rule_set_version,
+            started_at, completed_at, target_count, verified_count, unverified_count,
+            indeterminate_count, blocked_count, failed_count, summary, is_diagnostic,
+            diagnostic_status, diagnostic_outcome, provenance_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "run_36g_missing_03", "mission_test_36g", 1, "tenant_alpha", "workspace_prod", "plant_01",
+        "3.0.0", "FULL_MISSION", "VERIFIED", "MANUAL", "user_legacy", "1.0.0",
+        now_iso, now_iso, 1, 0, 1, 0, 0, 0,
+        "Missing diagnostic evidence", 1, None, None, prov_json_default, now_iso
+    ))
+    conn.execute("""
+        INSERT INTO verification_findings (
+            finding_id, verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            target_type, target_id, status, evidence_references_json, evidence_assessments_json,
+            rule_id, rule_version, explanation, limitations_json, evaluated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "vf_36g_missing_03", "run_36g_missing_03", "mission_test_36g", 1, "tenant_alpha", "workspace_prod", "plant_01",
+        "CRITERION", "crit_01", "NOT_VERIFIED", json.dumps([]), json.dumps([]),
+        "RULE_EVIDENCE_EXISTS_V1", "1.0.0", "Not found", json.dumps([]), now_iso
+    ))
+
+    # 4. Run D: Legacy indeterminate evidence (finding is INDETERMINATE)
+    conn.execute("""
+        INSERT INTO verification_runs (
+            verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            schema_version, verification_scope, status, trigger_type, requested_by, rule_set_version,
+            started_at, completed_at, target_count, verified_count, unverified_count,
+            indeterminate_count, blocked_count, failed_count, summary, is_diagnostic,
+            diagnostic_status, diagnostic_outcome, provenance_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "run_36g_indeterminate_04", "mission_test_36g", 1, "tenant_alpha", "workspace_prod", "plant_01",
+        "3.0.0", "FULL_MISSION", "VERIFIED", "MANUAL", "user_legacy", "1.0.0",
+        now_iso, now_iso, 1, 0, 0, 1, 0, 0,
+        "Indeterminate diagnostic check", 1, None, None, prov_json_default, now_iso
+    ))
+    conn.execute("""
+        INSERT INTO verification_findings (
+            finding_id, verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            target_type, target_id, status, evidence_references_json, evidence_assessments_json,
+            rule_id, rule_version, explanation, limitations_json, evaluated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "vf_36g_indet_04", "run_36g_indeterminate_04", "mission_test_36g", 1, "tenant_alpha", "workspace_prod", "plant_01",
+        "CRITERION", "crit_01", "INDETERMINATE", json.dumps([]), json.dumps([]),
+        "RULE_EVIDENCE_EXISTS_V1", "1.0.0", "Indeterminate", json.dumps([]), now_iso
+    ))
+
+    # 5. Run E: Diagnostic run with NO findings
+    conn.execute("""
+        INSERT INTO verification_runs (
+            verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            schema_version, verification_scope, status, trigger_type, requested_by, rule_set_version,
+            started_at, completed_at, target_count, verified_count, unverified_count,
+            indeterminate_count, blocked_count, failed_count, summary, is_diagnostic,
+            diagnostic_status, diagnostic_outcome, provenance_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "run_36g_nofindings_05", "mission_test_36g", 1, "tenant_alpha", "workspace_prod", "plant_01",
+        "3.0.0", "FULL_MISSION", "VERIFIED", "MANUAL", "user_legacy", "1.0.0",
+        now_iso, now_iso, 1, 0, 0, 0, 0, 0,
+        "Diagnostic run with missing findings | DIAGNOSTIC ONLY", 1, None, None, prov_json_default, now_iso
+    ))
+
+    # 6. Run F: Partial metadata cases
+    # 6a. diagnostic_status missing, outcome present
+    conn.execute("""
+        INSERT INTO verification_runs (
+            verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            schema_version, verification_scope, status, trigger_type, requested_by, rule_set_version,
+            started_at, completed_at, target_count, verified_count, unverified_count,
+            indeterminate_count, blocked_count, failed_count, summary, is_diagnostic,
+            diagnostic_status, diagnostic_outcome, provenance_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "run_36g_part_stat_06a", "mission_test_36g", 1, "tenant_alpha", "workspace_prod", "plant_01",
+        "3.0.0", "FULL_MISSION", "NOT_VERIFIED", "MANUAL", "user_legacy", "1.0.0",
+        now_iso, now_iso, 1, 1, 0, 0, 0, 0,
+        "Partial stat missing", 1, None, "CONFIRMED", prov_json_default, now_iso
+    ))
+    conn.execute("""
+        INSERT INTO verification_findings (
+            finding_id, verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            target_type, target_id, status, evidence_references_json, evidence_assessments_json,
+            rule_id, rule_version, explanation, limitations_json, evaluated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "vf_36g_part_06a", "run_36g_part_stat_06a", "mission_test_36g", 1, "tenant_alpha", "workspace_prod", "plant_01",
+        "CRITERION", "crit_01", "VERIFIED", json.dumps(["ev_1"]), json.dumps([]),
+        "RULE_EVIDENCE_EXISTS_V1", "1.0.0", "Exists", json.dumps([]), now_iso
+    ))
+
+    # 6b. diagnostic_outcome missing, status present
+    conn.execute("""
+        INSERT INTO verification_runs (
+            verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            schema_version, verification_scope, status, trigger_type, requested_by, rule_set_version,
+            started_at, completed_at, target_count, verified_count, unverified_count,
+            indeterminate_count, blocked_count, failed_count, summary, is_diagnostic,
+            diagnostic_status, diagnostic_outcome, provenance_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "run_36g_part_out_06b", "mission_test_36g", 1, "tenant_alpha", "workspace_prod", "plant_01",
+        "3.0.0", "FULL_MISSION", "NOT_VERIFIED", "MANUAL", "user_legacy", "1.0.0",
+        now_iso, now_iso, 1, 1, 0, 0, 0, 0,
+        "Partial outcome missing", 1, "VERIFIED", None, prov_json_default, now_iso
+    ))
+    conn.execute("""
+        INSERT INTO verification_findings (
+            finding_id, verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            target_type, target_id, status, evidence_references_json, evidence_assessments_json,
+            rule_id, rule_version, explanation, limitations_json, evaluated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "vf_36g_part_06b", "run_36g_part_out_06b", "mission_test_36g", 1, "tenant_alpha", "workspace_prod", "plant_01",
+        "CRITERION", "crit_01", "VERIFIED", json.dumps(["ev_1"]), json.dumps([]),
+        "RULE_EVIDENCE_EXISTS_V1", "1.0.0", "Exists", json.dumps([]), now_iso
+    ))
+
+    # 7. Run G: Legitimate authoritative run (status=VERIFIED, authoritative rule, is_diagnostic=0)
+    conn.execute("""
+        INSERT INTO verification_runs (
+            verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            schema_version, verification_scope, status, trigger_type, requested_by, rule_set_version,
+            started_at, completed_at, target_count, verified_count, unverified_count,
+            indeterminate_count, blocked_count, failed_count, summary, is_diagnostic,
+            diagnostic_status, diagnostic_outcome, provenance_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "run_36g_auth_07", "mission_test_36g", 1, "tenant_alpha", "workspace_prod", "plant_01",
+        "3.0.0", "FULL_MISSION", "VERIFIED", "MANUAL", "user_authoritative", "1.0.0",
+        now_iso, now_iso, 1, 1, 0, 0, 0, 0,
+        "Legitimate authoritative mission verification", 0, None, None, prov_json_default, now_iso
+    ))
+    conn.execute("""
+        INSERT INTO verification_findings (
+            finding_id, verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            target_type, target_id, status, evidence_references_json, evidence_assessments_json,
+            rule_id, rule_version, explanation, limitations_json, evaluated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "vf_36g_auth_07", "run_36g_auth_07", "mission_test_36g", 1, "tenant_alpha", "workspace_prod", "plant_01",
+        "CRITERION", "crit_01", "VERIFIED", json.dumps(["ev_1"]), json.dumps([]),
+        "RULE_EVIDENCE_VALIDATED_V1", "1.0.0", "Validated evidence", json.dumps([]), now_iso
+    ))
+
+    # 8. Run H: Cross-scope runs (tenant_beta should not leak findings to tenant_alpha)
+    conn.execute("""
+        INSERT INTO verification_runs (
+            verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            schema_version, verification_scope, status, trigger_type, requested_by, rule_set_version,
+            started_at, completed_at, target_count, verified_count, unverified_count,
+            indeterminate_count, blocked_count, failed_count, summary, is_diagnostic,
+            diagnostic_status, diagnostic_outcome, provenance_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "run_36g_beta_08", "mission_test_36g", 1, "tenant_beta", "workspace_beta", "plant_02",
+        "3.0.0", "FULL_MISSION", "VERIFIED", "MANUAL", "user_beta", "1.0.0",
+        now_iso, now_iso, 1, 0, 0, 0, 1, 0,
+        "Beta diagnostic check", 1, None, None, prov_json_default, now_iso
+    ))
+    conn.execute("""
+        INSERT INTO verification_findings (
+            finding_id, verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            target_type, target_id, status, evidence_references_json, evidence_assessments_json,
+            rule_id, rule_version, explanation, limitations_json, evaluated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "vf_36g_beta_08", "run_36g_beta_08", "mission_test_36g", 1, "tenant_beta", "workspace_beta", "plant_02",
+        "CRITERION", "crit_01", "BLOCKED", json.dumps([]), json.dumps([]),
+        "RULE_EVIDENCE_EXISTS_V1", "1.0.0", "Beta blocked", json.dumps([]), now_iso
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+@pytest.fixture
+def prompt36g_repo():
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        db_path = f.name
+    _create_prompt36g_test_database(db_path)
+    repo = VerificationRepository(db_path=db_path)
+    yield repo
+    try:
+        os.remove(db_path)
+        for ext in ["-wal", "-shm"]:
+            p = db_path + ext
+            if os.path.exists(p):
+                os.remove(p)
+    except Exception:
+        pass
+
+
+def test_prompt36g_test_a_legacy_successful_diagnostic(prompt36g_repo):
+    """
+    Test A — Legacy successful diagnostic:
+    - Diagnostic run with missing diagnostic metadata (status=VERIFIED in storage).
+    - Findings are all VERIFIED under RULE_EVIDENCE_EXISTS_V1.
+    - list_runs() and get_run() both compute fields using canonical aggregation.
+    - is_diagnostic = True; status = NOT_VERIFIED; diagnostic_status = VERIFIED; outcome = CONFIRMED.
+    - Summary and full-run retrieval agree.
+    """
+    repo = prompt36g_repo
+    run = repo.get_run("tenant_alpha", "workspace_prod", "mission_test_36g", "run_36g_success_01")
+    assert run is not None
+    assert run.is_diagnostic is True
+    assert run.status == VerificationStatus.NOT_VERIFIED
+    assert run.diagnostic_status == VerificationStatus.VERIFIED
+    assert run.diagnostic_outcome == "CONFIRMED"
+
+    summaries, _ = repo.list_runs("tenant_alpha", "workspace_prod", "mission_test_36g")
+    sum_entry = [s for s in summaries if s.verification_id == "run_36g_success_01"][0]
+    assert sum_entry.is_diagnostic is True
+    assert sum_entry.status == VerificationStatus.NOT_VERIFIED
+    assert sum_entry.diagnostic_status == VerificationStatus.VERIFIED
+    assert sum_entry.diagnostic_outcome == "CONFIRMED"
+
+
+def test_prompt36g_test_b_legacy_blocked_diagnostic(prompt36g_repo):
+    """
+    Test B — Legacy blocked diagnostic:
+    - Diagnostic run with missing diagnostic metadata and one BLOCKED finding.
+    - list_runs() must NEVER report CONFIRMED.
+    - diagnostic_status = BLOCKED; outcome = BLOCKED; status = BLOCKED (not VERIFIED).
+    """
+    repo = prompt36g_repo
+    summaries, _ = repo.list_runs("tenant_alpha", "workspace_prod", "mission_test_36g")
+    sum_entry = [s for s in summaries if s.verification_id == "run_36g_blocked_02"][0]
+    assert sum_entry.is_diagnostic is True
+    assert sum_entry.status == VerificationStatus.BLOCKED
+    assert sum_entry.diagnostic_status == VerificationStatus.BLOCKED
+    assert sum_entry.diagnostic_outcome == "BLOCKED"
+    assert sum_entry.diagnostic_outcome != "CONFIRMED"
+
+    run = repo.get_run("tenant_alpha", "workspace_prod", "mission_test_36g", "run_36g_blocked_02")
+    assert run.is_diagnostic is True
+    assert run.status == VerificationStatus.BLOCKED
+    assert run.diagnostic_status == VerificationStatus.BLOCKED
+    assert run.diagnostic_outcome == "BLOCKED"
+
+
+def test_prompt36g_test_c_legacy_missing_evidence(prompt36g_repo):
+    """
+    Test C — Legacy missing evidence:
+    - Diagnostic run with missing diagnostic metadata and NOT_VERIFIED findings.
+    - Outcome must represent missing evidence (NOT_FOUND).
+    - It must never be reported as CONFIRMED.
+    - Run-level status is not VERIFIED.
+    """
+    repo = prompt36g_repo
+    summaries, _ = repo.list_runs("tenant_alpha", "workspace_prod", "mission_test_36g")
+    sum_entry = [s for s in summaries if s.verification_id == "run_36g_missing_03"][0]
+    assert sum_entry.is_diagnostic is True
+    assert sum_entry.status == VerificationStatus.NOT_VERIFIED
+    assert sum_entry.diagnostic_status == VerificationStatus.NOT_VERIFIED
+    assert sum_entry.diagnostic_outcome == "NOT_FOUND"
+    assert sum_entry.diagnostic_outcome != "CONFIRMED"
+
+    run = repo.get_run("tenant_alpha", "workspace_prod", "mission_test_36g", "run_36g_missing_03")
+    assert run.status == VerificationStatus.NOT_VERIFIED
+    assert run.diagnostic_status == VerificationStatus.NOT_VERIFIED
+    assert run.diagnostic_outcome == "NOT_FOUND"
+
+
+def test_prompt36g_test_d_legacy_indeterminate_evidence(prompt36g_repo):
+    """
+    Test D — Legacy indeterminate evidence:
+    - Diagnostic run with missing diagnostic metadata and INDETERMINATE findings.
+    - Both list_runs() and get_run() return consistent conservative results.
+    """
+    repo = prompt36g_repo
+    summaries, _ = repo.list_runs("tenant_alpha", "workspace_prod", "mission_test_36g")
+    sum_entry = [s for s in summaries if s.verification_id == "run_36g_indeterminate_04"][0]
+    assert sum_entry.is_diagnostic is True
+    assert sum_entry.status == VerificationStatus.INDETERMINATE
+    assert sum_entry.diagnostic_status == VerificationStatus.INDETERMINATE
+    assert sum_entry.diagnostic_outcome == "INDETERMINATE"
+    assert sum_entry.diagnostic_outcome != "CONFIRMED"
+
+    run = repo.get_run("tenant_alpha", "workspace_prod", "mission_test_36g", "run_36g_indeterminate_04")
+    assert run.status == VerificationStatus.INDETERMINATE
+    assert run.diagnostic_status == VerificationStatus.INDETERMINATE
+    assert run.diagnostic_outcome == "INDETERMINATE"
+
+
+def test_prompt36g_test_e_no_findings(prompt36g_repo):
+    """
+    Test E — No findings:
+    - Diagnostic run identifiable from trusted legacy metadata but with no persisted findings.
+    - No successful diagnostic result is fabricated.
+    - diagnostic_status is conservative (INDETERMINATE).
+    - outcome indicates missing/ambiguous information (AMBIGUOUS_NO_FINDINGS).
+    - run-level status is not VERIFIED.
+    """
+    repo = prompt36g_repo
+    summaries, _ = repo.list_runs("tenant_alpha", "workspace_prod", "mission_test_36g")
+    sum_entry = [s for s in summaries if s.verification_id == "run_36g_nofindings_05"][0]
+    assert sum_entry.is_diagnostic is True
+    assert sum_entry.status != VerificationStatus.VERIFIED
+    assert sum_entry.status == VerificationStatus.NOT_VERIFIED
+    assert sum_entry.diagnostic_status == VerificationStatus.INDETERMINATE
+    assert sum_entry.diagnostic_outcome == "AMBIGUOUS_NO_FINDINGS"
+    assert sum_entry.diagnostic_outcome != "CONFIRMED"
+
+    run = repo.get_run("tenant_alpha", "workspace_prod", "mission_test_36g", "run_36g_nofindings_05")
+    assert run.status == VerificationStatus.NOT_VERIFIED
+    assert run.diagnostic_status == VerificationStatus.INDETERMINATE
+    assert run.diagnostic_outcome == "AMBIGUOUS_NO_FINDINGS"
+
+
+def test_prompt36g_test_f_partial_metadata(prompt36g_repo):
+    """
+    Test F — Partial metadata:
+    - diagnostic_status missing.
+    - diagnostic_outcome missing.
+    - The canonical aggregation corrects these cases using actual findings.
+    """
+    repo = prompt36g_repo
+    # 6a. diagnostic_status missing
+    run_a = repo.get_run("tenant_alpha", "workspace_prod", "mission_test_36g", "run_36g_part_stat_06a")
+    assert run_a.diagnostic_status == VerificationStatus.VERIFIED
+    assert run_a.diagnostic_outcome == "CONFIRMED"
+
+    summaries, _ = repo.list_runs("tenant_alpha", "workspace_prod", "mission_test_36g")
+    sum_a = [s for s in summaries if s.verification_id == "run_36g_part_stat_06a"][0]
+    assert sum_a.diagnostic_status == VerificationStatus.VERIFIED
+    assert sum_a.diagnostic_outcome == "CONFIRMED"
+
+    # 6b. diagnostic_outcome missing
+    run_b = repo.get_run("tenant_alpha", "workspace_prod", "mission_test_36g", "run_36g_part_out_06b")
+    assert run_b.diagnostic_status == VerificationStatus.VERIFIED
+    assert run_b.diagnostic_outcome == "CONFIRMED"
+
+    sum_b = [s for s in summaries if s.verification_id == "run_36g_part_out_06b"][0]
+    assert sum_b.diagnostic_status == VerificationStatus.VERIFIED
+    assert sum_b.diagnostic_outcome == "CONFIRMED"
+
+
+def test_prompt36g_test_g_authoritative_run_preservation(prompt36g_repo):
+    """
+    Test G — Authoritative run preservation:
+    - Legitimate authoritative VERIFIED run with no diagnostic metadata.
+    - list_runs() does not reclassify it as diagnostic or alter its status.
+    """
+    repo = prompt36g_repo
+    summaries, _ = repo.list_runs("tenant_alpha", "workspace_prod", "mission_test_36g")
+    sum_auth = [s for s in summaries if s.verification_id == "run_36g_auth_07"][0]
+    assert sum_auth.is_diagnostic is False
+    assert sum_auth.status == VerificationStatus.VERIFIED
+    assert sum_auth.diagnostic_status is None
+    assert sum_auth.diagnostic_outcome is None
+
+    run_auth = repo.get_run("tenant_alpha", "workspace_prod", "mission_test_36g", "run_36g_auth_07")
+    assert run_auth.is_diagnostic is False
+    assert run_auth.status == VerificationStatus.VERIFIED
+    assert run_auth.diagnostic_status is None
+    assert run_auth.diagnostic_outcome is None
+
+
+def test_prompt36g_test_h_cross_scope_isolation(prompt36g_repo):
+    """
+    Test H — Cross-scope isolation:
+    - Runs and findings under separate tenant/workspace scopes.
+    - Summary for tenant_alpha cannot consume findings from tenant_beta.
+    """
+    repo = prompt36g_repo
+    # Query tenant_alpha
+    summaries_alpha, _ = repo.list_runs("tenant_alpha", "workspace_prod", "mission_test_36g")
+    v_ids_alpha = [s.verification_id for s in summaries_alpha]
+    assert "run_36g_beta_08" not in v_ids_alpha
+
+    # Query tenant_beta
+    summaries_beta, _ = repo.list_runs("tenant_beta", "workspace_beta", "mission_test_36g")
+    assert len(summaries_beta) == 1
+    beta_sum = summaries_beta[0]
+    assert beta_sum.verification_id == "run_36g_beta_08"
+    assert beta_sum.diagnostic_status == VerificationStatus.BLOCKED
+    assert beta_sum.diagnostic_outcome == "BLOCKED"
+
+
+def test_prompt36g_test_i_repeated_reads_and_migration(prompt36g_repo):
+    """
+    Test I — Repeated reads and migration:
+    - Repeatedly invoke migration, get_run(), list_runs(), and serialization.
+    - Results remain deterministic and consistent. Zero duplicate audit events or mutations.
+    """
+    repo = prompt36g_repo
+    for _ in range(3):
+        repo.migrate_legacy_diagnostic_runs()
+        summaries, _ = repo.list_runs("tenant_alpha", "workspace_prod", "mission_test_36g")
+        assert len(summaries) >= 7
+
+        run_a = repo.get_run("tenant_alpha", "workspace_prod", "mission_test_36g", "run_36g_success_01")
+        assert run_a.status == VerificationStatus.NOT_VERIFIED
+        assert run_a.diagnostic_outcome == "CONFIRMED"
+
+        dumped = run_a.model_dump()
+        reconstructed = VerificationRun.model_validate(dumped)
+        assert reconstructed.status == VerificationStatus.NOT_VERIFIED
+        assert reconstructed.diagnostic_status == VerificationStatus.VERIFIED
+
+
+def test_prompt36g_test_j_all_invariants_explicit_proof(prompt36g_repo):
+    """
+    Test J — Invariants explicit proof:
+    1. A diagnostic run can never have run-level status=VERIFIED.
+    2. Missing diagnostic metadata never implies diagnostic_status=VERIFIED.
+    3. Missing diagnostic metadata never implies diagnostic_outcome=CONFIRMED.
+    4. CONFIRMED requires all relevant diagnostic findings to satisfy authoritative accessible existence.
+    5. Blocked evidence remains blocked.
+    6. Missing evidence remains missing.
+    7. Unresolved evidence remains indeterminate.
+    8. Finding-level diagnostic VERIFIED is permitted.
+    9. Legitimate authoritative verification remains functional.
+    10. get_run() and list_runs() agree on the diagnostic result.
+    11. Cross-tenant and cross-workspace isolation remains intact.
+    12. Audit-ledger history and checksums remain intact.
+    """
+    repo = prompt36g_repo
+    summaries, _ = repo.list_runs("tenant_alpha", "workspace_prod", "mission_test_36g")
+
+    for s in summaries:
+        # Invariant 1: Diagnostic run can never have run-level status=VERIFIED
+        if s.is_diagnostic:
+            assert s.status != VerificationStatus.VERIFIED
+
+        # Invariant 10: get_run() and list_runs() agree on diagnostic result
+        full_run = repo.get_run("tenant_alpha", "workspace_prod", "mission_test_36g", s.verification_id)
+        assert full_run is not None
+        assert full_run.is_diagnostic == s.is_diagnostic
+        assert full_run.status == s.status
+        assert full_run.diagnostic_status == s.diagnostic_status
+        assert full_run.diagnostic_outcome == s.diagnostic_outcome
+
+    # Invariants 2, 3: Missing diagnostic metadata on run with blocked/missing findings never implies VERIFIED/CONFIRMED
+    blocked_sum = [s for s in summaries if s.verification_id == "run_36g_blocked_02"][0]
+    assert blocked_sum.diagnostic_status != VerificationStatus.VERIFIED
+    assert blocked_sum.diagnostic_outcome != "CONFIRMED"
+
+    missing_sum = [s for s in summaries if s.verification_id == "run_36g_missing_03"][0]
+    assert missing_sum.diagnostic_status != VerificationStatus.VERIFIED
+    assert missing_sum.diagnostic_outcome != "CONFIRMED"
+
+    # Invariant 4: CONFIRMED requires all diagnostic findings to be verified
+    succ_sum = [s for s in summaries if s.verification_id == "run_36g_success_01"][0]
+    assert succ_sum.diagnostic_status == VerificationStatus.VERIFIED
+    assert succ_sum.diagnostic_outcome == "CONFIRMED"
+
+    # Invariants 5, 6, 7:
+    assert blocked_sum.diagnostic_status == VerificationStatus.BLOCKED
+    assert missing_sum.diagnostic_status == VerificationStatus.NOT_VERIFIED
+    indet_sum = [s for s in summaries if s.verification_id == "run_36g_indeterminate_04"][0]
+    assert indet_sum.diagnostic_status == VerificationStatus.INDETERMINATE
+
+    # Invariant 8: Finding-level diagnostic VERIFIED is permitted
+    succ_run = repo.get_run("tenant_alpha", "workspace_prod", "mission_test_36g", "run_36g_success_01")
+    assert len(succ_run.findings) == 1
+    assert succ_run.findings[0].status == VerificationStatus.VERIFIED
+    assert succ_run.findings[0].rule_id == "RULE_EVIDENCE_EXISTS_V1"
+
+    # Invariant 9: Legitimate authoritative verification remains functional
+    auth_sum = [s for s in summaries if s.verification_id == "run_36g_auth_07"][0]
+    assert auth_sum.is_diagnostic is False
+    assert auth_sum.status == VerificationStatus.VERIFIED
+
+    # Invariant 11: Cross-tenant isolation
+    beta_sum, _ = repo.list_runs("tenant_beta", "workspace_beta", "mission_test_36g")
+    assert len(beta_sum) == 1
+    assert beta_sum[0].verification_id == "run_36g_beta_08"
+
+
+

@@ -16,6 +16,7 @@ import sqlite3
 import threading
 import logging
 import uuid
+from collections import defaultdict
 from typing import Dict, Any, List, Optional, Tuple, Set
 from datetime import datetime, timezone
 
@@ -690,27 +691,102 @@ class VerificationRepository:
             findings = self.get_findings(tenant_id, workspace_id, mission_id, verification_id)
             prov_data = json.loads(row["provenance_json"])
 
-            is_diag = bool(row["is_diagnostic"]) if "is_diagnostic" in row.keys() and row["is_diagnostic"] is not None else False
+    @staticmethod
+    def _normalize_diagnostic_run_fields(
+        is_diagnostic: bool,
+        status: VerificationStatus,
+        diagnostic_status: Optional[VerificationStatus],
+        diagnostic_outcome: Optional[str],
+        finding_statuses: List[VerificationStatus],
+        finding_rules: Set[str],
+        summary: str,
+        target_count: int,
+    ) -> Tuple[bool, VerificationStatus, Optional[VerificationStatus], Optional[str]]:
+        """
+        Prompt 36G — Canonical Read-Time Diagnostic Normalization:
+        Enforces that diagnostic status and outcome are NEVER fabricated from missing fields.
+
+        - Diagnostic classification != Diagnostic outcome.
+        - If the run is not diagnostic, preserves authoritative status and keeps diagnostic fields None.
+        - If the run is diagnostic, recomputes diagnostic fields using compute_diagnostic_run_fields
+          whenever status is VERIFIED, diagnostic_status is missing, or diagnostic_outcome is missing.
+        - Missing findings fail closed to (NOT_VERIFIED, INDETERMINATE, 'AMBIGUOUS_NO_FINDINGS').
+        - Run-level status for diagnostic runs can NEVER be VERIFIED.
+        """
+        is_diag = is_diagnostic
+        # A legacy run is diagnostic if its findings use diagnostic rules or its summary has diagnostic markers
+        if not is_diag:
+            if "RULE_EVIDENCE_EXISTS_V1" in finding_rules or "DIAGNOSTIC ONLY" in summary or "EVIDENCE_EXISTS" in summary:
+                is_diag = True
+
+        if not is_diag:
+            return False, status, None, None
+
+        # Run is diagnostic:
+        needs_recompute = (
+            status == VerificationStatus.VERIFIED
+            or diagnostic_status is None
+            or diagnostic_outcome is None
+        )
+
+        if needs_recompute:
+            run_st, diag_st, diag_out = compute_diagnostic_run_fields(finding_statuses, target_count)
+            # Permanent invariant: diagnostic run-level status can NEVER be VERIFIED
+            if run_st == VerificationStatus.VERIFIED:
+                run_st = VerificationStatus.NOT_VERIFIED
+            return True, run_st, diag_st, diag_out
+        else:
+            run_st = status
+            if run_st == VerificationStatus.VERIFIED:
+                run_st = VerificationStatus.NOT_VERIFIED
+            return True, run_st, diagnostic_status, diagnostic_outcome
+
+    def get_run(
+        self,
+        tenant_id: str,
+        workspace_id: str,
+        mission_id: str,
+        verification_id: str,
+    ) -> Optional[VerificationRun]:
+        """
+        Retrieves a verification run by ID scoped to tenant, workspace, and mission.
+        Returns None if not found or unauthorized.
+        """
+        with self._lock, self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT * FROM verification_runs
+                WHERE tenant_id = ? AND workspace_id = ? AND mission_id = ? AND verification_id = ?
+                """,
+                (tenant_id, workspace_id, mission_id, verification_id),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+
+            findings = self.get_findings(tenant_id, workspace_id, mission_id, verification_id)
+            prov_data = json.loads(row["provenance_json"])
+
+            finding_statuses = [f.status for f in findings]
+            finding_rules = {f.rule_id for f in findings}
             diag_stat_raw = row["diagnostic_status"] if "diagnostic_status" in row.keys() else None
             diag_stat = VerificationStatus(diag_stat_raw) if diag_stat_raw else None
             diag_out = row["diagnostic_outcome"] if "diagnostic_outcome" in row.keys() else None
             status_val = VerificationStatus(row["status"])
             summary_val = row["summary"] or ""
+            is_diag_raw = bool(row["is_diagnostic"]) if "is_diagnostic" in row.keys() and row["is_diagnostic"] is not None else False
 
-            # Defensive read-compatibility normalization
-            finding_rules = {f.rule_id for f in findings}
-            if not is_diag and ("RULE_EVIDENCE_EXISTS_V1" in finding_rules or "DIAGNOSTIC ONLY" in summary_val):
-                is_diag = True
-
-            if is_diag:
-                if status_val == VerificationStatus.VERIFIED or diag_stat is None:
-                    run_st, diag_st, d_out = compute_diagnostic_run_fields([f.status for f in findings], row["target_count"])
-                    status_val = run_st
-                    diag_stat = diag_st
-                    diag_out = d_out
-            else:
-                diag_stat = None
-                diag_out = None
+            is_diag, status_val, diag_stat, diag_out = self._normalize_diagnostic_run_fields(
+                is_diagnostic=is_diag_raw,
+                status=status_val,
+                diagnostic_status=diag_stat,
+                diagnostic_outcome=diag_out,
+                finding_statuses=finding_statuses,
+                finding_rules=finding_rules,
+                summary=summary_val,
+                target_count=row["target_count"],
+            )
 
             return VerificationRun(
                 verification_id=row["verification_id"],
@@ -788,29 +864,43 @@ class VerificationRepository:
             cursor.execute(query, exec_params)
             rows = cursor.fetchall()
 
+            # Batch retrieve findings scoped to tenant, workspace, and returned verification IDs
+            v_ids = [r["verification_id"] for r in rows]
+            findings_by_vid: Dict[str, List[sqlite3.Row]] = defaultdict(list)
+            if v_ids:
+                placeholders = ",".join("?" for _ in v_ids)
+                cursor.execute(f"""
+                    SELECT verification_id, rule_id, status
+                    FROM verification_findings
+                    WHERE tenant_id = ? AND workspace_id = ? AND verification_id IN ({placeholders})
+                    ORDER BY finding_id ASC
+                """, [tenant_id, workspace_id, *v_ids])
+                for fr in cursor.fetchall():
+                    findings_by_vid[fr["verification_id"]].append(fr)
+
             summaries: List[VerificationRunSummary] = []
             for r in rows:
-                is_diag = bool(r["is_diagnostic"]) if "is_diagnostic" in r.keys() and r["is_diagnostic"] is not None else False
+                v_findings = findings_by_vid.get(r["verification_id"], [])
+                finding_statuses = [VerificationStatus(fr["status"]) for fr in v_findings if fr["status"]]
+                finding_rules = {fr["rule_id"] for fr in v_findings if fr["rule_id"]}
+
                 diag_stat_raw = r["diagnostic_status"] if "diagnostic_status" in r.keys() else None
                 diag_stat = VerificationStatus(diag_stat_raw) if diag_stat_raw else None
                 diag_out = r["diagnostic_outcome"] if "diagnostic_outcome" in r.keys() else None
                 status_val = VerificationStatus(r["status"])
                 summary_val = r["summary"] or ""
+                is_diag_raw = bool(r["is_diagnostic"]) if "is_diagnostic" in r.keys() and r["is_diagnostic"] is not None else False
 
-                # Defensive read-compatibility normalization for summaries
-                if not is_diag and "DIAGNOSTIC ONLY" in summary_val:
-                    is_diag = True
-
-                if is_diag:
-                    if status_val == VerificationStatus.VERIFIED:
-                        status_val = VerificationStatus.NOT_VERIFIED
-                    if diag_stat is None:
-                        diag_stat = VerificationStatus.VERIFIED
-                    if diag_out is None:
-                        diag_out = "CONFIRMED"
-                else:
-                    diag_stat = None
-                    diag_out = None
+                is_diag, status_val, diag_stat, diag_out = self._normalize_diagnostic_run_fields(
+                    is_diagnostic=is_diag_raw,
+                    status=status_val,
+                    diagnostic_status=diag_stat,
+                    diagnostic_outcome=diag_out,
+                    finding_statuses=finding_statuses,
+                    finding_rules=finding_rules,
+                    summary=summary_val,
+                    target_count=r["target_count"],
+                )
 
                 summaries.append(
                     VerificationRunSummary(

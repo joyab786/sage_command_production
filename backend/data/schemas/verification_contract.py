@@ -353,8 +353,10 @@ def compute_diagnostic_run_fields(
     9. Else -> run_status=INDETERMINATE, diagnostic_status=INDETERMINATE, diagnostic_outcome='INDETERMINATE'
     """
     total = target_count if target_count is not None else len(finding_statuses)
-    if total == 0 or len(finding_statuses) == 0:
-        return VerificationStatus.INDETERMINATE, VerificationStatus.INDETERMINATE, "NO_TARGETS"
+    if not finding_statuses:
+        if total == 0:
+            return VerificationStatus.NOT_VERIFIED, VerificationStatus.INDETERMINATE, "NO_TARGETS"
+        return VerificationStatus.NOT_VERIFIED, VerificationStatus.INDETERMINATE, "AMBIGUOUS_NO_FINDINGS"
 
     if any(s == VerificationStatus.BLOCKED for s in finding_statuses):
         return VerificationStatus.BLOCKED, VerificationStatus.BLOCKED, "BLOCKED"
