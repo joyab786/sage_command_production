@@ -103,30 +103,45 @@ Publishes a canonical feedback event (`verification.feedback.recorded`) back to 
 
 ---
 
-## 4. Trusted Identity and Scope Isolation Boundary
+## 4. Trusted Identity, Scope Boundaries & Producer Validation (Prompt 37A Hardened)
 
-A critical security invariant of Prompt 37 is the non-negotiable identity boundary:
-1. **Never Trust Event Payload for Identity:**
-   Fields inside `CanonicalEvent.payload` such as `user_id`, `roles`, `permissions`, `clearance`, or `tenant_id` are completely ignored.
-2. **Authoritative Scope Derived from Envelope:**
-   `tenant_id`, `workspace_id`, and `plant_id` are taken strictly from the canonical event envelope, which has passed prior cryptographic/server ingestion checks.
-3. **Server-Derived Service Identity:**
-   Background verification uses `_build_trusted_service_identity(event)`:
-   - `user_id`: `"system:closed_loop_coordinator"`
-   - `tenant_id`: Authoritative event `tenant_id`
-   - `workspace_id`: Authoritative event `workspace_id`
-   - `roles`: `["SERVICE_OPERATOR"]`
+A core invariant of Prompt 37A is that **a valid event schema is not proof of an authorized event scope**.
+
+### 4.1 Authenticated Event Producer Boundary (`POST /api/v3/events`)
+1. **Producer Identity is Authoritative:** The caller's authenticated identity (`identity.tenant_id`, `identity.workspace_id`, `identity.assigned_plants`) governs the event submission boundary. The event body is untrusted input.
+2. **Tenant Mismatch Forbidden:** Cross-tenant event submissions return `HTTP 403 Forbidden`.
+3. **Workspace Isolation:** Producers cannot choose an arbitrary workspace by editing the event body. Mismatched workspaces return `HTTP 403 Forbidden`.
+4. **Physical Plant Scoping:** If a producer is assigned to specific physical plants, the submitted `plant_id` must belong to that authorized set (`HTTP 403 Forbidden` otherwise). Wildcard `*` in assigned plants is honored only if server-authoritative.
+5. **Fail-Closed on Missing Scope:** Events with missing, empty, or manufactured scopes (`"global"`, `"unknown"`, `"default"`) return `HTTP 400 Bad Request`.
+6. **No Privilege Escalation via Payload:** Payload fields attempting to inject `user_id`, `roles`, `permissions`, or `clearance` are completely ignored and cannot grant operational authority.
+7. **Fingerprint Validation:** Client-supplied `event_fingerprint` must match `event.compute_fingerprint()`. Inconsistent fingerprints return `HTTP 400 Bad Request`.
+8. **Persistence Barrier:** Events are persisted in `EventRepository` and published to `EventBus` only after all scope and fingerprint validations succeed.
+
+### 4.2 Independent Verification Scope Check (`VerificationTriggerCoordinator`)
+Event fields cannot independently grant the coordinator authority to verify a mission:
+1. **Scope Validation:** Validates that tenant, workspace, and plant are present, non-blank, and not manufactured strings (`"global"`, `"unknown"`, `"default"`).
+2. **Independent Mission Resolution:** Before calling `VerificationService.request_verification(...)`, the coordinator independently resolves the target mission from `MissionRepository.get_mission(tenant_id, workspace_id, mission_id)`.
+3. **Scope Alignment Verification:** Confirms that the mission's scope (`mission.scope.tenant_id`, `mission.scope.workspace_id`, `mission.scope.plant_id`) strictly matches the event's authorized scope.
+4. **Revision & Target Validation:** Verifies that requested `mission_revision` matches `mission.revision`, and target criterion/step exists on the mission DAG.
+5. **Strict Service Identity Construction:** Service identity is constructed strictly from the validated `Mission` scope via `_build_trusted_service_identity(mission)`:
+   - `user_id`: `"system:closed_loop_coordinator:{tenant_id}"`
+   - `tenant_id`: `mission.scope.tenant_id`
+   - `workspace_id`: `mission.scope.workspace_id`
+   - `roles`: `["SYSTEM_VERIFIER"]`
    - `permissions`: `["mission.verification.request", "mission.verification.read", "mission.read"]`
-   - `assigned_plants`: Exactly `[event.plant_id]` (never wildcard `"*"` unless event specifically validates)
-4. **Cross-Tenant and Cross-Plant Isolation:**
-   Cross-tenant attempts fail closed with `SCOPE_MISMATCH`. Cross-plant attempts fail closed with `SCOPE_MISMATCH` or `MissionPermissionError`.
+   - `assigned_plants`: `[mission.scope.plant_id]` (strictly the mission's plant, never wildcard)
+
+### 4.3 Global Workspace Policy
+- Missing or blank workspace scope fails closed.
+- Manufactured scopes (`"global"`, `"default"`, `"unknown"`) are strictly rejected.
+- No manufactured scope is ever stored in `verification_feedback_records`.
 
 ---
 
 ## 5. EventBus Reuse & Delivery Semantics
 
 No competing event bus was introduced. The coordinator integrates with the existing `EventBus` (`backend/services/event_bus.py`):
-- Registers tenant-scoped subscriptions with `Subscription` records.
+- Registers explicitly configured tenant/workspace/plant subscriptions with `Subscription` records.
 - Implements `SubscriberCallback` via `async def handle_event(delivery: EventDelivery, event: CanonicalEvent) -> bool`.
 - Respects at-least-once delivery semantics:
   - If event is already processed or duplicate, acknowledges delivery safely without re-running verification.
@@ -142,13 +157,15 @@ The same logical trigger must never spawn duplicate verification runs:
    ```text
    cltrig_<SHA-256(tenant_id:workspace_id:mission_id:revision:event_fingerprint:rule_version)>
    ```
-2. **Dual-Layer Deduplication:**
+2. **Deterministic Fingerprint Verification:**
+   Fingerprints are computed deterministically from canonical event content. Client-supplied fingerprints that do not match are rejected with `UNTRUSTED_PROVENANCE`. Fingerprint reuse with mutated payloads cannot impersonate another event.
+3. **Dual-Layer Deduplication:**
    - **Repository Level:** `VerificationRepository.check_feedback_idempotency(...)` checks recent triggers within `SAGE_VERIFICATION_EVENT_DEDUP_WINDOW_SECONDS` (default: 300s).
    - **Verification Service Level:** Passes the deterministic trigger key as `idempotency_key` into `VerificationService.request_verification(...)`.
-3. **Replay Determinism:**
+4. **Replay Determinism:**
    Replays of identical events return the existing `VerificationRun` and existing `VerificationFeedbackRecord` with `DeliveryStatus.ACKNOWLEDGED`.
-4. **Fresh Events:**
-   Distinct operational events with different fingerprints or payload timestamps legitimately produce fresh, independent verification runs.
+5. **Fresh Events:**
+   Distinct operational events with different fingerprints legitimately produce fresh, independent verification runs.
 
 ---
 
@@ -222,11 +239,11 @@ Strictly preserves Prompt 36 and Prompt 36E–36H invariants:
 
 ## 10. Copilot and Agent Integration Decision
 
-**Decision:** Verification tools remain **UNREGISTERED** in the default `copilot_tools` registry for Prompt 37.
+**Decision:** Verification tools remain **UNREGISTERED** in the default `copilot_tools` registry for Prompt 37 / Prompt 37A.
 
 **Reason:**
 Current LangGraph `ToolNode` architecture in `backend/agents/copilot.py` does not provide an immutable, request-scoped identity propagation context for background sub-agents. Allowing the LLM to invoke verification tools without verified identity propagation would risk client-forged identity parameters.
-As mandated by Prompt 37 Section 15:
+As mandated by Prompt 37 Section 15 and Prompt 37A Section 10:
 > *"If the current Copilot architecture cannot guarantee trusted identity propagation, keep the tool unregistered and document the blocker. Do not weaken the identity boundary to make a demo work."*
 
 ---
@@ -240,25 +257,36 @@ Mounted in FastAPI:
 2. `GET /api/v3/verification/feedback`
    - Returns tenant-wide closed-loop feedback records with optional `mission_id` filtering.
    - Enforces `mission.verification.read` permission and tenant/workspace boundaries.
+3. `POST /api/v3/events`
+   - Ingests canonical operational events with strict producer tenant/workspace/plant authorization.
+4. `GET /api/v3/events`
+   - Retrieves events filtered by tenant, workspace, and authorized plant scoping.
 
 ---
 
-## 12. Configuration Settings
+## 12. Configuration Settings & Startup Subscriptions (Prompt 37A)
 
 Configured in `backend/core/config.py`:
-- `SAGE_CLOSED_LOOP_ENABLED` (bool, default: `True`): Master toggle for closed-loop subsystem.
-- `SAGE_VERIFICATION_EVENT_TRIGGER_ENABLED` (bool, default: `True`): Toggles event-triggered verification.
+- `SAGE_CLOSED_LOOP_ENABLED` (bool, default: `False`): Master toggle for closed-loop subsystem. Defaults to `false` for startup safety.
+- `SAGE_VERIFICATION_EVENT_TRIGGER_ENABLED` (bool, default: `False`): Toggles event-triggered verification. Defaults to `false`.
+- `SAGE_CLOSED_LOOP_SUBSCRIPTION_SCOPES` (str, default: `""`): Comma-separated triples `tenant:workspace:plant` defining explicitly authorized subscription scopes.
 - `SAGE_VERIFICATION_EVENT_MAX_AGE_SECONDS` (int, default: `3600`): Maximum acceptable age of operational events.
 - `SAGE_VERIFICATION_EVENT_DEDUP_WINDOW_SECONDS` (int, default: `300`): Deduplication window for identical event replays.
 - `SAGE_VERIFICATION_EVENT_MAX_BATCH_SIZE` (int, default: `100`): Max batch processing size.
+
+### Startup Behavior
+- When either flag is `False`, no closed-loop subscriptions are registered on startup.
+- Unconditional `register_tenant_subscription("default")` is permanently removed.
+- When flags are `True`, the server subscribes only to explicitly configured scopes in `SAGE_CLOSED_LOOP_SUBSCRIPTION_SCOPES`.
+- Missing or invalid subscription configuration logs a safe diagnostic and registers 0 subscriptions.
 
 ---
 
 ## 13. Test Coverage Summary
 
 - **Focused Closed-Loop Test Suite:** `backend/test_v3_closed_loop_learning.py`
-  - 24 tests covering eligibility, identity boundary, scope isolation, idempotency, loop guards, AST checks, and REST routes.
-  - **Result: 24 passed (100%)**.
+  - 49 tests covering eligibility, identity boundary, scope isolation, idempotency, loop guards, AST checks, producer authorization, coordinator independent scope verification, feature flag defaults, and fingerprint integrity.
+  - **Result: 49 passed (100%)**.
 - **All Core Regression Suites:**
   - Event Driven Architecture: 5 passed
   - Continuous Verification: 128 passed
@@ -268,13 +296,14 @@ Configured in `backend/core/config.py`:
   - Root Cause Analysis: 30 passed
   - Incident Management: 56 passed
   - Confidence Uncertainty & Authorization: 171 passed
-  - **Total: 711 passed, 0 failed.**
+  - **Total: 736 passed, 0 failed.**
 
 ---
 
-## 14. Deferred Capabilities
+## 14. Remaining Limitations and Deferred Work
 
-1. **Autonomous Policy Mutation:** Self-modifying policy engines remain strictly forbidden.
-2. **Model Weight Fine-Tuning:** Dynamic training of model weights is deferred.
-3. **Autonomous Action Approval:** Human-in-the-loop governance remains mandatory for all operational actions.
-4. **LangGraph Identity Context Propagation:** Tool registration deferred until request-scoped security context is added to LangGraph `ToolNode`.
+1. **Dynamic Subscriber Scope Discovery:** The server requires explicit configuration in `SAGE_CLOSED_LOOP_SUBSCRIPTION_SCOPES`; dynamic subscription authorization from a tenant directory is deferred until an external tenant registry is introduced.
+2. **Autonomous Policy Mutation:** Self-modifying policy engines remain strictly forbidden.
+3. **Model Weight Fine-Tuning:** Dynamic training of model weights is deferred.
+4. **Autonomous Action Approval:** Human-in-the-loop governance remains mandatory for all operational actions.
+5. **LangGraph Identity Context Propagation:** Tool registration deferred until request-scoped security context is added to LangGraph `ToolNode`.
