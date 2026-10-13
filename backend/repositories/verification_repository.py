@@ -122,6 +122,9 @@ class VerificationRepository:
                 blocked_count INTEGER NOT NULL DEFAULT 0,
                 failed_count INTEGER NOT NULL DEFAULT 0,
                 summary TEXT NOT NULL DEFAULT '',
+                is_diagnostic INTEGER NOT NULL DEFAULT 0,
+                diagnostic_status TEXT,
+                diagnostic_outcome TEXT,
                 provenance_json TEXT NOT NULL,
                 idempotency_key TEXT,
                 created_at TEXT NOT NULL,
@@ -210,6 +213,18 @@ class VerificationRepository:
             CREATE INDEX IF NOT EXISTS idx_vaudit_mission_lookup
             ON verification_audit_ledger (tenant_id, workspace_id, mission_id)
         """)
+
+        # Backward compatibility migration for existing SQLite schemas
+        for col_name, col_type in [
+            ("is_diagnostic", "INTEGER NOT NULL DEFAULT 0"),
+            ("diagnostic_status", "TEXT"),
+            ("diagnostic_outcome", "TEXT"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE verification_runs ADD COLUMN {col_name} {col_type}")
+            except sqlite3.OperationalError:
+                pass
+
         conn.commit()
 
     def check_idempotency(
@@ -304,9 +319,9 @@ class VerificationRepository:
                         plant_id, session_id, schema_version, verification_scope, status,
                         trigger_type, requested_by, rule_set_version, started_at, completed_at,
                         target_count, verified_count, unverified_count, indeterminate_count,
-                        blocked_count, failed_count, summary, provenance_json, idempotency_key,
-                        created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        blocked_count, failed_count, summary, is_diagnostic, diagnostic_status,
+                        diagnostic_outcome, provenance_json, idempotency_key, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         run.verification_id,
@@ -331,6 +346,9 @@ class VerificationRepository:
                         run.blocked_count,
                         run.failed_count,
                         run.summary,
+                        1 if run.is_diagnostic else 0,
+                        run.diagnostic_status.value if run.diagnostic_status else None,
+                        run.diagnostic_outcome,
                         json.dumps(run.provenance.model_dump(), separators=(",", ":")),
                         run.idempotency_key,
                         run.created_at,
@@ -437,6 +455,11 @@ class VerificationRepository:
             findings = self.get_findings(tenant_id, workspace_id, mission_id, verification_id)
             prov_data = json.loads(row["provenance_json"])
 
+            is_diag = bool(row["is_diagnostic"]) if "is_diagnostic" in row.keys() and row["is_diagnostic"] is not None else False
+            diag_stat_raw = row["diagnostic_status"] if "diagnostic_status" in row.keys() else None
+            diag_stat = VerificationStatus(diag_stat_raw) if diag_stat_raw else None
+            diag_out = row["diagnostic_outcome"] if "diagnostic_outcome" in row.keys() else None
+
             return VerificationRun(
                 verification_id=row["verification_id"],
                 schema_version=row["schema_version"],
@@ -463,6 +486,9 @@ class VerificationRepository:
                 findings=findings,
                 provenance=VerificationProvenance.model_validate(prov_data),
                 idempotency_key=row["idempotency_key"],
+                is_diagnostic=is_diag,
+                diagnostic_status=diag_stat,
+                diagnostic_outcome=diag_out,
                 created_at=row["created_at"],
             )
 
@@ -485,7 +511,7 @@ class VerificationRepository:
             SELECT verification_id, mission_id, mission_revision, verification_scope,
                    status, trigger_type, started_at, completed_at, target_count,
                    verified_count, unverified_count, indeterminate_count, blocked_count,
-                   failed_count, summary
+                   failed_count, summary, is_diagnostic, diagnostic_status, diagnostic_outcome
             FROM verification_runs
             WHERE tenant_id = ? AND workspace_id = ? AND mission_id = ?
         """
@@ -512,6 +538,11 @@ class VerificationRepository:
 
             summaries: List[VerificationRunSummary] = []
             for r in rows:
+                is_diag = bool(r["is_diagnostic"]) if "is_diagnostic" in r.keys() and r["is_diagnostic"] is not None else False
+                diag_stat_raw = r["diagnostic_status"] if "diagnostic_status" in r.keys() else None
+                diag_stat = VerificationStatus(diag_stat_raw) if diag_stat_raw else None
+                diag_out = r["diagnostic_outcome"] if "diagnostic_outcome" in r.keys() else None
+
                 summaries.append(
                     VerificationRunSummary(
                         verification_id=r["verification_id"],
@@ -529,6 +560,9 @@ class VerificationRepository:
                         blocked_count=r["blocked_count"],
                         failed_count=r["failed_count"],
                         summary=r["summary"],
+                        is_diagnostic=is_diag,
+                        diagnostic_status=diag_stat,
+                        diagnostic_outcome=diag_out,
                     )
                 )
             return summaries, total

@@ -2913,11 +2913,16 @@ def test_prompt36d_rule_selection_diagnostic_caveat(v_service, analyst_identity,
         rule_type=RuleType.EVIDENCE_EXISTS,
     )
     run = v_service.request_verification(analyst_identity, sample_mission.mission_id, req)
-    assert run.status == VerificationStatus.VERIFIED
+    # Prompt 36E: Diagnostic existence check must NOT produce an authoritative VERIFIED run status
+    assert run.status == VerificationStatus.NOT_VERIFIED
+    assert run.is_diagnostic is True
+    assert run.diagnostic_status == VerificationStatus.VERIFIED
+    assert run.diagnostic_outcome == "CONFIRMED"
     finding = run.findings[0]
 
-    # Clearly identifies the evaluated rule
+    # Clearly identifies the evaluated rule and its rule-specific result
     assert finding.rule_id == "RULE_EVIDENCE_EXISTS_V1"
+    assert finding.status == VerificationStatus.VERIFIED
 
     # Run summary explicitly records diagnostic non-certification notice
     assert "DIAGNOSTIC ONLY" in run.summary
@@ -2929,3 +2934,379 @@ def test_prompt36d_rule_selection_diagnostic_caveat(v_service, analyst_identity,
     # Mission status remains ACCEPTED, not EXECUTED or COMPLETED
     saved_m = v_service.mission_service.get_mission(analyst_identity, sample_mission.mission_id)
     assert saved_m.status == MissionStatus.ACCEPTED
+
+
+# =============================================================================
+# PROMPT 36E: DIAGNOSTIC STATUS CONTRACT & MACHINE-READABLE INTEGRITY TESTS
+# =============================================================================
+
+def test_prompt36e_test_a_diagnostic_only_result(v_service, analyst_identity, sample_mission, e_repo):
+    """
+    Test A — Diagnostic-only result:
+    When a request selects EVIDENCE_EXISTS and evidence records are accessible:
+    - The finding identifies RULE_EVIDENCE_EXISTS_V1.
+    - The finding may report its rule-specific diagnostic result (VERIFIED) according to contract.
+    - The overall run status does not imply authoritative mission verification (NOT_VERIFIED).
+    - Machine-readable fields identify the diagnostic nature of the result (is_diagnostic, diagnostic_status, diagnostic_outcome).
+    - The summary includes the diagnostic disclaimer.
+    - Provenance limitations retain the diagnostic disclaimer.
+    - The mission remains in its original lifecycle state.
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with e_repo._lock, e_repo._get_connection() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO evidence_explanations (
+                explanation_id, target_type, target_id, tenant_id, workspace_id, plant_id,
+                fingerprint, assessment_timestamp, algorithm_version, contract_version,
+                is_partial, summary, supporting_evidence_count, excluded_evidence_count,
+                payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "exp_p36e_a", "CRITERION", "crit_01", "tenant_alpha", "workspace_prod", "plant_01",
+                "fp_p36e_a", now_iso, "1.0", "1.0",
+                0, "test explanation A", 1, 0, "{}", now_iso
+            )
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO evidence_records (
+                evidence_id, explanation_id, tenant_id, workspace_id, plant_id,
+                source_type, source_record_id, provenance, validation_status,
+                payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "ev_rec_01", "exp_p36e_a", "tenant_alpha", "workspace_prod", "plant_01",
+                "TELEMETRY_LOG", "tel_a1", "OBSERVED", "VALID",
+                json.dumps({"temp": 22.5, "classification": "INTERNAL"}), now_iso
+            )
+        )
+        conn.commit()
+
+    req = VerificationRequest(
+        target_type=VerificationTargetType.CRITERION,
+        target_id="crit_01",
+        rule_type=RuleType.EVIDENCE_EXISTS,
+    )
+    run = v_service.request_verification(analyst_identity, sample_mission.mission_id, req)
+
+    # 1. Finding identifies RULE_EVIDENCE_EXISTS_V1 and reports rule-specific result
+    assert len(run.findings) == 1
+    finding = run.findings[0]
+    assert finding.rule_id == "RULE_EVIDENCE_EXISTS_V1"
+    assert finding.status == VerificationStatus.VERIFIED
+    assert "confirms record presence only" in finding.explanation
+
+    # 2. Overall run status does not imply authoritative mission verification
+    assert run.status == VerificationStatus.NOT_VERIFIED
+    assert run.status != VerificationStatus.VERIFIED
+
+    # 3. Machine-readable fields identify the diagnostic nature of the result
+    assert run.is_diagnostic is True
+    assert run.diagnostic_status == VerificationStatus.VERIFIED
+    assert run.diagnostic_outcome == "CONFIRMED"
+
+    # 4. Summary includes diagnostic disclaimer
+    assert "DIAGNOSTIC ONLY" in run.summary
+    assert "does not certify" in run.summary
+
+    # 5. Provenance limitations retain diagnostic disclaimer
+    assert any("DIAGNOSTIC" in lim.upper() for lim in run.provenance.limitations)
+
+    # 6. Mission remains in original lifecycle state
+    saved_m = v_service.mission_service.get_mission(analyst_identity, sample_mission.mission_id)
+    assert saved_m.status == MissionStatus.ACCEPTED
+
+
+def test_prompt36e_test_b_stronger_authoritative_requirement(v_service, analyst_identity, sample_mission, e_repo):
+    """
+    Test B — Stronger authoritative requirement:
+    Given a mission whose requirements demand stronger evidence validation:
+    - A request selecting EVIDENCE_EXISTS cannot satisfy or certify those stronger requirements.
+    - The overall run status cannot be consumed as authoritative success.
+    - The authoritative requirements remain unchanged.
+    - No execution, approval, or mission-state mutation occurs.
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with e_repo._lock, e_repo._get_connection() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO evidence_explanations (
+                explanation_id, target_type, target_id, tenant_id, workspace_id, plant_id,
+                fingerprint, assessment_timestamp, algorithm_version, contract_version,
+                is_partial, summary, supporting_evidence_count, excluded_evidence_count,
+                payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "exp_p36e_b", "CRITERION", "crit_01", "tenant_alpha", "workspace_prod", "plant_01",
+                "fp_p36e_b", now_iso, "1.0", "1.0",
+                0, "test explanation B", 1, 0, "{}", now_iso
+            )
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO evidence_records (
+                evidence_id, explanation_id, tenant_id, workspace_id, plant_id,
+                source_type, source_record_id, provenance, validation_status,
+                payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "ev_rec_01", "exp_p36e_b", "tenant_alpha", "workspace_prod", "plant_01",
+                "TELEMETRY_LOG", "tel_b1", "OBSERVED", "VALID",
+                json.dumps({"temp": 30.0, "classification": "INTERNAL"}), now_iso
+            )
+        )
+        conn.commit()
+
+    # Pre-verification snapshot of mission requirements
+    orig_mission = v_service.mission_service.get_mission(analyst_identity, sample_mission.mission_id)
+    orig_req_count = len(orig_mission.evidence_requirements)
+    orig_status = orig_mission.status
+
+    req = VerificationRequest(
+        target_type=VerificationTargetType.CRITERION,
+        target_id="crit_01",
+        rule_type=RuleType.EVIDENCE_EXISTS,
+    )
+    run = v_service.request_verification(analyst_identity, sample_mission.mission_id, req)
+
+    # Run status cannot be consumed as authoritative success
+    assert run.status != VerificationStatus.VERIFIED
+    assert run.status == VerificationStatus.NOT_VERIFIED
+    assert run.is_diagnostic is True
+
+    # Authoritative mission requirements remain unchanged
+    after_m = v_service.mission_service.get_mission(analyst_identity, sample_mission.mission_id)
+    assert len(after_m.evidence_requirements) == orig_req_count
+    assert after_m.status == orig_status
+    assert after_m.planned_steps[0].status == StepStatus.PLANNED
+
+
+def test_prompt36e_test_c_authoritative_validation_path(v_service, analyst_identity, sample_mission, e_repo):
+    """
+    Test C — Authoritative validation path:
+    - A request using the appropriate authoritative validation rule continues to behave
+      according to the established verification contract.
+    - Legitimate fully validated evidence can still satisfy applicable requirements.
+    - Invalid, blocked, unknown, stale, conflicting, or incomplete evidence retains appropriate conservative result.
+    - The correction does not blanket-reject all successful verification runs.
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with e_repo._lock, e_repo._get_connection() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO evidence_explanations (
+                explanation_id, target_type, target_id, tenant_id, workspace_id, plant_id,
+                fingerprint, assessment_timestamp, algorithm_version, contract_version,
+                is_partial, summary, supporting_evidence_count, excluded_evidence_count,
+                payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "exp_p36e_c", "CRITERION", "crit_01", "tenant_alpha", "workspace_prod", "plant_01",
+                "fp_p36e_c", now_iso, "1.0", "1.0",
+                0, "test explanation C", 1, 0, "{}", now_iso
+            )
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO evidence_records (
+                evidence_id, explanation_id, tenant_id, workspace_id, plant_id,
+                source_type, source_record_id, provenance, validation_status,
+                payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "ev_rec_01", "exp_p36e_c", "tenant_alpha", "workspace_prod", "plant_01",
+                "TELEMETRY_LOG", "tel_c1", "OBSERVED", "VALID",
+                json.dumps({"temp": 18.0, "classification": "INTERNAL", "observed_at": now_iso}), now_iso
+            )
+        )
+        conn.commit()
+
+    # Authoritative rule path: EVIDENCE_VALIDATED
+    req_auth = VerificationRequest(
+        target_type=VerificationTargetType.CRITERION,
+        target_id="crit_01",
+        rule_type=RuleType.EVIDENCE_VALIDATED,
+    )
+    run_auth = v_service.request_verification(analyst_identity, sample_mission.mission_id, req_auth)
+
+    # Legitimate validated evidence achieves authoritative VERIFIED status
+    assert run_auth.status == VerificationStatus.VERIFIED
+    assert run_auth.is_diagnostic is False
+    assert run_auth.diagnostic_status is None
+    assert run_auth.diagnostic_outcome is None
+    assert "successfully verified by authorized, current evidence" in run_auth.summary
+
+    # Default rule path (EVIDENCE_FRESH) is also authoritative
+    req_default = VerificationRequest(
+        target_type=VerificationTargetType.CRITERION,
+        target_id="crit_01",
+    )
+    run_default = v_service.request_verification(analyst_identity, sample_mission.mission_id, req_default)
+    assert run_default.status == VerificationStatus.VERIFIED
+    assert run_default.is_diagnostic is False
+
+
+def test_prompt36e_test_d_serialization_and_persistence(v_service, analyst_identity, sample_mission, e_repo):
+    """
+    Test D — Serialization and persistence:
+    - The diagnostic distinction survives API serialization.
+    - The diagnostic distinction survives repository persistence and subsequent retrieval.
+    - The distinction remains available to downstream consumers without parsing human-readable text.
+    - Idempotent replay preserves the same result contract.
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with e_repo._lock, e_repo._get_connection() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO evidence_explanations (
+                explanation_id, target_type, target_id, tenant_id, workspace_id, plant_id,
+                fingerprint, assessment_timestamp, algorithm_version, contract_version,
+                is_partial, summary, supporting_evidence_count, excluded_evidence_count,
+                payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "exp_p36e_d", "CRITERION", "crit_01", "tenant_alpha", "workspace_prod", "plant_01",
+                "fp_p36e_d", now_iso, "1.0", "1.0",
+                0, "test explanation D", 1, 0, "{}", now_iso
+            )
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO evidence_records (
+                evidence_id, explanation_id, tenant_id, workspace_id, plant_id,
+                source_type, source_record_id, provenance, validation_status,
+                payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "ev_rec_01", "exp_p36e_d", "tenant_alpha", "workspace_prod", "plant_01",
+                "TELEMETRY_LOG", "tel_d1", "OBSERVED", "VALID",
+                json.dumps({"temp": 20.0, "classification": "INTERNAL", "observed_at": now_iso}), now_iso
+            )
+        )
+        conn.commit()
+
+    idem_key = f"idem_diag_{uuid.uuid4().hex[:12]}"
+    req = VerificationRequest(
+        target_type=VerificationTargetType.CRITERION,
+        target_id="crit_01",
+        rule_type=RuleType.EVIDENCE_EXISTS,
+        idempotency_key=idem_key,
+    )
+    run = v_service.request_verification(analyst_identity, sample_mission.mission_id, req)
+
+    # 1. VerificationRun Serialization & Deserialization
+    serialized = run.model_dump()
+    assert serialized["is_diagnostic"] is True
+    assert serialized["diagnostic_status"] == VerificationStatus.VERIFIED
+    assert serialized["diagnostic_outcome"] == "CONFIRMED"
+    assert serialized["status"] == VerificationStatus.NOT_VERIFIED
+
+    reconstructed = VerificationRun.model_validate(serialized)
+    assert reconstructed.is_diagnostic is True
+    assert reconstructed.diagnostic_status == VerificationStatus.VERIFIED
+    assert reconstructed.diagnostic_outcome == "CONFIRMED"
+    assert reconstructed.status == VerificationStatus.NOT_VERIFIED
+
+    # 2. Repository persistence & retrieval via get_verification_run
+    reloaded = v_service.get_verification_run(analyst_identity, sample_mission.mission_id, run.verification_id)
+    assert reloaded.is_diagnostic is True
+    assert reloaded.diagnostic_status == VerificationStatus.VERIFIED
+    assert reloaded.diagnostic_outcome == "CONFIRMED"
+    assert reloaded.status == VerificationStatus.NOT_VERIFIED
+
+    # 3. Summary list retrieval via list_verification_runs
+    summaries, _ = v_service.list_verification_runs(analyst_identity, sample_mission.mission_id)
+    matching = [s for s in summaries if s.verification_id == run.verification_id]
+    assert len(matching) == 1
+    sum_entry = matching[0]
+    assert sum_entry.is_diagnostic is True
+    assert sum_entry.diagnostic_status == VerificationStatus.VERIFIED
+    assert sum_entry.diagnostic_outcome == "CONFIRMED"
+    assert sum_entry.status == VerificationStatus.NOT_VERIFIED
+
+    # 4. Idempotent replay preserves identical contract
+    replay_run = v_service.request_verification(analyst_identity, sample_mission.mission_id, req)
+    assert replay_run.verification_id == run.verification_id
+    assert replay_run.is_diagnostic is True
+    assert replay_run.diagnostic_status == VerificationStatus.VERIFIED
+    assert replay_run.diagnostic_outcome == "CONFIRMED"
+    assert replay_run.status == VerificationStatus.NOT_VERIFIED
+
+
+def test_prompt36e_test_e_regressions_and_security(v_service, analyst_identity, sample_mission, e_repo):
+    """
+    Test E — Regression:
+    - Existing scope enforcement tests continue passing (cross-plant evidence fails closed to BLOCKED).
+    - Evidence non-disclosure remains intact (blocked evidence IDs never disclosed).
+    - Caller-controlled rule parameters still cannot weaken authoritative requirements.
+    - Verification tools output diagnostic information cleanly.
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with e_repo._lock, e_repo._get_connection() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO evidence_explanations (
+                explanation_id, target_type, target_id, tenant_id, workspace_id, plant_id,
+                fingerprint, assessment_timestamp, algorithm_version, contract_version,
+                is_partial, summary, supporting_evidence_count, excluded_evidence_count,
+                payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "exp_p36e_e", "CRITERION", "crit_01", "tenant_alpha", "workspace_prod", "plant_02",
+                "fp_p36e_e", now_iso, "1.0", "1.0",
+                0, "foreign plant explanation", 1, 0, "{}", now_iso
+            )
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO evidence_records (
+                evidence_id, explanation_id, tenant_id, workspace_id, plant_id,
+                source_type, source_record_id, provenance, validation_status,
+                payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "ev_rec_01", "exp_p36e_e", "tenant_alpha", "workspace_prod", "plant_02",
+                "TELEMETRY_LOG", "tel_foreign", "OBSERVED", "VALID",
+                json.dumps({"temp": 99.0, "secret": "leaked_pw", "classification": "INTERNAL"}), now_iso
+            )
+        )
+        conn.commit()
+
+    # Cross-boundary diagnostic request must FAIL CLOSED to BLOCKED
+    req_cross = VerificationRequest(
+        target_type=VerificationTargetType.CRITERION,
+        target_id="crit_01",
+        rule_type=RuleType.EVIDENCE_EXISTS,
+    )
+    run_cross = v_service.request_verification(analyst_identity, sample_mission.mission_id, req_cross)
+    assert run_cross.status == VerificationStatus.BLOCKED
+    assert run_cross.is_diagnostic is True
+    assert run_cross.diagnostic_status == VerificationStatus.BLOCKED
+    assert run_cross.diagnostic_outcome == "BLOCKED"
+
+    # Non-disclosure: Blocked evidence ID must NOT appear in caller-visible findings or limitations
+    for f in run_cross.findings:
+        assert "ev_rec_01" not in f.evidence_references
+        assert "ev_rec_01" not in f.explanation
+        for lim in f.limitations:
+            assert "ev_rec_01" not in lim
+            assert "plant_02" not in lim
+
+    # Prohibited rule parameters remain blocked
+    with pytest.raises(Exception):
+        VerificationRequest(
+            rule_type=RuleType.EVIDENCE_EXISTS,
+            rule_parameters={"status": "VERIFIED"},
+        )
+

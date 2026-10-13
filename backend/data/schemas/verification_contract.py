@@ -372,6 +372,19 @@ class VerificationRun(BaseModel):
     findings: List[VerificationFinding] = Field(default_factory=list, max_length=100, description="Detailed findings per target")
     provenance: VerificationProvenance = Field(..., description="Reproducibility provenance record")
     idempotency_key: Optional[str] = Field(default=None, max_length=128, description="Idempotency key if supplied")
+    is_diagnostic: bool = Field(
+        default=False,
+        description="Indicates whether this run was a diagnostic check (e.g. EVIDENCE_EXISTS) rather than authoritative mission verification."
+    )
+    diagnostic_status: Optional[VerificationStatus] = Field(
+        default=None,
+        description="Machine-readable diagnostic status outcome when is_diagnostic is True."
+    )
+    diagnostic_outcome: Optional[str] = Field(
+        default=None,
+        max_length=64,
+        description="Machine-readable diagnostic outcome classification (e.g. 'CONFIRMED', 'NOT_FOUND', 'BLOCKED')."
+    )
     created_at: str = Field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat(),
         description="ISO-8601 creation timestamp"
@@ -563,6 +576,9 @@ class VerificationRunSummary(BaseModel):
     blocked_count: int
     failed_count: int
     summary: str
+    is_diagnostic: bool = False
+    diagnostic_status: Optional[VerificationStatus] = None
+    diagnostic_outcome: Optional[str] = None
 
 
 class VerificationFindingsResponse(BaseModel):
@@ -575,6 +591,9 @@ class VerificationFindingsResponse(BaseModel):
     overall_status: VerificationStatus
     total_findings: int
     findings: List[VerificationFinding]
+    is_diagnostic: bool = False
+    diagnostic_status: Optional[VerificationStatus] = None
+    diagnostic_outcome: Optional[str] = None
 
 
 class VerificationCancelRequest(BaseModel):

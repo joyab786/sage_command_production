@@ -318,7 +318,7 @@ class VerificationService:
 
             val_status = str(rec.get("validation_status", "UNKNOWN")).upper()
             # Strict timestamp semantics: observation time is strictly observed_at; never fallback to created_at
-            observed_at = rec.get("observed_at")
+            observed_at = rec.get("observed_at") or rec_payload.get("observed_at")
             received_at = rec.get("received_at") or rec.get("created_at")
 
             # Evaluate freshness
@@ -908,6 +908,10 @@ class VerificationService:
             findings.append(finding)
 
         # 6. Aggregate Findings & Determine Run Status
+        is_diagnostic_run = (rule_to_use.rule_type == RuleType.EVIDENCE_EXISTS)
+        diagnostic_status: Optional[VerificationStatus] = None
+        diagnostic_outcome: Optional[str] = None
+
         target_count = len(findings)
         verified_count = sum(1 for f in findings if f.status == VerificationStatus.VERIFIED)
         unverified_count = sum(1 for f in findings if f.status == VerificationStatus.NOT_VERIFIED)
@@ -920,37 +924,70 @@ class VerificationService:
         if target_count == 0:
             overall_status = VerificationStatus.INDETERMINATE
             summary = "No targets were eligible or requested for verification."
+            if is_diagnostic_run:
+                diagnostic_status = VerificationStatus.INDETERMINATE
+                diagnostic_outcome = "NO_TARGETS"
         elif blocked_count > 0:
             overall_status = VerificationStatus.BLOCKED
             summary = f"{blocked_count} verification target(s) blocked due to scope boundary or clearance restrictions."
+            if is_diagnostic_run:
+                diagnostic_status = VerificationStatus.BLOCKED
+                diagnostic_outcome = "BLOCKED"
         elif failed_count > 0:
             overall_status = VerificationStatus.FAILED
             summary = f"{failed_count} verification check(s) failed evaluation preconditions."
+            if is_diagnostic_run:
+                diagnostic_status = VerificationStatus.FAILED
+                diagnostic_outcome = "FAILED"
         elif conflicting_count > 0:
             overall_status = VerificationStatus.CONFLICTING
             summary = f"{conflicting_count} verification target(s) have conflicting evidence sources."
+            if is_diagnostic_run:
+                diagnostic_status = VerificationStatus.CONFLICTING
+                diagnostic_outcome = "CONFLICTING"
         elif unverified_count > 0:
             overall_status = VerificationStatus.NOT_VERIFIED
             summary = f"{unverified_count} of {target_count} target(s) remain unverified due to missing, invalid, or inadequate evidence."
+            if is_diagnostic_run:
+                diagnostic_status = VerificationStatus.NOT_VERIFIED
+                diagnostic_outcome = "NOT_FOUND"
         elif indeterminate_count > 0:
             overall_status = VerificationStatus.INDETERMINATE
             summary = f"{indeterminate_count} target(s) have indeterminate, unverified, or unproven evidence."
+            if is_diagnostic_run:
+                diagnostic_status = VerificationStatus.INDETERMINATE
+                diagnostic_outcome = "INDETERMINATE"
         elif stale_count > 0:
             overall_status = VerificationStatus.STALE
             summary = f"{stale_count} verification target(s) rely on stale evidence beyond threshold ({freshness_threshold:.0f}s)."
+            if is_diagnostic_run:
+                diagnostic_status = VerificationStatus.STALE
+                diagnostic_outcome = "STALE"
         elif verified_count == target_count:
-            overall_status = VerificationStatus.VERIFIED
-            if rule_to_use.rule_type == RuleType.EVIDENCE_EXISTS:
+            if is_diagnostic_run:
+                # Prompt 36E: A diagnostic existence check must not produce a run-level status
+                # that can be mistaken for authoritative mission verification.
+                # Conservative run status: NOT_VERIFIED
+                # Explicit machine-readable diagnostic outcome: diagnostic_status = VERIFIED, diagnostic_outcome = "CONFIRMED"
+                overall_status = VerificationStatus.NOT_VERIFIED
+                diagnostic_status = VerificationStatus.VERIFIED
+                diagnostic_outcome = "CONFIRMED"
                 summary = (
                     f"All {target_count} target(s) verified under diagnostic rule '{rule_to_use.rule_id}'. "
                     f"DIAGNOSTIC ONLY: Evidence existence check does not certify authoritative mission completion, freshness, or multi-source consistency."
                 )
                 all_limitations.append("Diagnostic evaluation only (EVIDENCE_EXISTS): does not certify authoritative mission completion, freshness, or multi-source consistency.")
             else:
+                overall_status = VerificationStatus.VERIFIED
+                diagnostic_status = None
+                diagnostic_outcome = None
                 summary = f"All {target_count} target(s) successfully verified by authorized, current evidence."
         else:
             overall_status = VerificationStatus.INDETERMINATE
             summary = f"{indeterminate_count} target(s) have indeterminate evidence."
+            if is_diagnostic_run:
+                diagnostic_status = VerificationStatus.INDETERMINATE
+                diagnostic_outcome = "INDETERMINATE"
 
         now_iso = eval_dt.isoformat()
         v_id = f"vrun_{uuid.uuid4().hex[:16]}"
@@ -973,6 +1010,9 @@ class VerificationService:
             mission_revision=mission.revision,
             verification_scope=verification_scope,
             status=overall_status,
+            is_diagnostic=is_diagnostic_run,
+            diagnostic_status=diagnostic_status,
+            diagnostic_outcome=diagnostic_outcome,
             started_at=now_iso,
             completed_at=now_iso,
             requested_by=identity.user_id,
@@ -1014,6 +1054,9 @@ class VerificationService:
                 "verified_count": verified_count,
                 "unverified_count": unverified_count,
                 "status": overall_status.value,
+                "is_diagnostic": is_diagnostic_run,
+                "diagnostic_status": diagnostic_status.value if diagnostic_status else None,
+                "diagnostic_outcome": diagnostic_outcome,
             },
         )
 
@@ -1135,6 +1178,9 @@ class VerificationService:
                 "mission_id": run.mission_id,
                 "mission_revision": run.mission_revision,
                 "status": run.status.value,
+                "is_diagnostic": run.is_diagnostic,
+                "diagnostic_status": run.diagnostic_status.value if run.diagnostic_status else None,
+                "diagnostic_outcome": run.diagnostic_outcome,
                 "target_count": run.target_count,
                 "verified_count": run.verified_count,
                 "unverified_count": run.unverified_count,

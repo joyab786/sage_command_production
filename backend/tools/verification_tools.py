@@ -138,12 +138,18 @@ def request_mission_verification_tool(
             request=req,
         )
 
+        diag_line = ""
+        if run.is_diagnostic:
+            diag_outcome_str = run.diagnostic_outcome or (run.diagnostic_status.value if run.diagnostic_status else "NONE")
+            diag_line = f"Diagnostic Check: True (Outcome: {diag_outcome_str} — non-authoritative existence check)\n"
+
         return (
             f"[VERIFICATION COMPLETED]\n"
             f"Notice: {MANDATORY_VERIFICATION_NOTICE}\n"
             f"Verification ID: {run.verification_id}\n"
             f"Mission ID: {run.mission_id} (Rev {run.mission_revision})\n"
             f"Overall Status: {run.status.value}\n"
+            f"{diag_line}"
             f"Targets Evaluated: {run.target_count} "
             f"(Verified: {run.verified_count}, Unverified: {run.unverified_count}, "
             f"Indeterminate: {run.indeterminate_count}, Blocked: {run.blocked_count}, Failed: {run.failed_count})\n"

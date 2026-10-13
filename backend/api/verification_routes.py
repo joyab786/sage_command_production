@@ -248,6 +248,9 @@ async def get_mission_verification_findings(
             overall_status=run.status,
             total_findings=len(run.findings),
             findings=run.findings,
+            is_diagnostic=run.is_diagnostic,
+            diagnostic_status=run.diagnostic_status,
+            diagnostic_outcome=run.diagnostic_outcome,
         )
     except VerificationNotFoundError as e:
         raise HTTPException(
