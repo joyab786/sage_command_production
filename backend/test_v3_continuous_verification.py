@@ -4495,4 +4495,661 @@ def test_prompt36g_test_j_all_invariants_explicit_proof(prompt36g_repo):
     assert beta_sum[0].verification_id == "run_36g_beta_08"
 
 
+# =============================================================================
+# PROMPT 36H ADVERSARIAL TESTS: FINDINGS-DRIVEN RECONCILIATION
+# =============================================================================
+
+def _create_prompt36h_test_database(db_path: str):
+    """
+    Creates an SQLite database containing adversarial test cases for Prompt 36H:
+    Contradictory stored metadata claiming CONFIRMED over BLOCKED, NOT_VERIFIED,
+    INDETERMINATE, mixed rules, zero findings, FAILED, and CONFLICTING findings.
+    """
+    conn = sqlite3.connect(db_path)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    prov_json_default = json.dumps({
+        "verification_id": "vrun_36h_default",
+        "mission_id": "mission_test_36h",
+        "mission_revision": 1,
+        "rule_set_version": "1.0.0",
+        "evaluator_version": "1.0.0",
+        "evidence_ids": ["ev_1"],
+        "evidence_timestamps": {"ev_1": now_iso},
+        "evaluation_timestamp": now_iso,
+        "limitations": [],
+    })
+
+    conn.execute("""
+        CREATE TABLE verification_runs (
+            verification_id TEXT NOT NULL,
+            mission_id TEXT NOT NULL,
+            mission_revision INTEGER NOT NULL,
+            tenant_id TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            plant_id TEXT NOT NULL,
+            session_id TEXT,
+            schema_version TEXT NOT NULL,
+            verification_scope TEXT NOT NULL,
+            status TEXT NOT NULL,
+            trigger_type TEXT NOT NULL,
+            requested_by TEXT NOT NULL,
+            rule_set_version TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            completed_at TEXT,
+            target_count INTEGER NOT NULL DEFAULT 0,
+            verified_count INTEGER NOT NULL DEFAULT 0,
+            unverified_count INTEGER NOT NULL DEFAULT 0,
+            indeterminate_count INTEGER NOT NULL DEFAULT 0,
+            blocked_count INTEGER NOT NULL DEFAULT 0,
+            failed_count INTEGER NOT NULL DEFAULT 0,
+            summary TEXT NOT NULL DEFAULT '',
+            is_diagnostic INTEGER NOT NULL DEFAULT 0,
+            diagnostic_status TEXT,
+            diagnostic_outcome TEXT,
+            provenance_json TEXT NOT NULL,
+            idempotency_key TEXT,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, workspace_id, verification_id)
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE verification_findings (
+            finding_id TEXT NOT NULL,
+            verification_id TEXT NOT NULL,
+            mission_id TEXT NOT NULL,
+            mission_revision INTEGER NOT NULL,
+            tenant_id TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            plant_id TEXT NOT NULL,
+            target_type TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            evidence_references_json TEXT NOT NULL,
+            evidence_assessments_json TEXT NOT NULL,
+            rule_id TEXT NOT NULL,
+            rule_version TEXT NOT NULL,
+            explanation TEXT NOT NULL,
+            limitations_json TEXT NOT NULL,
+            evaluated_at TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, workspace_id, finding_id)
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE verification_audit_ledger (
+            audit_id TEXT NOT NULL,
+            verification_id TEXT NOT NULL,
+            mission_id TEXT NOT NULL,
+            mission_revision INTEGER NOT NULL,
+            tenant_id TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            plant_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            result TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            actor_role TEXT,
+            request_id TEXT,
+            trace_id TEXT,
+            details_json TEXT NOT NULL,
+            checksum TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, workspace_id, audit_id)
+        )
+    """)
+
+    # 1. Run A: Contradictory blocked finding (stored metadata claims CONFIRMED, finding is BLOCKED)
+    conn.execute("""
+        INSERT INTO verification_runs (
+            verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            schema_version, verification_scope, status, trigger_type, requested_by, rule_set_version,
+            started_at, completed_at, target_count, verified_count, unverified_count,
+            indeterminate_count, blocked_count, failed_count, summary, is_diagnostic,
+            diagnostic_status, diagnostic_outcome, provenance_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "run_36h_blocked_01", "mission_test_36h", 1, "tenant_alpha", "workspace_prod", "plant_01",
+        "3.0.0", "FULL_MISSION", "NOT_VERIFIED", "MANUAL", "user_adversarial", "1.0.0",
+        now_iso, now_iso, 1, 0, 0, 0, 1, 0,
+        "Contradictory run claiming CONFIRMED. DIAGNOSTIC ONLY", 1, "VERIFIED", "CONFIRMED", prov_json_default, now_iso
+    ))
+    conn.execute("""
+        INSERT INTO verification_findings (
+            finding_id, verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            target_type, target_id, status, evidence_references_json, evidence_assessments_json,
+            rule_id, rule_version, explanation, limitations_json, evaluated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "vf_36h_blocked_01", "run_36h_blocked_01", "mission_test_36h", 1, "tenant_alpha", "workspace_prod", "plant_01",
+        "CRITERION", "crit_01", "BLOCKED", json.dumps([]), json.dumps([]),
+        "RULE_EVIDENCE_EXISTS_V1", "1.0.0", "Access restricted / blocked scope", json.dumps([]), now_iso
+    ))
+
+    # 2. Run B: Contradictory missing finding (stored metadata claims CONFIRMED, finding is NOT_VERIFIED)
+    conn.execute("""
+        INSERT INTO verification_runs (
+            verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            schema_version, verification_scope, status, trigger_type, requested_by, rule_set_version,
+            started_at, completed_at, target_count, verified_count, unverified_count,
+            indeterminate_count, blocked_count, failed_count, summary, is_diagnostic,
+            diagnostic_status, diagnostic_outcome, provenance_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "run_36h_missing_02", "mission_test_36h", 1, "tenant_alpha", "workspace_prod", "plant_01",
+        "3.0.0", "FULL_MISSION", "NOT_VERIFIED", "MANUAL", "user_adversarial", "1.0.0",
+        now_iso, now_iso, 1, 0, 1, 0, 0, 0,
+        "Contradictory run claiming CONFIRMED. DIAGNOSTIC ONLY", 1, "VERIFIED", "CONFIRMED", prov_json_default, now_iso
+    ))
+    conn.execute("""
+        INSERT INTO verification_findings (
+            finding_id, verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            target_type, target_id, status, evidence_references_json, evidence_assessments_json,
+            rule_id, rule_version, explanation, limitations_json, evaluated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "vf_36h_missing_02", "run_36h_missing_02", "mission_test_36h", 1, "tenant_alpha", "workspace_prod", "plant_01",
+        "CRITERION", "crit_01", "NOT_VERIFIED", json.dumps([]), json.dumps([]),
+        "RULE_EVIDENCE_EXISTS_V1", "1.0.0", "Evidence not found", json.dumps([]), now_iso
+    ))
+
+    # 3. Run C: Contradictory indeterminate finding (stored metadata claims CONFIRMED, finding is INDETERMINATE)
+    conn.execute("""
+        INSERT INTO verification_runs (
+            verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            schema_version, verification_scope, status, trigger_type, requested_by, rule_set_version,
+            started_at, completed_at, target_count, verified_count, unverified_count,
+            indeterminate_count, blocked_count, failed_count, summary, is_diagnostic,
+            diagnostic_status, diagnostic_outcome, provenance_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "run_36h_indet_03", "mission_test_36h", 1, "tenant_alpha", "workspace_prod", "plant_01",
+        "3.0.0", "FULL_MISSION", "NOT_VERIFIED", "MANUAL", "user_adversarial", "1.0.0",
+        now_iso, now_iso, 1, 0, 0, 1, 0, 0,
+        "Contradictory run claiming CONFIRMED. DIAGNOSTIC ONLY", 1, "VERIFIED", "CONFIRMED", prov_json_default, now_iso
+    ))
+    conn.execute("""
+        INSERT INTO verification_findings (
+            finding_id, verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            target_type, target_id, status, evidence_references_json, evidence_assessments_json,
+            rule_id, rule_version, explanation, limitations_json, evaluated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "vf_36h_indet_03", "run_36h_indet_03", "mission_test_36h", 1, "tenant_alpha", "workspace_prod", "plant_01",
+        "CRITERION", "crit_01", "INDETERMINATE", json.dumps([]), json.dumps([]),
+        "RULE_EVIDENCE_EXISTS_V1", "1.0.0", "Ambiguous evidence", json.dumps([]), now_iso
+    ))
+
+    # 4. Run D: Contradictory mixed-rule record (diagnostic + authoritative rules, stored claims CONFIRMED)
+    conn.execute("""
+        INSERT INTO verification_runs (
+            verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            schema_version, verification_scope, status, trigger_type, requested_by, rule_set_version,
+            started_at, completed_at, target_count, verified_count, unverified_count,
+            indeterminate_count, blocked_count, failed_count, summary, is_diagnostic,
+            diagnostic_status, diagnostic_outcome, provenance_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "run_36h_mixed_04", "mission_test_36h", 1, "tenant_alpha", "workspace_prod", "plant_01",
+        "3.0.0", "FULL_MISSION", "NOT_VERIFIED", "MANUAL", "user_adversarial", "1.0.0",
+        now_iso, now_iso, 2, 2, 0, 0, 0, 0,
+        "Mixed rules claiming CONFIRMED. DIAGNOSTIC ONLY", 1, "VERIFIED", "CONFIRMED", prov_json_default, now_iso
+    ))
+    conn.execute("""
+        INSERT INTO verification_findings (
+            finding_id, verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            target_type, target_id, status, evidence_references_json, evidence_assessments_json,
+            rule_id, rule_version, explanation, limitations_json, evaluated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "vf_36h_mixed_04a", "run_36h_mixed_04", "mission_test_36h", 1, "tenant_alpha", "workspace_prod", "plant_01",
+        "CRITERION", "crit_01", "VERIFIED", json.dumps(["ev_1"]), json.dumps([]),
+        "RULE_EVIDENCE_EXISTS_V1", "1.0.0", "Existence pass", json.dumps([]), now_iso
+    ))
+    conn.execute("""
+        INSERT INTO verification_findings (
+            finding_id, verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            target_type, target_id, status, evidence_references_json, evidence_assessments_json,
+            rule_id, rule_version, explanation, limitations_json, evaluated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "vf_36h_mixed_04b", "run_36h_mixed_04", "mission_test_36h", 1, "tenant_alpha", "workspace_prod", "plant_01",
+        "CRITERION", "crit_02", "VERIFIED", json.dumps(["ev_2"]), json.dumps([]),
+        "RULE_EVIDENCE_VALIDATED_V1", "1.0.0", "Authoritative rule pass", json.dumps([]), now_iso
+    ))
+
+    # 5. Run E: Zero findings with prepopulated CONFIRMED
+    conn.execute("""
+        INSERT INTO verification_runs (
+            verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            schema_version, verification_scope, status, trigger_type, requested_by, rule_set_version,
+            started_at, completed_at, target_count, verified_count, unverified_count,
+            indeterminate_count, blocked_count, failed_count, summary, is_diagnostic,
+            diagnostic_status, diagnostic_outcome, provenance_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "run_36h_nofindings_05", "mission_test_36h", 1, "tenant_alpha", "workspace_prod", "plant_01",
+        "3.0.0", "FULL_MISSION", "NOT_VERIFIED", "MANUAL", "user_adversarial", "1.0.0",
+        now_iso, now_iso, 1, 0, 0, 0, 0, 0,
+        "Zero findings claiming CONFIRMED. DIAGNOSTIC ONLY", 1, "VERIFIED", "CONFIRMED", prov_json_default, now_iso
+    ))
+
+    # 6. Run F: Consistent success (all findings VERIFIED under RULE_EVIDENCE_EXISTS_V1)
+    conn.execute("""
+        INSERT INTO verification_runs (
+            verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            schema_version, verification_scope, status, trigger_type, requested_by, rule_set_version,
+            started_at, completed_at, target_count, verified_count, unverified_count,
+            indeterminate_count, blocked_count, failed_count, summary, is_diagnostic,
+            diagnostic_status, diagnostic_outcome, provenance_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "run_36h_success_06", "mission_test_36h", 1, "tenant_alpha", "workspace_prod", "plant_01",
+        "3.0.0", "FULL_MISSION", "NOT_VERIFIED", "MANUAL", "user_legit", "1.0.0",
+        now_iso, now_iso, 1, 1, 0, 0, 0, 0,
+        "Legitimate diagnostic check. DIAGNOSTIC ONLY", 1, "VERIFIED", "CONFIRMED", prov_json_default, now_iso
+    ))
+    conn.execute("""
+        INSERT INTO verification_findings (
+            finding_id, verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            target_type, target_id, status, evidence_references_json, evidence_assessments_json,
+            rule_id, rule_version, explanation, limitations_json, evaluated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "vf_36h_success_06", "run_36h_success_06", "mission_test_36h", 1, "tenant_alpha", "workspace_prod", "plant_01",
+        "CRITERION", "crit_01", "VERIFIED", json.dumps(["ev_1"]), json.dumps([]),
+        "RULE_EVIDENCE_EXISTS_V1", "1.0.0", "Evidence confirmed present", json.dumps([]), now_iso
+    ))
+
+    # 7. Run H: Legitimate authoritative run (status=VERIFIED, authoritative rule, is_diagnostic=0)
+    conn.execute("""
+        INSERT INTO verification_runs (
+            verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            schema_version, verification_scope, status, trigger_type, requested_by, rule_set_version,
+            started_at, completed_at, target_count, verified_count, unverified_count,
+            indeterminate_count, blocked_count, failed_count, summary, is_diagnostic,
+            diagnostic_status, diagnostic_outcome, provenance_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "run_36h_auth_07", "mission_test_36h", 1, "tenant_alpha", "workspace_prod", "plant_01",
+        "3.0.0", "FULL_MISSION", "VERIFIED", "MANUAL", "user_authoritative", "1.0.0",
+        now_iso, now_iso, 1, 1, 0, 0, 0, 0,
+        "Authoritative verification of mission compliance", 0, None, None, prov_json_default, now_iso
+    ))
+    conn.execute("""
+        INSERT INTO verification_findings (
+            finding_id, verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            target_type, target_id, status, evidence_references_json, evidence_assessments_json,
+            rule_id, rule_version, explanation, limitations_json, evaluated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "vf_36h_auth_07", "run_36h_auth_07", "mission_test_36h", 1, "tenant_alpha", "workspace_prod", "plant_01",
+        "CRITERION", "crit_01", "VERIFIED", json.dumps(["ev_auth"]), json.dumps([]),
+        "RULE_EVIDENCE_VALIDATED_V1", "1.0.0", "Authoritative verification passed", json.dumps([]), now_iso
+    ))
+
+    # 8. Run I: Cross-scope tenant_beta run
+    conn.execute("""
+        INSERT INTO verification_runs (
+            verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            schema_version, verification_scope, status, trigger_type, requested_by, rule_set_version,
+            started_at, completed_at, target_count, verified_count, unverified_count,
+            indeterminate_count, blocked_count, failed_count, summary, is_diagnostic,
+            diagnostic_status, diagnostic_outcome, provenance_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "run_36h_beta_08", "mission_test_36h", 1, "tenant_beta", "workspace_beta", "plant_02",
+        "3.0.0", "FULL_MISSION", "BLOCKED", "MANUAL", "user_beta", "1.0.0",
+        now_iso, now_iso, 1, 0, 0, 0, 1, 0,
+        "Beta diagnostic check. DIAGNOSTIC ONLY", 1, "BLOCKED", "BLOCKED", prov_json_default, now_iso
+    ))
+    conn.execute("""
+        INSERT INTO verification_findings (
+            finding_id, verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            target_type, target_id, status, evidence_references_json, evidence_assessments_json,
+            rule_id, rule_version, explanation, limitations_json, evaluated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "vf_36h_beta_08", "run_36h_beta_08", "mission_test_36h", 1, "tenant_beta", "workspace_beta", "plant_02",
+        "CRITERION", "crit_01", "BLOCKED", json.dumps([]), json.dumps([]),
+        "RULE_EVIDENCE_EXISTS_V1", "1.0.0", "Beta blocked scope", json.dumps([]), now_iso
+    ))
+
+    # 9. Run K: Contradictory FAILED finding (stored metadata claims CONFIRMED, finding is FAILED)
+    conn.execute("""
+        INSERT INTO verification_runs (
+            verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            schema_version, verification_scope, status, trigger_type, requested_by, rule_set_version,
+            started_at, completed_at, target_count, verified_count, unverified_count,
+            indeterminate_count, blocked_count, failed_count, summary, is_diagnostic,
+            diagnostic_status, diagnostic_outcome, provenance_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "run_36h_failed_09", "mission_test_36h", 1, "tenant_alpha", "workspace_prod", "plant_01",
+        "3.0.0", "FULL_MISSION", "NOT_VERIFIED", "MANUAL", "user_adversarial", "1.0.0",
+        now_iso, now_iso, 1, 0, 0, 0, 0, 1,
+        "Contradictory failed run claiming CONFIRMED. DIAGNOSTIC ONLY", 1, "VERIFIED", "CONFIRMED", prov_json_default, now_iso
+    ))
+    conn.execute("""
+        INSERT INTO verification_findings (
+            finding_id, verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            target_type, target_id, status, evidence_references_json, evidence_assessments_json,
+            rule_id, rule_version, explanation, limitations_json, evaluated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "vf_36h_failed_09", "run_36h_failed_09", "mission_test_36h", 1, "tenant_alpha", "workspace_prod", "plant_01",
+        "CRITERION", "crit_01", "FAILED", json.dumps([]), json.dumps([]),
+        "RULE_EVIDENCE_EXISTS_V1", "1.0.0", "Evidence check explicitly failed", json.dumps([]), now_iso
+    ))
+
+    # 10. Run L: Contradictory CONFLICTING finding (stored metadata claims CONFIRMED, finding is CONFLICTING)
+    conn.execute("""
+        INSERT INTO verification_runs (
+            verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            schema_version, verification_scope, status, trigger_type, requested_by, rule_set_version,
+            started_at, completed_at, target_count, verified_count, unverified_count,
+            indeterminate_count, blocked_count, failed_count, summary, is_diagnostic,
+            diagnostic_status, diagnostic_outcome, provenance_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "run_36h_conflict_10", "mission_test_36h", 1, "tenant_alpha", "workspace_prod", "plant_01",
+        "3.0.0", "FULL_MISSION", "NOT_VERIFIED", "MANUAL", "user_adversarial", "1.0.0",
+        now_iso, now_iso, 1, 0, 0, 0, 0, 0,
+        "Contradictory conflicting run claiming CONFIRMED. DIAGNOSTIC ONLY", 1, "VERIFIED", "CONFIRMED", prov_json_default, now_iso
+    ))
+    conn.execute("""
+        INSERT INTO verification_findings (
+            finding_id, verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            target_type, target_id, status, evidence_references_json, evidence_assessments_json,
+            rule_id, rule_version, explanation, limitations_json, evaluated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "vf_36h_conflict_10", "run_36h_conflict_10", "mission_test_36h", 1, "tenant_alpha", "workspace_prod", "plant_01",
+        "CRITERION", "crit_01", "CONFLICTING", json.dumps([]), json.dumps([]),
+        "RULE_EVIDENCE_EXISTS_V1", "1.0.0", "Conflicting evidence findings", json.dumps([]), now_iso
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+@pytest.fixture
+def prompt36h_repo():
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        db_path = f.name
+    _create_prompt36h_test_database(db_path)
+    repo = VerificationRepository(db_path=db_path)
+    yield repo
+    try:
+        os.remove(db_path)
+        for ext in ["-wal", "-shm"]:
+            p = db_path + ext
+            if os.path.exists(p):
+                os.remove(p)
+    except Exception:
+        pass
+
+
+def test_prompt36h_test_a_contradictory_blocked_finding(prompt36h_repo):
+    """
+    Test A — Contradictory blocked finding:
+    - Stored metadata claims diagnostic_status=VERIFIED, diagnostic_outcome=CONFIRMED.
+    - Persisted diagnostic finding is actually BLOCKED.
+    - Findings-driven reconciliation MUST override stored metadata and recompute as BLOCKED.
+    - Run-level status must be BLOCKED (never VERIFIED).
+    """
+    repo = prompt36h_repo
+    run = repo.get_run("tenant_alpha", "workspace_prod", "mission_test_36h", "run_36h_blocked_01")
+    assert run is not None
+    assert run.is_diagnostic is True
+    assert run.status == VerificationStatus.BLOCKED
+    assert run.diagnostic_status == VerificationStatus.BLOCKED
+    assert run.diagnostic_outcome == "BLOCKED"
+    assert run.diagnostic_outcome != "CONFIRMED"
+
+    summaries, _ = repo.list_runs("tenant_alpha", "workspace_prod", "mission_test_36h")
+    sum_entry = [s for s in summaries if s.verification_id == "run_36h_blocked_01"][0]
+    assert sum_entry.is_diagnostic is True
+    assert sum_entry.status == VerificationStatus.BLOCKED
+    assert sum_entry.diagnostic_status == VerificationStatus.BLOCKED
+    assert sum_entry.diagnostic_outcome == "BLOCKED"
+
+
+def test_prompt36h_test_b_contradictory_missing_finding(prompt36h_repo):
+    """
+    Test B — Contradictory missing finding:
+    - Stored metadata claims diagnostic_status=VERIFIED, diagnostic_outcome=CONFIRMED.
+    - Persisted finding is NOT_VERIFIED.
+    - Findings-driven reconciliation MUST override stored metadata and recompute as NOT_VERIFIED / NOT_FOUND.
+    - Run-level status remains NOT_VERIFIED (never VERIFIED).
+    """
+    repo = prompt36h_repo
+    run = repo.get_run("tenant_alpha", "workspace_prod", "mission_test_36h", "run_36h_missing_02")
+    assert run is not None
+    assert run.is_diagnostic is True
+    assert run.status == VerificationStatus.NOT_VERIFIED
+    assert run.diagnostic_status == VerificationStatus.NOT_VERIFIED
+    assert run.diagnostic_outcome == "NOT_FOUND"
+    assert run.diagnostic_outcome != "CONFIRMED"
+
+    summaries, _ = repo.list_runs("tenant_alpha", "workspace_prod", "mission_test_36h")
+    sum_entry = [s for s in summaries if s.verification_id == "run_36h_missing_02"][0]
+    assert sum_entry.is_diagnostic is True
+    assert sum_entry.status == VerificationStatus.NOT_VERIFIED
+    assert sum_entry.diagnostic_status == VerificationStatus.NOT_VERIFIED
+    assert sum_entry.diagnostic_outcome == "NOT_FOUND"
+
+
+def test_prompt36h_test_c_contradictory_indeterminate_finding(prompt36h_repo):
+    """
+    Test C — Contradictory indeterminate finding:
+    - Stored metadata claims diagnostic_status=VERIFIED, diagnostic_outcome=CONFIRMED.
+    - Persisted finding is INDETERMINATE.
+    - Recomputed as INDETERMINATE / INDETERMINATE; never CONFIRMED.
+    """
+    repo = prompt36h_repo
+    run = repo.get_run("tenant_alpha", "workspace_prod", "mission_test_36h", "run_36h_indet_03")
+    assert run is not None
+    assert run.is_diagnostic is True
+    assert run.status == VerificationStatus.INDETERMINATE
+    assert run.diagnostic_status == VerificationStatus.INDETERMINATE
+    assert run.diagnostic_outcome == "INDETERMINATE"
+    assert run.diagnostic_outcome != "CONFIRMED"
+
+    summaries, _ = repo.list_runs("tenant_alpha", "workspace_prod", "mission_test_36h")
+    sum_entry = [s for s in summaries if s.verification_id == "run_36h_indet_03"][0]
+    assert sum_entry.is_diagnostic is True
+    assert sum_entry.status == VerificationStatus.INDETERMINATE
+    assert sum_entry.diagnostic_status == VerificationStatus.INDETERMINATE
+    assert sum_entry.diagnostic_outcome == "INDETERMINATE"
+
+
+def test_prompt36h_test_d_contradictory_mixed_rule_record(prompt36h_repo):
+    """
+    Test D — Contradictory mixed-rule record:
+    - Diagnostic (RULE_EVIDENCE_EXISTS_V1) and authoritative (RULE_EVIDENCE_VALIDATED_V1)
+      rules are mixed in persisted findings.
+    - Stored metadata claims CONFIRMED.
+    - Safe fail-closed semantics: return NOT_VERIFIED, INDETERMINATE, INCONSISTENT_RULES.
+    - Never reinterprets ambiguous evidence as confirmation.
+    """
+    repo = prompt36h_repo
+    run = repo.get_run("tenant_alpha", "workspace_prod", "mission_test_36h", "run_36h_mixed_04")
+    assert run is not None
+    assert run.is_diagnostic is True
+    assert run.status == VerificationStatus.NOT_VERIFIED
+    assert run.diagnostic_status == VerificationStatus.INDETERMINATE
+    assert run.diagnostic_outcome == "INCONSISTENT_RULES"
+    assert run.diagnostic_outcome != "CONFIRMED"
+
+    summaries, _ = repo.list_runs("tenant_alpha", "workspace_prod", "mission_test_36h")
+    sum_entry = [s for s in summaries if s.verification_id == "run_36h_mixed_04"][0]
+    assert sum_entry.is_diagnostic is True
+    assert sum_entry.status == VerificationStatus.NOT_VERIFIED
+    assert sum_entry.diagnostic_status == VerificationStatus.INDETERMINATE
+    assert sum_entry.diagnostic_outcome == "INCONSISTENT_RULES"
+
+
+def test_prompt36h_test_e_zero_findings_fail_closed(prompt36h_repo):
+    """
+    Test E — Zero findings fail-closed:
+    - Diagnostic run has prepopulated VERIFIED / CONFIRMED fields but no persisted findings.
+    - Fails closed to NOT_VERIFIED, INDETERMINATE, AMBIGUOUS_NO_FINDINGS.
+    - Never confirms without evidence findings.
+    """
+    repo = prompt36h_repo
+    run = repo.get_run("tenant_alpha", "workspace_prod", "mission_test_36h", "run_36h_nofindings_05")
+    assert run is not None
+    assert run.is_diagnostic is True
+    assert run.status == VerificationStatus.NOT_VERIFIED
+    assert run.diagnostic_status == VerificationStatus.INDETERMINATE
+    assert run.diagnostic_outcome == "AMBIGUOUS_NO_FINDINGS"
+    assert run.diagnostic_outcome != "CONFIRMED"
+
+    summaries, _ = repo.list_runs("tenant_alpha", "workspace_prod", "mission_test_36h")
+    sum_entry = [s for s in summaries if s.verification_id == "run_36h_nofindings_05"][0]
+    assert sum_entry.is_diagnostic is True
+    assert sum_entry.status == VerificationStatus.NOT_VERIFIED
+    assert sum_entry.diagnostic_status == VerificationStatus.INDETERMINATE
+    assert sum_entry.diagnostic_outcome == "AMBIGUOUS_NO_FINDINGS"
+
+
+def test_prompt36h_test_f_consistent_success(prompt36h_repo):
+    """
+    Test F — Consistent success:
+    - All relevant diagnostic findings are VERIFIED under RULE_EVIDENCE_EXISTS_V1.
+    - Result remains diagnostic_status=VERIFIED, diagnostic_outcome=CONFIRMED.
+    - Run-level status remains NOT_VERIFIED (never implies authoritative completion).
+    """
+    repo = prompt36h_repo
+    run = repo.get_run("tenant_alpha", "workspace_prod", "mission_test_36h", "run_36h_success_06")
+    assert run is not None
+    assert run.is_diagnostic is True
+    assert run.status == VerificationStatus.NOT_VERIFIED
+    assert run.diagnostic_status == VerificationStatus.VERIFIED
+    assert run.diagnostic_outcome == "CONFIRMED"
+
+    summaries, _ = repo.list_runs("tenant_alpha", "workspace_prod", "mission_test_36h")
+    sum_entry = [s for s in summaries if s.verification_id == "run_36h_success_06"][0]
+    assert sum_entry.is_diagnostic is True
+    assert sum_entry.status == VerificationStatus.NOT_VERIFIED
+    assert sum_entry.diagnostic_status == VerificationStatus.VERIFIED
+    assert sum_entry.diagnostic_outcome == "CONFIRMED"
+
+
+def test_prompt36h_test_g_read_path_parity(prompt36h_repo):
+    """
+    Test G — Read-path parity:
+    - get_run() and list_runs() must agree on all diagnostic fields for every adversarial case.
+    """
+    repo = prompt36h_repo
+    summaries, total = repo.list_runs("tenant_alpha", "workspace_prod", "mission_test_36h")
+    assert total >= 8
+
+    for s in summaries:
+        full_run = repo.get_run("tenant_alpha", "workspace_prod", "mission_test_36h", s.verification_id)
+        assert full_run is not None
+        assert full_run.is_diagnostic == s.is_diagnostic
+        assert full_run.status == s.status
+        assert full_run.diagnostic_status == s.diagnostic_status
+        assert full_run.diagnostic_outcome == s.diagnostic_outcome
+
+
+def test_prompt36h_test_h_authoritative_preservation(prompt36h_repo):
+    """
+    Test H — Authoritative preservation:
+    - Legitimate authoritative runs remain VERIFIED with authoritative rules.
+    - Must NOT be reclassified as diagnostic merely because findings are VERIFIED.
+    """
+    repo = prompt36h_repo
+    run = repo.get_run("tenant_alpha", "workspace_prod", "mission_test_36h", "run_36h_auth_07")
+    assert run is not None
+    assert run.is_diagnostic is False
+    assert run.status == VerificationStatus.VERIFIED
+    assert run.diagnostic_status is None
+    assert run.diagnostic_outcome is None
+
+    summaries, _ = repo.list_runs("tenant_alpha", "workspace_prod", "mission_test_36h")
+    sum_entry = [s for s in summaries if s.verification_id == "run_36h_auth_07"][0]
+    assert sum_entry.is_diagnostic is False
+    assert sum_entry.status == VerificationStatus.VERIFIED
+    assert sum_entry.diagnostic_status is None
+    assert sum_entry.diagnostic_outcome is None
+
+
+def test_prompt36h_test_i_scope_isolation(prompt36h_repo):
+    """
+    Test I — Scope isolation:
+    - Findings from tenant_beta cannot influence tenant_alpha queries.
+    - Neither list_runs nor get_run allows cross-tenant findings or runs to leak.
+    """
+    repo = prompt36h_repo
+    summaries_alpha, _ = repo.list_runs("tenant_alpha", "workspace_prod", "mission_test_36h")
+    v_ids = [s.verification_id for s in summaries_alpha]
+    assert "run_36h_beta_08" not in v_ids
+
+    # Unauthorized access to beta run under alpha tenant returns None
+    leak = repo.get_run("tenant_alpha", "workspace_prod", "mission_test_36h", "run_36h_beta_08")
+    assert leak is None
+
+    # Querying tenant_beta returns only beta
+    summaries_beta, total_beta = repo.list_runs("tenant_beta", "workspace_beta", "mission_test_36h")
+    assert total_beta == 1
+    assert summaries_beta[0].verification_id == "run_36h_beta_08"
+
+
+def test_prompt36h_test_j_deterministic_repeated_reads_no_mutation(prompt36h_repo):
+    """
+    Test J — Deterministic repeated reads and zero read-side mutation:
+    - Repeated reads return identical results.
+    - Zero updates or inserts to historical verification_runs or audit ledger during reads.
+    """
+    repo = prompt36h_repo
+
+    with repo._get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM verification_runs")
+        initial_run_count = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM verification_audit_ledger")
+        initial_audit_count = cursor.fetchone()[0]
+
+    # Perform repeated reads
+    for _ in range(5):
+        run = repo.get_run("tenant_alpha", "workspace_prod", "mission_test_36h", "run_36h_blocked_01")
+        assert run.status == VerificationStatus.BLOCKED
+        assert run.diagnostic_status == VerificationStatus.BLOCKED
+
+        summaries, _ = repo.list_runs("tenant_alpha", "workspace_prod", "mission_test_36h")
+        assert len(summaries) >= 8
+
+    # Verify no rows were added to verification_runs or verification_audit_ledger
+    with repo._get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM verification_runs")
+        assert cursor.fetchone()[0] == initial_run_count
+        cursor.execute("SELECT COUNT(*) FROM verification_audit_ledger")
+        assert cursor.fetchone()[0] == initial_audit_count
+
+
+def test_prompt36h_contradictory_failed_and_conflicting(prompt36h_repo):
+    """
+    Tests handling of contradictory FAILED and CONFLICTING findings when stored
+    metadata claimed CONFIRMED.
+    """
+    repo = prompt36h_repo
+    # Failed finding
+    run_f = repo.get_run("tenant_alpha", "workspace_prod", "mission_test_36h", "run_36h_failed_09")
+    assert run_f.is_diagnostic is True
+    assert run_f.status == VerificationStatus.FAILED
+    assert run_f.diagnostic_status == VerificationStatus.FAILED
+    assert run_f.diagnostic_outcome == "FAILED"
+
+    # Conflicting finding
+    run_c = repo.get_run("tenant_alpha", "workspace_prod", "mission_test_36h", "run_36h_conflict_10")
+    assert run_c.is_diagnostic is True
+    assert run_c.status == VerificationStatus.CONFLICTING
+    assert run_c.diagnostic_status == VerificationStatus.CONFLICTING
+    assert run_c.diagnostic_outcome == "CONFLICTING"
+
+
+
 

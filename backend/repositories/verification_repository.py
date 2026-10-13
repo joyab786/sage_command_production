@@ -331,9 +331,8 @@ class VerificationRepository:
                 new_diag_status = VerificationStatus.INDETERMINATE
                 new_diag_outcome = "AMBIGUOUS_NO_FINDINGS"
             elif is_ambiguous and "RULE_EVIDENCE_EXISTS_V1" in rule_ids:
-                run_st, diag_st, diag_out = compute_diagnostic_run_fields(finding_statuses, target_count)
-                new_run_status = run_st
-                new_diag_status = diag_st
+                new_run_status = VerificationStatus.NOT_VERIFIED
+                new_diag_status = VerificationStatus.INDETERMINATE
                 new_diag_outcome = "INCONSISTENT_RULES"
             elif is_ambiguous:
                 new_run_status = VerificationStatus.NOT_VERIFIED
@@ -664,33 +663,6 @@ class VerificationRepository:
                 conn.rollback()
                 raise
 
-    def get_run(
-        self,
-        tenant_id: str,
-        workspace_id: str,
-        mission_id: str,
-        verification_id: str,
-    ) -> Optional[VerificationRun]:
-        """
-        Retrieves a verification run by ID scoped to tenant, workspace, and mission.
-        Returns None if not found or unauthorized.
-        """
-        with self._lock, self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                SELECT * FROM verification_runs
-                WHERE tenant_id = ? AND workspace_id = ? AND mission_id = ? AND verification_id = ?
-                """,
-                (tenant_id, workspace_id, mission_id, verification_id),
-            )
-            row = cursor.fetchone()
-            if not row:
-                return None
-
-            findings = self.get_findings(tenant_id, workspace_id, mission_id, verification_id)
-            prov_data = json.loads(row["provenance_json"])
-
     @staticmethod
     def _normalize_diagnostic_run_fields(
         is_diagnostic: bool,
@@ -703,43 +675,58 @@ class VerificationRepository:
         target_count: int,
     ) -> Tuple[bool, VerificationStatus, Optional[VerificationStatus], Optional[str]]:
         """
-        Prompt 36G — Canonical Read-Time Diagnostic Normalization:
-        Enforces that diagnostic status and outcome are NEVER fabricated from missing fields.
+        Prompt 36H — Findings-Driven Diagnostic Reconciliation & Fail-Closed Read Integrity:
+        For every diagnostic verification run, the authoritative diagnostic result is derived
+        deterministically from actual persisted findings. Existing summary metadata or stored
+        fields MUST NEVER override contradictory findings.
 
-        - Diagnostic classification != Diagnostic outcome.
-        - If the run is not diagnostic, preserves authoritative status and keeps diagnostic fields None.
-        - If the run is diagnostic, recomputes diagnostic fields using compute_diagnostic_run_fields
-          whenever status is VERIFIED, diagnostic_status is missing, or diagnostic_outcome is missing.
-        - Missing findings fail closed to (NOT_VERIFIED, INDETERMINATE, 'AMBIGUOUS_NO_FINDINGS').
-        - Run-level status for diagnostic runs can NEVER be VERIFIED.
+        1. Determine diagnostic classification:
+           - is_diagnostic flag is True
+           - OR findings evaluate RULE_EVIDENCE_EXISTS_V1
+           - OR summary carries diagnostic markers ('DIAGNOSTIC ONLY' or 'EVIDENCE_EXISTS')
+           - OR stored diagnostic_status or diagnostic_outcome is present
+        2. Non-diagnostic (authoritative) runs:
+           - Preserves status (including VERIFIED)
+           - Keeps diagnostic fields None
+        3. Diagnostic runs:
+           - Zero findings: fails closed to (NOT_VERIFIED, INDETERMINATE, 'NO_TARGETS' if target_count == 0 else 'AMBIGUOUS_NO_FINDINGS')
+           - Mixed or unrecognized rule sets (e.g. RULE_EVIDENCE_EXISTS_V1 mixed with authoritative rules):
+             fails closed to (NOT_VERIFIED, INDETERMINATE, 'INCONSISTENT_RULES')
+           - Consistent diagnostic evaluation (only RULE_EVIDENCE_EXISTS_V1):
+             recomputes via compute_diagnostic_run_fields(finding_statuses, target_count)
+           - Permanent invariant: diagnostic run-level status can NEVER be VERIFIED.
         """
         is_diag = is_diagnostic
         # A legacy run is diagnostic if its findings use diagnostic rules or its summary has diagnostic markers
+        # or it carries diagnostic metadata
         if not is_diag:
-            if "RULE_EVIDENCE_EXISTS_V1" in finding_rules or "DIAGNOSTIC ONLY" in summary or "EVIDENCE_EXISTS" in summary:
+            if (
+                "RULE_EVIDENCE_EXISTS_V1" in finding_rules
+                or "DIAGNOSTIC ONLY" in summary
+                or "EVIDENCE_EXISTS" in summary
+                or diagnostic_status is not None
+                or diagnostic_outcome is not None
+            ):
                 is_diag = True
 
         if not is_diag:
             return False, status, None, None
 
-        # Run is diagnostic:
-        needs_recompute = (
-            status == VerificationStatus.VERIFIED
-            or diagnostic_status is None
-            or diagnostic_outcome is None
-        )
-
-        if needs_recompute:
-            run_st, diag_st, diag_out = compute_diagnostic_run_fields(finding_statuses, target_count)
-            # Permanent invariant: diagnostic run-level status can NEVER be VERIFIED
-            if run_st == VerificationStatus.VERIFIED:
-                run_st = VerificationStatus.NOT_VERIFIED
+        # Identified diagnostic run: ALWAYS reconcile against persisted findings.
+        # Stored diagnostic_status or diagnostic_outcome must NEVER override actual findings.
+        if not finding_statuses:
+            run_st, diag_st, diag_out = compute_diagnostic_run_fields([], target_count)
             return True, run_st, diag_st, diag_out
-        else:
-            run_st = status
-            if run_st == VerificationStatus.VERIFIED:
-                run_st = VerificationStatus.NOT_VERIFIED
-            return True, run_st, diagnostic_status, diagnostic_outcome
+
+        # Mixed or unrecognized rule sets fail closed as ambiguous/inconsistent
+        if finding_rules != {"RULE_EVIDENCE_EXISTS_V1"}:
+            return True, VerificationStatus.NOT_VERIFIED, VerificationStatus.INDETERMINATE, "INCONSISTENT_RULES"
+
+        # Canonical diagnostic aggregation for consistent diagnostic evaluation
+        run_st, diag_st, diag_out = compute_diagnostic_run_fields(finding_statuses, target_count)
+        if run_st == VerificationStatus.VERIFIED:
+            run_st = VerificationStatus.NOT_VERIFIED
+        return True, run_st, diag_st, diag_out
 
     def get_run(
         self,
@@ -872,9 +859,9 @@ class VerificationRepository:
                 cursor.execute(f"""
                     SELECT verification_id, rule_id, status
                     FROM verification_findings
-                    WHERE tenant_id = ? AND workspace_id = ? AND verification_id IN ({placeholders})
+                    WHERE tenant_id = ? AND workspace_id = ? AND mission_id = ? AND verification_id IN ({placeholders})
                     ORDER BY finding_id ASC
-                """, [tenant_id, workspace_id, *v_ids])
+                """, [tenant_id, workspace_id, mission_id, *v_ids])
                 for fr in cursor.fetchall():
                     findings_by_vid[fr["verification_id"]].append(fr)
 
