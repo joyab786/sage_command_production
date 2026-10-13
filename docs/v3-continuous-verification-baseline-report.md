@@ -292,7 +292,43 @@ Prompt 36F eliminated the backward-compatibility vulnerability where SQLite veri
 
 ---
 
-## 11. Known Limitations
+## 11. Prompt 36G — Diagnostic Summary Fallback Must Never Fabricate Confirmation
+
+Prompt 36G resolved the unsafe summary fallback in `VerificationRepository.list_runs()` where missing diagnostic metadata previously caused `VerificationRunSummary` to fabricate positive confirmation:
+
+### A. Defect Analysis & Corrective Actions
+- **Issue:** Review of Prompt 36F identified that `VerificationRepository.list_runs()` defaulted `diag_stat = VerificationStatus.VERIFIED` and `diag_out = "CONFIRMED"` whenever a diagnostic run had `NULL` in its diagnostic columns, without inspecting its findings.
+- **Permanent Invariant:** **A missing diagnostic result is unknown—not confirmed.** The summary fallback must never invent a positive diagnostic result.
+- **Correction:**
+  - Added bounded, tenant-isolated batch retrieval of findings in `VerificationRepository.list_runs()` (`WHERE tenant_id = ? AND workspace_id = ? AND verification_id IN (...)`).
+  - Implemented `VerificationRepository._normalize_diagnostic_run_fields()` delegating directly to `compute_diagnostic_run_fields(finding_statuses, target_count)` from `backend/data/schemas/verification_contract.py`.
+  - Reused identical normalization in both `get_run()` and `list_runs()`, guaranteeing full-run and summary agreement.
+  - Guaranteed that missing findings fail closed to `status = NOT_VERIFIED`, `diagnostic_status = INDETERMINATE`, and `diagnostic_outcome = 'AMBIGUOUS_NO_FINDINGS'`.
+  - Preserved legitimate authoritative runs (`is_diagnostic = False`) with `status = VERIFIED` and diagnostic fields unset.
+
+### B. Verified Test Metrics (Prompt 36G)
+- **Continuous Verification Suite (`backend/test_v3_continuous_verification.py`):** **117 passed, 0 failed** in 10.46s (10 dedicated adversarial Prompt 36G tests: Tests A–J).
+  - Test A: Proved legacy successful diagnostic runs with missing metadata compute `status = NOT_VERIFIED`, `diagnostic_status = VERIFIED`, and `outcome = CONFIRMED`, with complete agreement between summary and full-run retrieval.
+  - Test B: Proved legacy blocked diagnostic runs evaluate to `status = BLOCKED`, `diagnostic_status = BLOCKED`, and `outcome = BLOCKED`; never reported as `CONFIRMED`.
+  - Test C: Proved legacy missing evidence evaluates to `status = NOT_VERIFIED`, `diagnostic_status = NOT_VERIFIED`, and `outcome = NOT_FOUND`; never reported as `CONFIRMED`.
+  - Test D: Proved legacy indeterminate evidence evaluates to `status = INDETERMINATE`, `diagnostic_status = INDETERMINATE`, and `outcome = INDETERMINATE`.
+  - Test E: Proved diagnostic runs with no findings fail closed to `status = NOT_VERIFIED`, `diagnostic_status = INDETERMINATE`, and `outcome = AMBIGUOUS_NO_FINDINGS`; no positive result fabricated.
+  - Test F: Proved partial metadata (missing status, missing outcome, or persisted `VERIFIED`) is correctly computed from actual findings.
+  - Test G: Proved legitimate authoritative runs with no diagnostic metadata are preserved as `status = VERIFIED` with diagnostic fields `None`.
+  - Test H: Proved cross-scope isolation prevents summaries for one tenant/workspace from observing or consuming findings from another.
+  - Test I: Proved repeated reads and migrations are deterministic, idempotent, and cause zero duplicate audit records.
+  - Test J: Explicitly proved all 12 Prompt 36G security invariants.
+- **Mission Architecture Regression Suite (`backend/test_v3_mission_architecture.py`):** **74 passed, 0 failed** in 6.60s.
+- **Evidence Explainability Suite (`backend/test_v3_evidence_explainability.py`):** **140 passed, 0 failed** in 6.87s.
+- **Organizational Memory Suite (`backend/test_v3_organizational_memory.py`):** **83 passed, 0 failed** in 8.65s.
+- **Root Cause Analysis Suite (`backend/test_v3_root_cause_analysis.py`):** **30 passed, 0 failed** in 6.21s.
+- **Incident Management Suite (`backend/test_v3_incident_management.py`):** **56 passed, 0 failed** in 10.91s.
+- **Confidence Uncertainty & Authorization Suite (`backend/test_v3_confidence_uncertainty.py`, `backend/test_v3_authorization.py`):** **171 passed, 0 failed** in 7.64s.
+- **Combined Prompt 36G Verification Test Count:** **671 passed, 0 failed, 0 skipped** across all executed suites.
+
+---
+
+## 12. Known Limitations
 
 1. **Synchronous Polling vs. Event-Driven Push**: Evidence evaluation is performed on demand during a verification request. Streaming continuous re-evaluation upon telemetry event emission is architecturally prepared but scheduled for Prompt 37.
 2. **Deterministic Rules Bound**: The current rule registry implements 8 explicit deterministic rule types. Non-deterministic probabilistic models are intentionally not permitted to decide verification outcomes.
@@ -303,9 +339,9 @@ Prompt 36F eliminated the backward-compatibility vulnerability where SQLite veri
 
 ---
 
-## 12. Explicitly Deferred Capabilities
+## 13. Explicitly Deferred Capabilities
 
-The following capabilities are explicitly deferred from Prompts 36, 36A, 36B, 36C, 36D, 36E & 36F:
+The following capabilities are explicitly deferred from Prompts 36, 36A, 36B, 36C, 36D, 36E, 36F & 36G:
 - Autonomous mission execution or dispatch.
 - Direct SCADA / PLC write commands.
 - Operational database updates or deletions.
@@ -315,7 +351,7 @@ The following capabilities are explicitly deferred from Prompts 36, 36A, 36B, 36
 
 ---
 
-## 13. Lineage and Git Lineage
+## 14. Lineage and Git Lineage
 
 - **Prompt 36 Starting Baseline:** `de6dac99df8c1285b33076eeb58d37b0656c1dcc`
 - **Prompt 36A Starting Baseline:** `663f3a491f84a97e580f575fd711d82e87f67f45`
@@ -329,6 +365,9 @@ The following capabilities are explicitly deferred from Prompts 36, 36A, 36B, 36
 - **Prompt 36E Starting Baseline:** `e3b672cd7a3d6041595d610a9f01b07fa6ed944e`
 - **Prompt 36E Implementation Commit:** `a53ccd16e34a3bfc9da3c3dbd1fcad54662b16b5`
 - **Prompt 36F Starting Baseline:** `a53ccd16e34a3bfc9da3c3dbd1fcad54662b16b5`
+- **Prompt 36F Implementation Commit:** `c6fd972317e1ffb7bfe492da96020545f88da3bd`
+- **Prompt 36F Documentation Commit:** `156ee6204bd00e45ae1a61a01d956ca1edc5cbf9`
+- **Prompt 36G Starting Baseline:** `156ee6204bd00e45ae1a61a01d956ca1edc5cbf9`
 - **Target Branch:** `main`
 - **Repository:** `joyab786/sage_command_production`
 

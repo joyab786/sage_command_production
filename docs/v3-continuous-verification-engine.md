@@ -482,12 +482,36 @@ Defensive read-compatibility logic in `VerificationRepository.get_run()` and `Ve
 
 ---
 
-## 20. Status Summary
+---
 
-- **Continuous Verification Engine**: `IMPLEMENTED` & `HARDENED (Prompts 36, 36A–36F)`
+## 20. Prevention of Fabricated Diagnostic Confirmation in Summaries (Prompt 36G)
+
+Prompt 36G eliminated the unsafe summary fallback in `VerificationRepository.list_runs()` where missing diagnostic metadata previously caused `VerificationRunSummary` to fabricate positive confirmation (`diagnostic_status=VERIFIED`, `diagnostic_outcome="CONFIRMED"`):
+
+### A. Defect Analysis & Root Cause
+- **Vulnerability:** In `VerificationRepository.list_runs()`, defensive read-fallback logic previously assigned `diag_stat = VerificationStatus.VERIFIED` and `diag_out = "CONFIRMED"` whenever a diagnostic run had `NULL` in its diagnostic columns.
+- **Security Impact:** Missing diagnostic metadata was treated as evidence of successful existence confirmation. If a legacy diagnostic run had blocked, failed, missing, or indeterminate findings (or no findings at all), listing endpoints would falsely present it as `CONFIRMED`.
+- **Permanent Invariant:** **A missing diagnostic result is unknown—not confirmed.** Summary fallbacks must never invent positive diagnostic confirmation.
+
+### B. Findings-Driven Read-Time Normalization
+- **Canonical Aggregation Reuse:** Both `list_runs()` and `get_run()` now utilize the shared static helper `VerificationRepository._normalize_diagnostic_run_fields()`, which delegates directly to `compute_diagnostic_run_fields(finding_statuses, target_count)` from `backend/data/schemas/verification_contract.py`.
+- **Tenant-Scoped Batch Query:** In `list_runs()`, findings are retrieved via a single bounded batch query strictly scoped to `tenant_id`, `workspace_id`, and the returned `verification_id IN (...)`. Cross-tenant and cross-workspace leakage is mathematically prevented while avoiding N+1 queries.
+- **Fail-Closed Missing Findings:** If a run is known to be diagnostic but has zero findings, it evaluates strictly to `status = NOT_VERIFIED`, `diagnostic_status = INDETERMINATE`, and `diagnostic_outcome = 'AMBIGUOUS_NO_FINDINGS'`. No positive confirmation is ever fabricated.
+- **Separation of Classification and Outcome:** Diagnostic classification (`is_diagnostic = True` via finding rules or summary notice) is strictly decoupled from diagnostic outcome (`CONFIRMED`, `BLOCKED`, `NOT_FOUND`, `INDETERMINATE`).
+- **Authoritative Run Preservation:** Legitimate authoritative verification runs (`is_diagnostic = False`) preserve their authoritative `status = VERIFIED` with diagnostic fields unset (`None`).
+
+### C. Unified Agreement Across Read Paths
+All retrieval paths (`get_run()`, `list_runs()`, findings endpoints, API serialization, and agent tools) produce identical, deterministic interpretations of legacy and newly created verification runs.
+
+---
+
+## 21. Status Summary
+
+- **Continuous Verification Engine**: `IMPLEMENTED` & `HARDENED (Prompts 36, 36A–36G)`
+- **Unsafe Fallback Prevention**: `IMPLEMENTED & VERIFIED` (Prompt 36G findings-based summary aggregation; zero fabricated confirmations)
+- **Unified Read Contract**: `IMPLEMENTED` (Shared `_normalize_diagnostic_run_fields()` across `get_run()` and `list_runs()`)
 - **Legacy Diagnostic Migration**: `IMPLEMENTED & VERIFIED` (Prompt 36F SQLite backfill, audit ledger preservation, idempotency verified)
 - **Model-Level Invariant Enforcement**: `IMPLEMENTED & ENFORCED` (`is_diagnostic=True` strictly forbids run-level `status=VERIFIED`)
-- **Read-Path Defense-in-Depth**: `IMPLEMENTED` (Direct in-memory normalization in `get_run()` and `list_runs()`)
 - **Machine-Readable Diagnostic Status**: `IMPLEMENTED & ENFORCED` (`run.status = NOT_VERIFIED`, `is_diagnostic = True`, `diagnostic_status = VERIFIED`)
 - **Universal Scope Enforcement**: `IMPLEMENTED & ENFORCED` across all registered rules
 - **Universal Evidence Non-Disclosure**: `IMPLEMENTED & VERIFIED` across all return paths, findings, provenance, and storage
