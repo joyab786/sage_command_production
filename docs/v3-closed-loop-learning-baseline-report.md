@@ -1,7 +1,7 @@
 # SageCommand V3 — Closed-Loop Learning Foundation Baseline & Security Audit Report
 
-**Prompt Reference:** Prompt 37 & Prompt 37A (Security Correction)  
-**Starting Baseline Git Commit:** `0f7d7e0deb3d7aaa19362fd1ff9c25ae7e21036a`  
+**Prompt Reference:** Prompt 37, Prompt 37A & Prompt 37B (Security Corrections)  
+**Starting Baseline Git Commit:** `dc39e78f49253c857a4752ff7be8623e3d3088a0`  
 **Branch:** `main`  
 **Repository:** `joyab786/sage_command_production`  
 **Local Workspace:** `E:\js\sage_command_production`  
@@ -11,14 +11,17 @@
 
 ## 1. Commit Audit Trail & Baseline Correction
 
-As required by Prompt 37A Section 14, the git commit history and audit documentation have been reconciled:
+As required by Prompt 37A Section 14 and Prompt 37B Section 8, the git commit history and audit documentation have been reconciled against actual git history:
 
-- **Original Prompt 37 Implementation Commit:** `bad6c5c4e976657c96cb6c8577a6a439207e7804` (`feat(verification): add governed closed-loop learning foundation (Prompt 37)`)  
-  *(Audit Correction Note: In the initial Prompt 37 baseline report, the implementation commit SHA was omitted and only the pre-Prompt 37 baseline `8c18e674...` was referenced. This is now explicitly corrected and recorded above.)*
+- **Original Prompt 37 Implementation Commit:** `bad6c5cc5f90f99cde5edb02f73470239a03bd94` (`feat(verification): add governed closed-loop learning foundation (Prompt 37)`)  
+  *(Audit Correction Note: In the initial Prompt 37 baseline report, the implementation commit SHA was omitted and only the pre-Prompt 37 baseline `8c18e674...` was referenced. This is now explicitly corrected and recorded above with the exact verified SHA.)*
 - **Original Prompt 37 Documentation Commit:** `0f7d7e0deb3d7aaa19362fd1ff9c25ae7e21036a` (`docs(verification): add closed-loop learning foundation architecture and baseline report (Prompt 37)`)
 - **Prompt 37A Starting Baseline:** `0f7d7e0deb3d7aaa19362fd1ff9c25ae7e21036a`
-- **Prompt 37A Dedicated Implementation Commit:** `9e13ccd46033488825c05273ba6169c9b4e54252` (`fix(security): bind closed-loop triggers to trusted scope (Prompt 37A)`)
-- **Prompt 37A Dedicated Documentation Commit:** Pending (`docs(security): document closed-loop scope hardening (Prompt 37A)`)
+- **Prompt 37A Dedicated Implementation Commit:** `9e13ccdb43f26bfa713a6a6658056a64a8e80edc` (`fix(security): bind closed-loop triggers to trusted scope (Prompt 37A)`)
+- **Prompt 37A Dedicated Documentation Commit:** `dc39e78f49253c857a4752ff7be8623e3d3088a0` (`docs(security): document closed-loop scope hardening (Prompt 37A)`)
+- **Prompt 37B Starting Baseline:** `dc39e78f49253c857a4752ff7be8623e3d3088a0`
+- **Prompt 37B Dedicated Implementation Commit:** `274034f992ed9a2dca8ab18b7ea2098758c5b921` (`fix(security): isolate event fingerprints and prevent duplicate cross-scope resolution (Prompt 37B)`)
+- **Prompt 37B Dedicated Documentation Commit:** `docs(security): document event fingerprint isolation and deduplication safety (Prompt 37B)`
 
 ---
 
@@ -219,3 +222,84 @@ All regression test suites specified in Prompt 37A Section 12 were executed and 
 3. **Model Weight Fine-Tuning:** Dynamic training or weight adjustment is deferred.
 4. **Autonomous Action Approval:** Human-in-the-loop governance remains mandatory for all operational actions.
 5. **LangGraph Identity Context Propagation:** Tool registration deferred until request-scoped security context is added to LangGraph `ToolNode`.
+
+---
+
+## 7. Prompt 37B Security Audit: Closed-Loop Event Fingerprint Isolation & Deduplication Safety
+
+### 7.1 Audit Trail & Baselines
+- **Starting Baseline:** `dc39e78f49253c857a4752ff7be8623e3d3088a0`
+- **Implementation Commit:** `274034f992ed9a2dca8ab18b7ea2098758c5b921` (`fix(security): isolate event fingerprints and prevent duplicate cross-scope resolution (Prompt 37B)`)
+- **Documentation Commit:** `docs(security): document event fingerprint isolation and deduplication safety (Prompt 37B)`
+- **Security Invariant:**
+  > An event fingerprint must bind all security-relevant event scope, and a duplicate lookup must never return or publish an event belonging to a different workspace or plant than the validated request. A fingerprint match alone is never proof of canonical event equivalence.
+
+### 7.2 Fingerprint Algorithm Correction (`backend/data/schemas/event_contract.py`)
+- **Canonical Structure:** Computed deterministically via `CanonicalEvent.compute_fingerprint()` over an unambiguous canonical JSON dictionary with sorted keys (`sort_keys=True`) and compact separators (`separators=(',', ':')`).
+- **Bound Fields:**
+  - `schema_version` (contract version, e.g. `"event.v1"`)
+  - `tenant_id` (tenant boundary)
+  - `workspace_id` (workspace boundary)
+  - `plant_id` (plant boundary)
+  - `category` (event category enum value)
+  - `event_type` (event type string)
+  - `occurred_at` (occurrence timestamp in ISO 8601 UTC)
+  - `provenance` (producer subsystem origin)
+  - `payload` (canonicalized JSON payload)
+- **Excluded Fields:** `event_id` (transient UUID), `event_fingerprint` (self-referential), `recorded_at` (ingest timestamp), `observed_at` (latency tracking), `severity`, `lifecycle`, `correlation_id`, `causation_id`, `references`.
+- **Legacy Fingerprint Support:** `compute_legacy_fingerprint()` retained for backward compatibility inspections only.
+
+### 7.3 Repository Deduplication & Collision Handling (`backend/services/event_repository.py`)
+- **Composite Scoped Indexing:** Added database index `idx_tenant_scope_fp` (`tenant_id`, `workspace_id`, `plant_id`, `event_fingerprint`) and `idx_tenant_ws_plant` (`tenant_id`, `workspace_id`, `plant_id`).
+- **Explicit Outcome Distinction (`record_event_ex`):**
+  1. **Newly Persisted Event:** Fresh database insert returns `(CanonicalEvent, False)`.
+  2. **Exact Legitimate Replay:** Existing row matches fingerprint AND canonical equality across tenant, workspace, plant, category, event_type, occurred_at, provenance, schema_version, and payload. Returns `(CanonicalEvent, True)`.
+  3. **Conflicting Duplicate:** Existing row matches fingerprint but differs in workspace, plant, or payload. Raises `EventIdempotencyConflictError`.
+  4. **Ambiguous Legacy Records:** Existing row lacks workspace/plant scope or was persisted under old unverified hashing. Raises `LegacyEventFingerprintError`.
+- **Fail-Closed Retrieval:** `get_event_by_scope_and_fingerprint` requires tenant, workspace, and plant match before returning a record.
+
+### 7.4 API Persistence and Publication Boundary (`backend/api/event_routes.py`)
+- **Execution Flow:**
+  1. Authenticated caller identity validation (`tenant_id`, `workspace_id`, authorized plants).
+  2. Event body scope validation against caller identity.
+  3. Deterministic fingerprint recomputation and client-fingerprint verification.
+  4. Persistence / exact replay resolution via `EventRepository.record_event_ex()`.
+  5. Post-persistence returned event scope verification against authenticated identity.
+  6. Conditional EventBus publication: Published if and only if `is_replay is False`. Exact replays return `HTTP 201` idempotently without publishing duplicate bus messages. Conflicting duplicates raise `HTTP 409 Conflict` with zero bus publication.
+
+### 7.5 Migration and Legacy-Data Strategy
+- Safe, non-destructive migration in `EventRepository._ensure_tables()`:
+  - Adds composite indices if not present.
+  - Safely reads historical rows handling NULL `workspace_id`/`plant_id` values.
+  - Does NOT delete or alter historical events.
+  - Fails closed (`LegacyEventFingerprintError`) on duplicate lookups against unverified legacy rows to prevent false event equivalence.
+
+### 7.6 Security Regression Tests (Prompt 37B Tests A–J)
+Implemented in `backend/test_v3_closed_loop_learning.py` (`TestEventFingerprintIsolationAndDeduplication`):
+- **Test A (test_50):** Same tenant, different workspace isolation — second event cannot resolve to, return, or publish Workspace A's event.
+- **Test B (test_51):** Same tenant and workspace, different plant isolation — plant scope bound into fingerprint and duplicate rejection.
+- **Test C (test_52):** Exact replay idempotency — same event re-submitted returns existing record with zero duplicate verification runs.
+- **Test D (test_53):** Modified payload with reused fingerprint rejected (`HTTP 400 Bad Request`).
+- **Test E (test_54):** Modified workspace with reused fingerprint rejected (`HTTP 400 Bad Request`).
+- **Test F (test_55):** Modified plant with reused fingerprint rejected (`HTTP 400 Bad Request`).
+- **Test G (test_56):** Repository duplicate collision raises `EventIdempotencyConflictError` without overwriting or returning existing record.
+- **Test H (test_57):** Publication boundary spy verifies exact replay publishes 0 times to `EventBus` and conflicting duplicates publish 0 times.
+- **Test I (test_58):** Legacy unverified records fail closed with `LegacyEventFingerprintError`.
+- **Test J (test_59):** Multi-tenant isolation verified — cross-tenant duplicate submissions rejected deterministically.
+
+### 7.7 Comprehensive Test Suite Matrix
+- `backend/test_v3_closed_loop_learning.py`: 59 passed (10.04s)
+- `backend/test_v3_event_model.py`: 33 passed (1.75s)
+- `backend/test_v3_event_driven_architecture.py`: 5 passed (1.34s)
+- `backend/test_v3_continuous_verification.py`: 128 passed (10.90s)
+- `backend/test_v3_mission_architecture.py`: 74 passed (6.49s)
+- `backend/test_v3_evidence_explainability.py`: 140 passed (6.77s)
+- `backend/test_v3_organizational_memory.py`: 83 passed (8.66s)
+- `backend/test_v3_root_cause_analysis.py`: 30 passed (6.19s)
+- `backend/test_v3_incident_management.py`: 56 passed (11.06s)
+- `backend/test_v3_confidence_uncertainty.py` & `backend/test_v3_authorization.py`: 171 passed (7.94s)
+- **Total:** **779 passed, 0 failed.**
+
+### 7.8 Remaining Limitations
+1. **Historical Legacy Event Backfill:** Historical events lacking workspace or plant bindings fail closed upon deduplication lookup. If replay support for legacy pre-Prompt 37B events is required, an explicit tenant-governed migration script must populate verified scope and recompute fingerprints.
+2. **LangGraph Copilot Tool Exposure:** Verification tools remain unregistered pending request-scoped identity propagation in LangGraph subagent `ToolNode`.

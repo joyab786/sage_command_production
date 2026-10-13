@@ -114,8 +114,16 @@ A core invariant of Prompt 37A is that **a valid event schema is not proof of an
 4. **Physical Plant Scoping:** If a producer is assigned to specific physical plants, the submitted `plant_id` must belong to that authorized set (`HTTP 403 Forbidden` otherwise). Wildcard `*` in assigned plants is honored only if server-authoritative.
 5. **Fail-Closed on Missing Scope:** Events with missing, empty, or manufactured scopes (`"global"`, `"unknown"`, `"default"`) return `HTTP 400 Bad Request`.
 6. **No Privilege Escalation via Payload:** Payload fields attempting to inject `user_id`, `roles`, `permissions`, or `clearance` are completely ignored and cannot grant operational authority.
-7. **Fingerprint Validation:** Client-supplied `event_fingerprint` must match `event.compute_fingerprint()`. Inconsistent fingerprints return `HTTP 400 Bad Request`.
-8. **Persistence Barrier:** Events are persisted in `EventRepository` and published to `EventBus` only after all scope and fingerprint validations succeed.
+7. **Scope-Bound Fingerprint Validation:** Client-supplied `event_fingerprint` must match `event.compute_fingerprint()`. Inconsistent fingerprints return `HTTP 400 Bad Request`.
+8. **Repository Return Scope Verification:** The API layer verifies the returned event's scope (`tenant_id`, `workspace_id`, `plant_id`) and fingerprint against the validated request before returning or publishing it.
+9. **Persistence & Publication Ordering:**
+   - Authenticated caller validation
+   - Event body scope validation
+   - Scope-bound fingerprint recomputation & verification
+   - Immutably persist or resolve exact replay via `EventRepository.record_event_ex`
+   - Validate returned event scope and canonical equality
+   - Publish to `EventBus` only if newly persisted (`is_replay is False`)
+   - Return canonical event response to caller
 
 ### 4.2 Independent Verification Scope Check (`VerificationTriggerCoordinator`)
 Event fields cannot independently grant the coordinator authority to verify a mission:
@@ -150,22 +158,49 @@ No competing event bus was introduced. The coordinator integrates with the exist
 
 ---
 
-## 6. Idempotency & Duplicate Suppression
+## 6. Scope-Bound Fingerprinting, Idempotency & Deduplication Safety (Prompt 37B)
 
-The same logical trigger must never spawn duplicate verification runs:
-1. **Deterministic Trigger Key:**
-   ```text
-   cltrig_<SHA-256(tenant_id:workspace_id:mission_id:revision:event_fingerprint:rule_version)>
-   ```
-2. **Deterministic Fingerprint Verification:**
-   Fingerprints are computed deterministically from canonical event content. Client-supplied fingerprints that do not match are rejected with `UNTRUSTED_PROVENANCE`. Fingerprint reuse with mutated payloads cannot impersonate another event.
-3. **Dual-Layer Deduplication:**
-   - **Repository Level:** `VerificationRepository.check_feedback_idempotency(...)` checks recent triggers within `SAGE_VERIFICATION_EVENT_DEDUP_WINDOW_SECONDS` (default: 300s).
-   - **Verification Service Level:** Passes the deterministic trigger key as `idempotency_key` into `VerificationService.request_verification(...)`.
-4. **Replay Determinism:**
-   Replays of identical events return the existing `VerificationRun` and existing `VerificationFeedbackRecord` with `DeliveryStatus.ACKNOWLEDGED`.
-5. **Fresh Events:**
-   Distinct operational events with different fingerprints legitimately produce fresh, independent verification runs.
+### 6.1 Canonical Fingerprint Fields & Serialization
+`CanonicalEvent.compute_fingerprint()` computes a deterministic SHA-256 fingerprint over an unambiguous canonical JSON structure with sorted keys and compact separators (`separators=(',', ':')`):
+- **Included Fields (Canonical Reality & Scope):**
+  - `schema_version`: Contract schema version (e.g. `"event.v1"`)
+  - `tenant_id`: Authoritative tenant isolation boundary
+  - `workspace_id`: Workspace isolation boundary
+  - `plant_id`: Physical plant boundary
+  - `category`: Event category enum string
+  - `event_type`: Specific event type (e.g. `"telemetry.updated"`)
+  - `occurred_at`: ISO timestamp of physical reality occurrence
+  - `provenance`: Origin source string
+  - `payload`: Canonicalized data dictionary
+- **Excluded Fields (Transient & Non-Identity):**
+  - `event_id`: Transient database UUID identifier
+  - `event_fingerprint`: Excluded from its own hash
+  - `recorded_at`: Server ingest timestamp
+  - `observed_at`: Observation latency timestamp
+  - `severity`: Alerting rating tag
+  - `lifecycle`: Mutable state machine status (`RECORDED` -> `ACTIVE` -> `RESOLVED`)
+  - `correlation_id` / `causation_id`: Distributed tracing links
+  - `references`: Object links
+
+### 6.2 Exact Replay vs. Conflicting Duplicate vs. Legacy Records
+`EventRepository.record_event_ex(event)` strictly distinguishes three outcomes:
+1. **Newly Persisted Event:**
+   - Database insert succeeds.
+   - Returns `(event, False)`.
+   - Published to `EventBus`.
+2. **Exact Legitimate Replay:**
+   - Fingerprint matches an existing record in SQLite.
+   - All canonical scope fields (`tenant_id`, `workspace_id`, `plant_id`) and content fields (`category`, `event_type`, `occurred_at`, `provenance`, `payload`, `schema_version`) match existing record exactly.
+   - Returns `(existing_event, True)`.
+   - **Publication Semantics:** Exact replays return the canonical event to the caller idempotently without re-publishing to `EventBus`, preventing downstream duplicate message traffic.
+3. **Conflicting Duplicate:**
+   - Fingerprint matches, but incoming event scope (`workspace_id`, `plant_id`) or payload differs.
+   - Rejects deterministically by raising `EventIdempotencyConflictError`.
+   - API translates to `HTTP 409 Conflict`. Zero publication to `EventBus`.
+4. **Ambiguous Legacy Records:**
+   - Existing record has missing/empty `workspace_id` or `plant_id`, or legacy unverified fingerprint.
+   - Fails closed by raising `LegacyEventFingerprintError`.
+   - Never returned as a verified exact replay.
 
 ---
 
@@ -239,11 +274,11 @@ Strictly preserves Prompt 36 and Prompt 36E–36H invariants:
 
 ## 10. Copilot and Agent Integration Decision
 
-**Decision:** Verification tools remain **UNREGISTERED** in the default `copilot_tools` registry for Prompt 37 / Prompt 37A.
+**Decision:** Verification tools remain **UNREGISTERED** in the default `copilot_tools` registry for Prompt 37 / Prompt 37A / Prompt 37B.
 
 **Reason:**
 Current LangGraph `ToolNode` architecture in `backend/agents/copilot.py` does not provide an immutable, request-scoped identity propagation context for background sub-agents. Allowing the LLM to invoke verification tools without verified identity propagation would risk client-forged identity parameters.
-As mandated by Prompt 37 Section 15 and Prompt 37A Section 10:
+As mandated by Prompt 37 Section 15, Prompt 37A Section 10, and Prompt 37B Section 7:
 > *"If the current Copilot architecture cannot guarantee trusted identity propagation, keep the tool unregistered and document the blocker. Do not weaken the identity boundary to make a demo work."*
 
 ---
@@ -259,12 +294,15 @@ Mounted in FastAPI:
    - Enforces `mission.verification.read` permission and tenant/workspace boundaries.
 3. `POST /api/v3/events`
    - Ingests canonical operational events with strict producer tenant/workspace/plant authorization.
+   - Enforces exact-replay deduplication and rejects conflicting duplicates (HTTP 409).
 4. `GET /api/v3/events`
    - Retrieves events filtered by tenant, workspace, and authorized plant scoping.
+5. `GET /api/v3/events/fingerprint/{fingerprint}`
+   - Retrieves event by fingerprint with strict tenant, workspace, and plant access control.
 
 ---
 
-## 12. Configuration Settings & Startup Subscriptions (Prompt 37A)
+## 12. Configuration Settings & Startup Subscriptions (Prompt 37A & 37B)
 
 Configured in `backend/core/config.py`:
 - `SAGE_CLOSED_LOOP_ENABLED` (bool, default: `False`): Master toggle for closed-loop subsystem. Defaults to `false` for startup safety.
@@ -285,9 +323,10 @@ Configured in `backend/core/config.py`:
 ## 13. Test Coverage Summary
 
 - **Focused Closed-Loop Test Suite:** `backend/test_v3_closed_loop_learning.py`
-  - 49 tests covering eligibility, identity boundary, scope isolation, idempotency, loop guards, AST checks, producer authorization, coordinator independent scope verification, feature flag defaults, and fingerprint integrity.
-  - **Result: 49 passed (100%)**.
+  - 59 tests covering eligibility, identity boundary, scope isolation, idempotency, loop guards, AST checks, producer authorization, coordinator independent scope verification, feature flag defaults, fingerprint integrity, workspace/plant fingerprint isolation, exact replay, and conflicting duplicate rejection.
+  - **Result: 59 passed (100%)**.
 - **All Core Regression Suites:**
+  - Canonical Event Model: 33 passed
   - Event Driven Architecture: 5 passed
   - Continuous Verification: 128 passed
   - Mission Architecture: 74 passed
@@ -296,7 +335,7 @@ Configured in `backend/core/config.py`:
   - Root Cause Analysis: 30 passed
   - Incident Management: 56 passed
   - Confidence Uncertainty & Authorization: 171 passed
-  - **Total: 736 passed, 0 failed.**
+  - **Total: 779 passed, 0 failed.**
 
 ---
 
