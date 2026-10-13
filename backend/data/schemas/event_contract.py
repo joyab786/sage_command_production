@@ -98,27 +98,67 @@ class CanonicalEvent(BaseModel):
 
     def compute_fingerprint(self) -> str:
         """
-        Computes a deterministic SHA-256 fingerprint from the canonicalized event content.
-        Excludes transient/database fields. Focuses on the essence of the event.
-        """
-        # We sort keys to be insensitive to dictionary ordering.
-        payload_str = json.dumps(self.payload, sort_keys=True)
+        Computes a deterministic SHA-256 fingerprint binding all security-relevant
+        event scope and canonical content into an unambiguous canonical JSON structure.
         
-        # Include fields that uniquely define the event in reality
-        # tenant_id ensures fingerprints are tenant-aware and isolated.
+        Binds:
+        - schema_version: Contract schema version
+        - tenant_id: Authoritative tenant isolation boundary
+        - workspace_id: Workspace isolation boundary
+        - plant_id: Physical plant boundary
+        - category: High-level classification
+        - event_type: Specific event type
+        - occurred_at: ISO timestamp of physical reality occurrence
+        - provenance: Origin source
+        - payload: Canonicalized dictionary (sorted keys)
+
+        Fields excluded:
+        - event_id: Transient database/UUID identifier
+        - event_fingerprint: The fingerprint itself (cannot be self-referential)
+        - recorded_at: Server-side ingest timestamp
+        - observed_at: Observation timestamp
+        - severity: Operational alert rating
+        - lifecycle: Mutable state machine status (RECORDED -> ACTIVE -> RESOLVED)
+        - correlation_id, causation_id: Distributed tracing references
+        - references: Object links
+        """
+        category_val = self.category.value if hasattr(self.category, "value") else str(self.category)
+        canonical_dict = {
+            "category": category_val,
+            "event_type": str(self.event_type),
+            "occurred_at": str(self.occurred_at),
+            "payload": self.payload,
+            "plant_id": str(self.plant_id or ""),
+            "provenance": str(self.provenance or ""),
+            "schema_version": str(self.schema_version),
+            "tenant_id": str(self.tenant_id),
+            "workspace_id": str(self.workspace_id or ""),
+        }
+        # Unambiguous canonical JSON: sort_keys=True ensures key-order independence,
+        # separators=(',', ':') eliminates whitespace variance.
+        canonical_bytes = json.dumps(canonical_dict, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(canonical_bytes).hexdigest()
+
+    def compute_legacy_fingerprint(self) -> str:
+        """
+        Computes the pre-Prompt 37B legacy fingerprint for compatibility detection and migration checks.
+        Legacy algorithm omitted workspace_id and plant_id and used naive pipe-delimited serialization.
+        """
+        payload_str = json.dumps(self.payload, sort_keys=True)
+        category_val = self.category.value if hasattr(self.category, "value") else str(self.category)
         components = [
             self.schema_version,
             self.tenant_id,
-            self.category.value,
+            category_val,
             self.event_type,
             self.occurred_at,
             self.provenance,
             payload_str
         ]
-        
         canonical_string = "|".join(str(c) for c in components)
-        return hashlib.sha256(canonical_string.encode('utf-8')).hexdigest()
+        return hashlib.sha256(canonical_string.encode("utf-8")).hexdigest()
 
     def apply_fingerprint(self):
         """Sets the event_fingerprint field using compute_fingerprint."""
         self.event_fingerprint = self.compute_fingerprint()
+

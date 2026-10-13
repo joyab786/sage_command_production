@@ -10,6 +10,31 @@ from data.schemas.event_contract import CanonicalEvent
 
 logger = logging.getLogger(__name__)
 
+class EventRepositoryError(Exception):
+    """Base exception for event repository operations."""
+    pass
+
+
+class EventNotFoundError(EventRepositoryError):
+    """Raised when an event cannot be found."""
+    pass
+
+
+class EventIdempotencyConflictError(EventRepositoryError):
+    """Raised when an event fingerprint is reused with differing event payload, scope, or canonical content."""
+    pass
+
+
+class EventScopeMismatchError(EventRepositoryError):
+    """Raised when an event does not match expected scope or crosses workspace/plant boundaries."""
+    pass
+
+
+class LegacyEventFingerprintError(EventRepositoryError):
+    """Raised when an existing event record has an ambiguous or legacy fingerprint preventing safe replay verification."""
+    pass
+
+
 class EventRepository:
     def __init__(self, db_path: str = "sage_events.sqlite"):
         self.db_path = db_path
@@ -47,19 +72,35 @@ class EventRepository:
                 )
             """)
             
-            # Indexes for efficient bounded querying
+            # Indexes for efficient bounded querying and scope isolation
             conn.execute("CREATE INDEX IF NOT EXISTS idx_tenant_occurred ON events (tenant_id, occurred_at DESC)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_tenant_fingerprint ON events (tenant_id, fingerprint)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_tenant_category_type ON events (tenant_id, category, event_type)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_tenant_ws_plant ON events (tenant_id, workspace_id, plant_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_tenant_scope_fp ON events (tenant_id, workspace_id, plant_id, fingerprint)")
 
-    def record_event(self, event: CanonicalEvent) -> CanonicalEvent:
+    def record_event_ex(self, event: CanonicalEvent) -> tuple[CanonicalEvent, bool]:
         """
         Record a canonical event immutably.
-        Deterministic deduplication: if the fingerprint + tenant_id already exists,
-        returns the existing event without modifying it.
+        Distinguishes deterministically between:
+        - Newly persisted event: returns (event, False)
+        - Exact legitimate replay: returns (existing_event, True)
+        - Conflicting duplicate (mismatched payload or scope): raises EventIdempotencyConflictError
+        - Ambiguous/legacy duplicate: raises LegacyEventFingerprintError
         """
         if not event.event_fingerprint:
             event.apply_fingerprint()
+        else:
+            computed_fp = event.compute_fingerprint()
+            if event.event_fingerprint != computed_fp:
+                raise EventIdempotencyConflictError(
+                    f"Supplied fingerprint '{event.event_fingerprint}' does not match computed canonical fingerprint '{computed_fp}'."
+                )
+
+        cat_val = event.category.value if hasattr(event.category, "value") else str(event.category)
+        sev_val = event.severity.value if hasattr(event.severity, "value") else str(event.severity)
+        life_val = event.lifecycle.value if hasattr(event.lifecycle, "value") else str(event.lifecycle)
+        ref_json = event.references.model_dump_json() if hasattr(event.references, "model_dump_json") else json.dumps(event.references)
 
         try:
             with closing(self._get_conn()) as conn:
@@ -72,21 +113,66 @@ class EventRepository:
                         correlation_id, causation_id, provenance,
                         references_json, payload_json
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    event.event_id, event.event_fingerprint, event.tenant_id, event.workspace_id, event.plant_id,
-                    event.schema_version, event.category.value, event.event_type, event.severity.value, event.lifecycle.value,
-                    event.occurred_at, event.observed_at, event.recorded_at,
-                    event.correlation_id, event.causation_id, event.provenance,
-                    event.references.model_dump_json(), json.dumps(event.payload)
-                ))
-            return event
+                    """, (
+                        event.event_id, event.event_fingerprint, event.tenant_id, event.workspace_id, event.plant_id,
+                        event.schema_version, cat_val, event.event_type, sev_val, life_val,
+                        event.occurred_at, event.observed_at, event.recorded_at,
+                        event.correlation_id, event.causation_id, event.provenance,
+                        ref_json, json.dumps(event.payload)
+                    ))
+            return event, False
         except sqlite3.IntegrityError:
-            # Deduplication: fingerprint + tenant_id clash
-            logger.info(f"Duplicate event fingerprint {event.event_fingerprint} for tenant {event.tenant_id}. Returning existing.")
+            # Duplicate fingerprint or primary key clash.
+            # Perform strict verification against existing record.
             existing = self.get_event_by_fingerprint(event.tenant_id, event.event_fingerprint)
-            if existing:
-                return existing
-            raise
+            if not existing:
+                # Primary key clash (event_id clash) or unresolvable integrity error
+                raise EventIdempotencyConflictError(f"Integrity conflict for event_id '{event.event_id}' in tenant '{event.tenant_id}'.")
+
+            # Check for legacy or ambiguous fingerprint on existing record
+            if not existing.workspace_id or not existing.plant_id:
+                raise LegacyEventFingerprintError(
+                    f"Existing event '{existing.event_id}' has ambiguous scope (workspace='{existing.workspace_id}', plant='{existing.plant_id}')."
+                )
+
+            if existing.compute_fingerprint() != existing.event_fingerprint:
+                raise LegacyEventFingerprintError(
+                    f"Existing event '{existing.event_id}' has legacy/unverified fingerprint '{existing.event_fingerprint}'."
+                )
+
+            # Check scope boundaries: workspace and plant must match
+            if existing.workspace_id != event.workspace_id or existing.plant_id != event.plant_id:
+                raise EventIdempotencyConflictError(
+                    f"Fingerprint collision across scope: existing event '{existing.event_id}' has scope "
+                    f"({existing.workspace_id}, {existing.plant_id}) but incoming event has scope ({event.workspace_id}, {event.plant_id})."
+                )
+
+            # Check canonical content equality
+            existing_cat = existing.category.value if hasattr(existing.category, "value") else str(existing.category)
+            if (
+                existing_cat != cat_val or
+                existing.event_type != event.event_type or
+                existing.occurred_at != event.occurred_at or
+                existing.provenance != event.provenance or
+                existing.payload != event.payload or
+                existing.schema_version != event.schema_version
+            ):
+                raise EventIdempotencyConflictError(
+                    f"Fingerprint collision on '{event.event_fingerprint}': incoming event content differs from existing event '{existing.event_id}'."
+                )
+
+            # Exact legitimate replay verified!
+            logger.info(f"Exact replay of canonical event '{existing.event_id}' (fingerprint {event.event_fingerprint}). Returning existing record.")
+            return existing, True
+
+    def record_event(self, event: CanonicalEvent) -> CanonicalEvent:
+        """
+        Record a canonical event immutably.
+        Returns the event (or existing event on exact replay).
+        Raises EventIdempotencyConflictError on conflicting duplicates.
+        """
+        event_obj, _ = self.record_event_ex(event)
+        return event_obj
 
     def get_event(self, tenant_id: str, event_id: str) -> Optional[CanonicalEvent]:
         with closing(self._get_conn()) as conn:
@@ -98,6 +184,18 @@ class EventRepository:
     def get_event_by_fingerprint(self, tenant_id: str, fingerprint: str) -> Optional[CanonicalEvent]:
         with closing(self._get_conn()) as conn:
             row = conn.execute("SELECT * FROM events WHERE fingerprint = ? AND tenant_id = ?", (fingerprint, tenant_id)).fetchone()
+            if row:
+                return self._row_to_event(row)
+        return None
+
+    def get_event_by_scope_and_fingerprint(
+        self, tenant_id: str, workspace_id: str, plant_id: str, fingerprint: str
+    ) -> Optional[CanonicalEvent]:
+        with closing(self._get_conn()) as conn:
+            row = conn.execute(
+                "SELECT * FROM events WHERE tenant_id = ? AND workspace_id = ? AND plant_id = ? AND fingerprint = ?",
+                (tenant_id, workspace_id, plant_id, fingerprint)
+            ).fetchone()
             if row:
                 return self._row_to_event(row)
         return None
@@ -143,8 +241,8 @@ class EventRepository:
             schema_version=row["schema_version"],
             event_fingerprint=row["fingerprint"],
             tenant_id=row["tenant_id"],
-            workspace_id=row["workspace_id"],
-            plant_id=row["plant_id"],
+            workspace_id=row["workspace_id"] or "",
+            plant_id=row["plant_id"] or "",
             category=row["category"],
             event_type=row["event_type"],
             severity=row["severity"],

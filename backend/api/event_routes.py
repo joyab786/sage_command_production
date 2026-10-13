@@ -5,12 +5,22 @@ import sqlite3
 
 try:
     from data.schemas.event_contract import CanonicalEvent
-    from services.event_repository import EventRepository
+    from services.event_repository import (
+        EventRepository,
+        EventIdempotencyConflictError,
+        LegacyEventFingerprintError,
+        EventScopeMismatchError,
+    )
     from services.event_bus import get_event_bus, EventBus
     from core.auth import Identity, require_permission
 except (ImportError, ModuleNotFoundError):
     from backend.data.schemas.event_contract import CanonicalEvent
-    from backend.services.event_repository import EventRepository
+    from backend.services.event_repository import (
+        EventRepository,
+        EventIdempotencyConflictError,
+        LegacyEventFingerprintError,
+        EventScopeMismatchError,
+    )
     from backend.services.event_bus import get_event_bus, EventBus
     from backend.core.auth import Identity, require_permission
 
@@ -42,6 +52,8 @@ async def record_event(
     The authenticated producer's identity is authoritative. The event body is untrusted input.
     Validates tenant, workspace, and physical plant scope against authenticated identity.
     Enforces deterministic fingerprint integrity before persistence and EventBus publication.
+    Enforces strict exact-replay deduplication and rejects conflicting duplicates (HTTP 409).
+    Never returns or publishes an event belonging to another workspace or plant.
     """
     # 1. Authoritative Identity Scope Validation
     if not identity.tenant_id or not identity.tenant_id.strip() or identity.tenant_id.lower() in ("global", "unknown", "default"):
@@ -96,7 +108,7 @@ async def record_event(
             detail=f"Caller is not authorized for plant '{event.plant_id}'."
         )
 
-    # 3. Deterministic Fingerprint Verification
+    # 3. Deterministic Scope-Bound Fingerprint Verification
     computed_fp = event.compute_fingerprint()
     if event.event_fingerprint:
         if event.event_fingerprint != computed_fp:
@@ -107,14 +119,58 @@ async def record_event(
     else:
         event.event_fingerprint = computed_fp
 
-    # 4. Persistence and EventBus Dispatch
+    # 4. Persistence and Exact-Replay Resolution
     try:
-        saved_event = repo.record_event(event)
-        # Dispatch asynchronously to the event bus
-        await bus.publish(saved_event)
-        return saved_event
+        saved_event, is_replay = repo.record_event_ex(event)
+    except EventIdempotencyConflictError as err:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Conflicting duplicate event: {str(err)}"
+        )
+    except LegacyEventFingerprintError as err:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Ambiguous legacy event record: {str(err)}"
+        )
+    except EventScopeMismatchError as err:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Event scope mismatch: {str(err)}"
+        )
     except sqlite3.IntegrityError:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Duplicate event fingerprint.")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Duplicate event fingerprint collision."
+        )
+
+    # 5. Scope & Identity Verification on Repository-Returned Event (Never trust repo blindly)
+    if saved_event.tenant_id != identity.tenant_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Persisted event tenant mismatch."
+        )
+    if saved_event.workspace_id != identity.workspace_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Persisted event workspace mismatch: cross-workspace boundary violation."
+        )
+    if "*" not in auth_plants and saved_event.plant_id not in auth_plants:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Persisted event plant '{saved_event.plant_id}' is unauthorized for caller."
+        )
+    if saved_event.event_fingerprint != computed_fp:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Persisted event fingerprint mismatch."
+        )
+
+    # 6. EventBus Dispatch: Publish newly persisted events only.
+    # Replays are returned idempotently without duplicate EventBus publication to avoid redundant downstream processing.
+    if not is_replay:
+        await bus.publish(saved_event)
+
+    return saved_event
 
 @router.get("", response_model=List[CanonicalEvent], dependencies=[Depends(require_permission("events.read"))])
 async def list_events(

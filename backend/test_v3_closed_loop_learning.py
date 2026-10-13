@@ -95,7 +95,11 @@ try:
     )
     from services.event_bus import EventBus
     from services.event_delivery_repository import EventDeliveryRepository
-    from services.event_repository import EventRepository
+    from services.event_repository import (
+        EventRepository,
+        EventIdempotencyConflictError,
+        LegacyEventFingerprintError,
+    )
     from repositories.verification_repository import VerificationRepository
     from services.verification_service import VerificationService
     from repositories.mission_repository import MissionRepository
@@ -152,7 +156,11 @@ except (ImportError, ModuleNotFoundError):
     )
     from backend.services.event_bus import EventBus
     from backend.services.event_delivery_repository import EventDeliveryRepository
-    from backend.services.event_repository import EventRepository
+    from backend.services.event_repository import (
+        EventRepository,
+        EventIdempotencyConflictError,
+        LegacyEventFingerprintError,
+    )
     from backend.repositories.verification_repository import VerificationRepository
     from backend.services.verification_service import VerificationService
     from backend.repositories.mission_repository import MissionRepository
@@ -1335,3 +1343,409 @@ class TestFingerprintIntegrityAndIdempotency:
             assert total == 1
 
         asyncio.run(run())
+
+
+# =============================================================================
+# 12. EVENT FINGERPRINT ISOLATION & DEDUPLICATION SAFETY (Prompt 37B Section 6)
+# =============================================================================
+
+class TestEventFingerprintIsolationAndDeduplication:
+    @pytest.fixture
+    def fp_api_setup(self, temp_dbs):
+        event_db = temp_dbs[0]
+        delivery_db = temp_dbs[1]
+        ev_repo = EventRepository(db_path=event_db)
+        deliv_repo = EventDeliveryRepository(db_path=delivery_db)
+        ebus = EventBus(deliv_repo)
+        ebus.enabled = True
+        client = TestClient(app)
+        try:
+            import api.event_routes as er
+        except (ImportError, ModuleNotFoundError):
+            import backend.api.event_routes as er
+        app.dependency_overrides[er.get_event_repo] = lambda: ev_repo
+        app.dependency_overrides[er.get_event_bus] = lambda: ebus
+        yield client, ev_repo, ebus
+        app.dependency_overrides.clear()
+
+    def test_50_same_tenant_different_workspace_isolation(self, fp_api_setup):
+        """Test A: Events in different workspaces have distinct fingerprints and do not resolve to each other."""
+        client, ev_repo, _ = fp_api_setup
+        
+        # 1. Producer in Workspace A
+        producer_a = Identity(
+            user_id="op_a",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            assigned_plants=["plant_01"],
+            roles=["OPERATOR"],
+            permissions=["events.record", "events.read"],
+        )
+        app.dependency_overrides[get_current_identity] = lambda: producer_a
+
+        occurred_iso = "2026-10-13T10:00:00Z"
+        evt_a = make_operational_event(
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            plant_id="plant_01",
+            occurred_at=occurred_iso,
+            payload_extra={"telemetry_val": 42.0},
+        )
+        resp_a = client.post("/api/v3/events", json=evt_a.model_dump())
+        assert resp_a.status_code == 201
+        data_a = resp_a.json()
+
+        # 2. Producer in Workspace B with identical payload, event_type, occurred_at, and plant
+        producer_b = Identity(
+            user_id="op_b",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_dev",
+            assigned_plants=["plant_01"],
+            roles=["OPERATOR"],
+            permissions=["events.record", "events.read"],
+        )
+        app.dependency_overrides[get_current_identity] = lambda: producer_b
+
+        evt_b = make_operational_event(
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_dev",
+            plant_id="plant_01",
+            occurred_at=occurred_iso,
+            payload_extra={"telemetry_val": 42.0},
+        )
+        resp_b = client.post("/api/v3/events", json=evt_b.model_dump())
+        assert resp_b.status_code == 201
+        data_b = resp_b.json()
+
+        # 3. Verify fingerprint separation & isolation
+        assert data_a["event_fingerprint"] != data_b["event_fingerprint"]
+        assert data_b["workspace_id"] == "workspace_dev"
+        assert data_a["workspace_id"] == "workspace_prod"
+        assert data_b["event_id"] != data_a["event_id"]
+        # Zero data from Workspace A leaked to Workspace B
+        assert data_b["event_id"] == evt_b.event_id
+
+    def test_51_same_workspace_different_plant_isolation(self, fp_api_setup):
+        """Test B: Events in different plants have distinct fingerprints and do not collide."""
+        client, ev_repo, _ = fp_api_setup
+        
+        producer_1 = Identity(
+            user_id="op_p1",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            assigned_plants=["plant_01"],
+            roles=["OPERATOR"],
+            permissions=["events.record", "events.read"],
+        )
+        app.dependency_overrides[get_current_identity] = lambda: producer_1
+
+        occurred_iso = "2026-10-13T10:00:00Z"
+        evt_1 = make_operational_event(
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            plant_id="plant_01",
+            occurred_at=occurred_iso,
+            payload_extra={"temp": 98.6},
+        )
+        resp_1 = client.post("/api/v3/events", json=evt_1.model_dump())
+        assert resp_1.status_code == 201
+        data_1 = resp_1.json()
+
+        producer_2 = Identity(
+            user_id="op_p2",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            assigned_plants=["plant_02"],
+            roles=["OPERATOR"],
+            permissions=["events.record", "events.read"],
+        )
+        app.dependency_overrides[get_current_identity] = lambda: producer_2
+
+        evt_2 = make_operational_event(
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            plant_id="plant_02",
+            occurred_at=occurred_iso,
+            payload_extra={"temp": 98.6},
+        )
+        resp_2 = client.post("/api/v3/events", json=evt_2.model_dump())
+        assert resp_2.status_code == 201
+        data_2 = resp_2.json()
+
+        assert data_1["event_fingerprint"] != data_2["event_fingerprint"]
+        assert data_1["plant_id"] == "plant_01"
+        assert data_2["plant_id"] == "plant_02"
+        assert data_1["event_id"] != data_2["event_id"]
+
+    def test_52_exact_replay_idempotency_preserved(self, fp_api_setup):
+        """Test C: Exact re-submission of the same canonical event returns the existing event idempotently."""
+        client, ev_repo, _ = fp_api_setup
+        producer = Identity(
+            user_id="op_replay",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            assigned_plants=["plant_01"],
+            roles=["OPERATOR"],
+            permissions=["events.record", "events.read"],
+        )
+        app.dependency_overrides[get_current_identity] = lambda: producer
+
+        evt = make_operational_event(
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            plant_id="plant_01",
+            payload_extra={"sensor": "A1"},
+        )
+        resp_1 = client.post("/api/v3/events", json=evt.model_dump())
+        assert resp_1.status_code == 201
+        data_1 = resp_1.json()
+
+        # Exact replay (retry with newly generated event_id but identical canonical scope & content)
+        evt_replay = evt.model_copy(deep=True)
+        evt_replay.event_id = f"evt_retry_{uuid.uuid4().hex[:8]}"
+        evt_replay.apply_fingerprint()
+        assert evt_replay.event_fingerprint == evt.event_fingerprint
+
+        resp_2 = client.post("/api/v3/events", json=evt_replay.model_dump())
+        assert resp_2.status_code == 201
+        data_2 = resp_2.json()
+
+        # Idempotent return of the original persisted event
+        assert data_1["event_id"] == data_2["event_id"]
+        assert data_1["event_fingerprint"] == data_2["event_fingerprint"]
+
+        # Exactly 1 record in repository
+        all_events = ev_repo.list_events("tenant_alpha")
+        assert len(all_events) == 1
+
+    def test_53_modified_payload_with_reused_fingerprint_rejected(self, fp_api_setup):
+        """Test D: Mutating payload while supplying original fingerprint fails closed (HTTP 400)."""
+        client, ev_repo, _ = fp_api_setup
+        producer = Identity(
+            user_id="op_d",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            assigned_plants=["plant_01"],
+            roles=["OPERATOR"],
+            permissions=["events.record"],
+        )
+        app.dependency_overrides[get_current_identity] = lambda: producer
+
+        evt_orig = make_operational_event(payload_extra={"val": 100})
+        fp_orig = evt_orig.event_fingerprint
+
+        # Modified payload but forged/reused original fingerprint
+        evt_bad = make_operational_event(payload_extra={"val": 9999})
+        bad_dump = evt_bad.model_dump()
+        bad_dump["event_fingerprint"] = fp_orig
+
+        resp = client.post("/api/v3/events", json=bad_dump)
+        assert resp.status_code == 400
+        assert "fingerprint does not match" in resp.json()["detail"].lower()
+        assert ev_repo.get_event("tenant_alpha", evt_bad.event_id) is None
+
+    def test_54_modified_workspace_with_reused_fingerprint_rejected(self, fp_api_setup):
+        """Test E: Changing workspace while keeping original fingerprint is rejected (HTTP 400)."""
+        client, ev_repo, _ = fp_api_setup
+        producer_dev = Identity(
+            user_id="op_e",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_dev",
+            assigned_plants=["plant_01"],
+            roles=["OPERATOR"],
+            permissions=["events.record"],
+        )
+        app.dependency_overrides[get_current_identity] = lambda: producer_dev
+
+        evt_prod = make_operational_event(workspace_id="workspace_prod")
+        fp_prod = evt_prod.event_fingerprint
+
+        # Submit event for workspace_dev with prod's fingerprint
+        evt_dev = make_operational_event(workspace_id="workspace_dev")
+        dev_dump = evt_dev.model_dump()
+        dev_dump["event_fingerprint"] = fp_prod
+
+        resp = client.post("/api/v3/events", json=dev_dump)
+        assert resp.status_code == 400
+        assert "fingerprint does not match" in resp.json()["detail"].lower()
+        assert ev_repo.get_event("tenant_alpha", evt_dev.event_id) is None
+
+    def test_55_modified_plant_with_reused_fingerprint_rejected(self, fp_api_setup):
+        """Test F: Changing plant while keeping original fingerprint is rejected (HTTP 400)."""
+        client, ev_repo, _ = fp_api_setup
+        producer_p2 = Identity(
+            user_id="op_f",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            assigned_plants=["plant_02"],
+            roles=["OPERATOR"],
+            permissions=["events.record"],
+        )
+        app.dependency_overrides[get_current_identity] = lambda: producer_p2
+
+        evt_p1 = make_operational_event(plant_id="plant_01")
+        fp_p1 = evt_p1.event_fingerprint
+
+        # Submit event for plant_02 with plant_01's fingerprint
+        evt_p2 = make_operational_event(plant_id="plant_02")
+        p2_dump = evt_p2.model_dump()
+        p2_dump["event_fingerprint"] = fp_p1
+
+        resp = client.post("/api/v3/events", json=p2_dump)
+        assert resp.status_code == 400
+        assert "fingerprint does not match" in resp.json()["detail"].lower()
+        assert ev_repo.get_event("tenant_alpha", evt_p2.event_id) is None
+
+    def test_56_repository_collision_path_rejects_conflicting_duplicate(self, fp_api_setup):
+        """Test G: Conflicting duplicate in repository raises EventIdempotencyConflictError and never returns existing record."""
+        _, ev_repo, _ = fp_api_setup
+        evt_orig = make_operational_event(payload_extra={"data": "original"})
+        ev_repo.record_event(evt_orig)
+
+        # Forge conflicting event with same fingerprint but modified payload
+        evt_conflict = evt_orig.model_copy(deep=True)
+        evt_conflict.event_id = "evt_conflict_99"
+        evt_conflict.payload = {"data": "tampered"}
+        # Keep original fingerprint
+        evt_conflict.event_fingerprint = evt_orig.event_fingerprint
+
+        with pytest.raises(EventIdempotencyConflictError):
+            ev_repo.record_event_ex(evt_conflict)
+
+        # Verify original record in DB was untouched
+        stored = ev_repo.get_event("tenant_alpha", evt_orig.event_id)
+        assert stored.payload == {"value": 100, "mission_id": "msn_cl_100", "data": "original"}
+
+    def test_57_publication_boundary_spy_verifies_no_unintended_publication(self, fp_api_setup):
+        """Test H: EventBus spy verifies exact replay publishes 0 duplicates, and rejected requests publish 0 events."""
+        client, ev_repo, ebus = fp_api_setup
+        producer = Identity(
+            user_id="op_spy",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            assigned_plants=["plant_01"],
+            roles=["OPERATOR"],
+            permissions=["events.record"],
+        )
+        app.dependency_overrides[get_current_identity] = lambda: producer
+
+        published_calls = []
+        async def spy_publish(ev):
+            published_calls.append(ev)
+
+        ebus.publish = spy_publish
+
+        # 1. First submission -> published
+        evt = make_operational_event()
+        resp_1 = client.post("/api/v3/events", json=evt.model_dump())
+        assert resp_1.status_code == 201
+        assert len(published_calls) == 1
+
+        # 2. Exact replay -> NOT published again
+        evt_replay = evt.model_copy(deep=True)
+        evt_replay.event_id = "evt_replay_uuid"
+        evt_replay.apply_fingerprint()
+        resp_2 = client.post("/api/v3/events", json=evt_replay.model_dump())
+        assert resp_2.status_code == 201
+        assert len(published_calls) == 1  # Still 1, zero unintended publication!
+
+        # 3. Invalid fingerprint -> 400, NOT published
+        bad_evt = evt.model_dump()
+        bad_evt["event_id"] = "evt_bad_uuid"
+        bad_evt["event_fingerprint"] = "bad_fp_123"
+        resp_3 = client.post("/api/v3/events", json=bad_evt)
+        assert resp_3.status_code == 400
+        assert len(published_calls) == 1  # Still 1
+
+    def test_58_legacy_records_fail_closed_on_collision(self, fp_api_setup):
+        """Test I: Ambiguous legacy record without workspace/plant fails closed and is never returned as exact replay."""
+        _, ev_repo, _ = fp_api_setup
+        
+        # Create a modern event with valid deterministic fingerprint
+        modern_evt = make_operational_event(tenant_id="tenant_alpha", workspace_id="workspace_prod", plant_id="plant_01")
+        valid_fp = modern_evt.compute_fingerprint()
+
+        # Directly insert a legacy event with NULL workspace/plant and valid_fp into SQLite store
+        now_iso = "2026-10-13T10:00:00Z"
+        with ev_repo._get_conn() as conn:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO events (
+                        event_id, fingerprint, tenant_id, workspace_id, plant_id,
+                        schema_version, category, event_type, severity, lifecycle,
+                        occurred_at, observed_at, recorded_at, provenance, references_json, payload_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "evt_legacy_01", valid_fp, "tenant_alpha", None, None,
+                        "event.v1", "TELEMETRY", "telemetry.updated", "INFO", "RECORDED",
+                        now_iso, now_iso, now_iso, "sensor", "{}", "{}"
+                    )
+                )
+
+        # Incoming modern event attempts insertion, clashes on fingerprint in DB,
+        # but existing record has ambiguous scope (NULL workspace/plant) -> fails closed
+        with pytest.raises(LegacyEventFingerprintError):
+            ev_repo.record_event_ex(modern_evt)
+
+    def test_59_multitenant_workspace_plant_regression(self, fp_api_setup):
+        """Test J: Multi-tenant isolation: identical payloads in tenant A and tenant B produce distinct isolated events."""
+        client, ev_repo, _ = fp_api_setup
+        occurred_iso = "2026-10-13T10:00:00Z"
+
+        # Tenant Alpha
+        producer_a = Identity(
+            user_id="op_alpha",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            assigned_plants=["plant_01"],
+            roles=["OPERATOR"],
+            permissions=["events.record", "events.read"],
+        )
+        app.dependency_overrides[get_current_identity] = lambda: producer_a
+
+        evt_a = make_operational_event(
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            plant_id="plant_01",
+            occurred_at=occurred_iso,
+            payload_extra={"shared_metric": 100},
+        )
+        resp_a = client.post("/api/v3/events", json=evt_a.model_dump())
+        assert resp_a.status_code == 201
+        data_a = resp_a.json()
+
+        # Tenant Beta
+        producer_b = Identity(
+            user_id="op_beta",
+            tenant_id="tenant_beta",
+            workspace_id="workspace_prod",
+            assigned_plants=["plant_01"],
+            roles=["OPERATOR"],
+            permissions=["events.record", "events.read"],
+        )
+        app.dependency_overrides[get_current_identity] = lambda: producer_b
+
+        evt_b = make_operational_event(
+            tenant_id="tenant_beta",
+            workspace_id="workspace_prod",
+            plant_id="plant_01",
+            occurred_at=occurred_iso,
+            payload_extra={"shared_metric": 100},
+        )
+        resp_b = client.post("/api/v3/events", json=evt_b.model_dump())
+        assert resp_b.status_code == 201
+        data_b = resp_b.json()
+
+        # Both exist independently
+        assert data_a["event_fingerprint"] != data_b["event_fingerprint"]
+        assert data_a["tenant_id"] == "tenant_alpha"
+        assert data_b["tenant_id"] == "tenant_beta"
+
+        # Tenant Alpha cannot list Tenant Beta's events
+        app.dependency_overrides[get_current_identity] = lambda: producer_a
+        events_a = client.get("/api/v3/events").json()
+        assert len(events_a) == 1
+        assert events_a[0]["tenant_id"] == "tenant_alpha"
+
