@@ -50,8 +50,10 @@ try:
     from api.sop_rag_routes import router as sop_rag_router
     from api.organizational_memory_routes import router as organizational_memory_router
     from api.mission_routes import router as mission_router
-    from api.verification_routes import router as verification_router
+    from api.verification_routes import router as verification_router, feedback_router
     from services.event_bus import get_event_bus
+    from services.verification_trigger_coordinator import get_verification_trigger_coordinator
+    from core.config import SAGE_CLOSED_LOOP_ENABLED
 except (ImportError, ModuleNotFoundError):
     from backend.core.config import SAGE_ALLOWED_ORIGINS, IS_PRODUCTION
     from backend.governance.middleware import (
@@ -93,8 +95,10 @@ except (ImportError, ModuleNotFoundError):
     from backend.api.sop_rag_routes import router as sop_rag_router
     from backend.api.organizational_memory_routes import router as organizational_memory_router
     from backend.api.mission_routes import router as mission_router
-    from backend.api.verification_routes import router as verification_router
+    from backend.api.verification_routes import router as verification_router, feedback_router
     from backend.services.event_bus import get_event_bus
+    from backend.services.verification_trigger_coordinator import get_verification_trigger_coordinator
+    from backend.core.config import SAGE_CLOSED_LOOP_ENABLED
 
 app = FastAPI(title="SageCommand V3 Industrial Operations AI OS")
 
@@ -137,6 +141,10 @@ async def startup_event():
     event_bus.start()
     print(" [Server Startup] Launching Factory Simulator background anomaly generator...")
     asyncio.create_task(run_factory_simulation_loop(interval_seconds=40))
+    if SAGE_CLOSED_LOOP_ENABLED:
+        print(" [Server Startup] Initializing Closed-Loop Learning Coordinator...")
+        coordinator = get_verification_trigger_coordinator()
+        coordinator.register_tenant_subscription("default")
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -180,6 +188,7 @@ app.include_router(sop_rag_router)
 app.include_router(organizational_memory_router)
 app.include_router(mission_router)
 app.include_router(verification_router)
+app.include_router(feedback_router)
 
 # BOOT SEQUENCE
 if __name__ == "__main__":

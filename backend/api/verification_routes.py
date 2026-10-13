@@ -33,6 +33,7 @@ try:
         VerificationAuditRecord,
         MANDATORY_VERIFICATION_NOTICE,
     )
+    from data.schemas.closed_loop_contract import VerificationFeedbackRecord
     from services.verification_service import (
         VerificationService,
         verification_service,
@@ -46,6 +47,8 @@ try:
         VerificationConcurrencyError,
         VerificationIdempotencyConflictError,
     )
+    from repositories.mission_repository import MissionNotFoundError
+    from services.mission_service import MissionPermissionError
 except (ImportError, ModuleNotFoundError):
     from backend.core.auth import Identity, require_permission
     from backend.data.schemas.verification_contract import (
@@ -58,6 +61,7 @@ except (ImportError, ModuleNotFoundError):
         VerificationAuditRecord,
         MANDATORY_VERIFICATION_NOTICE,
     )
+    from backend.data.schemas.closed_loop_contract import VerificationFeedbackRecord
     from backend.services.verification_service import (
         VerificationService,
         verification_service,
@@ -71,6 +75,8 @@ except (ImportError, ModuleNotFoundError):
         VerificationConcurrencyError,
         VerificationIdempotencyConflictError,
     )
+    from backend.repositories.mission_repository import MissionNotFoundError
+    from backend.services.mission_service import MissionPermissionError
 
 router = APIRouter(
     prefix="/api/v3/missions/{mission_id}/verifications",
@@ -179,6 +185,43 @@ async def list_mission_verifications(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="An internal error occurred while listing verification runs.",
+        )
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v3/missions/{mission_id}/verifications/feedback - Mission Feedback
+# ---------------------------------------------------------------------------
+
+@router.get("/feedback", response_model=List[VerificationFeedbackRecord], status_code=status.HTTP_200_OK)
+async def list_mission_verification_feedback(
+    mission_id: str,
+    limit: int = Query(50, ge=1, le=200),
+    user: Identity = Depends(require_permission("mission.verification.read")),
+):
+    """
+    Lists closed-loop feedback records for a specific mission.
+    Requires 'mission.verification.read' permission.
+    Strictly isolated to caller's authoritative tenant and workspace boundaries.
+    """
+    try:
+        # Validate that mission exists and is accessible to caller
+        verification_service.mission_service.get_mission(user, mission_id)
+        records = verification_service.repository.list_feedback_records(
+            tenant_id=user.tenant_id,
+            workspace_id=user.workspace_id,
+            mission_id=mission_id,
+            limit=limit,
+        )
+        return records
+    except (MissionNotFoundError, VerificationNotFoundError) as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except (MissionPermissionError, VerificationPermissionError) as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except Exception as e:
+        logger.error("Error retrieving feedback records for mission %s: %s", mission_id, e)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An internal error occurred while retrieving feedback records.",
         )
 
 
@@ -362,4 +405,40 @@ async def get_mission_verification_audit(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="An internal error occurred while retrieving verification audit trail.",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Closed-Loop Tenant Feedback Router
+# ---------------------------------------------------------------------------
+
+feedback_router = APIRouter(
+    prefix="/api/v3/verification/feedback",
+    tags=["Closed-Loop Learning"],
+)
+
+
+@feedback_router.get("", response_model=List[VerificationFeedbackRecord], status_code=status.HTTP_200_OK)
+async def list_all_verification_feedback(
+    mission_id: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    user: Identity = Depends(require_permission("mission.verification.read")),
+):
+    """
+    Lists closed-loop verification feedback records across missions for caller's tenant/workspace.
+    Requires 'mission.verification.read' permission.
+    """
+    try:
+        records = verification_service.repository.list_feedback_records(
+            tenant_id=user.tenant_id,
+            workspace_id=user.workspace_id,
+            mission_id=mission_id,
+            limit=limit,
+        )
+        return records
+    except Exception as e:
+        logger.error("Error retrieving tenant feedback records: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An internal error occurred while retrieving feedback records.",
         )

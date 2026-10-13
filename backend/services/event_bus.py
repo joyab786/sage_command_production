@@ -114,8 +114,10 @@ class EventBus:
                 continue
             
             # Provenance source matching
-            if sub.source and sub.source != event.provenance.source:
-                continue
+            if sub.source:
+                prov_source = getattr(event.provenance, "source", None) or (event.provenance if isinstance(event.provenance, str) else str(event.provenance))
+                if sub.source != prov_source:
+                    continue
                 
             matches.append(sub)
             

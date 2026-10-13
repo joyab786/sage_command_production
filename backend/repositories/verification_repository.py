@@ -37,6 +37,10 @@ try:
         TriggerType,
         compute_diagnostic_run_fields,
     )
+    from data.schemas.closed_loop_contract import (
+        VerificationFeedbackRecord,
+        EligibilityStatus,
+    )
 except (ImportError, ModuleNotFoundError):
     from backend.core.config import (
         SAGE_VERIFICATION_DB_PATH,
@@ -53,6 +57,10 @@ except (ImportError, ModuleNotFoundError):
         VerificationProvenance,
         TriggerType,
         compute_diagnostic_run_fields,
+    )
+    from backend.data.schemas.closed_loop_contract import (
+        VerificationFeedbackRecord,
+        EligibilityStatus,
     )
 
 logger = logging.getLogger("verification_repository")
@@ -216,6 +224,49 @@ class VerificationRepository:
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_vaudit_mission_lookup
             ON verification_audit_ledger (tenant_id, workspace_id, mission_id)
+        """)
+
+        # Feedback Records (Closed-Loop Learning foundation - Prompt 37)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS verification_feedback_records (
+                feedback_id TEXT NOT NULL,
+                tenant_id TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
+                plant_id TEXT NOT NULL,
+                trigger_event_id TEXT NOT NULL,
+                trigger_event_fingerprint TEXT NOT NULL,
+                eligibility_status TEXT NOT NULL,
+                eligibility_reason TEXT NOT NULL,
+                mission_id TEXT,
+                mission_revision INTEGER,
+                verification_id TEXT,
+                verification_status TEXT,
+                is_diagnostic INTEGER NOT NULL DEFAULT 0,
+                diagnostic_status TEXT,
+                diagnostic_outcome TEXT,
+                feedback_event_id TEXT,
+                feedback_event_fingerprint TEXT,
+                idempotency_key TEXT,
+                details_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (tenant_id, workspace_id, feedback_id)
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_vfb_mission_lookup
+            ON verification_feedback_records (tenant_id, workspace_id, mission_id, created_at DESC)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_vfb_event
+            ON verification_feedback_records (tenant_id, trigger_event_id)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_vfb_run
+            ON verification_feedback_records (tenant_id, verification_id)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_vfb_idem
+            ON verification_feedback_records (tenant_id, workspace_id, idempotency_key)
         """)
 
         # Backward compatibility migration for existing SQLite schemas
@@ -1088,6 +1139,155 @@ class VerificationRepository:
                     )
                 )
             return records
+
+    # -------------------------------------------------------------------------
+    # Closed-Loop Feedback Records (Prompt 37)
+    # -------------------------------------------------------------------------
+
+    def _row_to_feedback_record(self, r: sqlite3.Row) -> VerificationFeedbackRecord:
+        details = json.loads(r["details_json"]) if r["details_json"] else {}
+        return VerificationFeedbackRecord(
+            feedback_id=r["feedback_id"],
+            tenant_id=r["tenant_id"],
+            workspace_id=r["workspace_id"],
+            plant_id=r["plant_id"],
+            trigger_event_id=r["trigger_event_id"],
+            trigger_event_fingerprint=r["trigger_event_fingerprint"],
+            eligibility_status=EligibilityStatus(r["eligibility_status"]),
+            eligibility_reason=r["eligibility_reason"],
+            mission_id=r["mission_id"],
+            mission_revision=r["mission_revision"],
+            verification_id=r["verification_id"],
+            verification_status=r["verification_status"],
+            is_diagnostic=bool(r["is_diagnostic"]),
+            diagnostic_status=r["diagnostic_status"],
+            diagnostic_outcome=r["diagnostic_outcome"],
+            feedback_event_id=r["feedback_event_id"],
+            feedback_event_fingerprint=r["feedback_event_fingerprint"],
+            idempotency_key=r["idempotency_key"],
+            details=details,
+            created_at=r["created_at"],
+        )
+
+    def save_feedback_record(self, record: VerificationFeedbackRecord) -> VerificationFeedbackRecord:
+        """
+        Persists a closed-loop verification feedback record within tenant & workspace boundaries.
+        Thread-safe, atomic SQLite WAL operation.
+        """
+        sql = """
+            INSERT INTO verification_feedback_records (
+                feedback_id, tenant_id, workspace_id, plant_id,
+                trigger_event_id, trigger_event_fingerprint,
+                eligibility_status, eligibility_reason,
+                mission_id, mission_revision,
+                verification_id, verification_status,
+                is_diagnostic, diagnostic_status, diagnostic_outcome,
+                feedback_event_id, feedback_event_fingerprint,
+                idempotency_key, details_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(tenant_id, workspace_id, feedback_id) DO UPDATE SET
+                eligibility_status = excluded.eligibility_status,
+                eligibility_reason = excluded.eligibility_reason,
+                verification_id = excluded.verification_id,
+                verification_status = excluded.verification_status,
+                is_diagnostic = excluded.is_diagnostic,
+                diagnostic_status = excluded.diagnostic_status,
+                diagnostic_outcome = excluded.diagnostic_outcome,
+                feedback_event_id = excluded.feedback_event_id,
+                feedback_event_fingerprint = excluded.feedback_event_fingerprint,
+                details_json = excluded.details_json
+        """
+        params = (
+            record.feedback_id,
+            record.tenant_id,
+            record.workspace_id,
+            record.plant_id,
+            record.trigger_event_id,
+            record.trigger_event_fingerprint,
+            record.eligibility_status.value if hasattr(record.eligibility_status, "value") else str(record.eligibility_status),
+            record.eligibility_reason,
+            record.mission_id,
+            record.mission_revision,
+            record.verification_id,
+            record.verification_status,
+            1 if record.is_diagnostic else 0,
+            record.diagnostic_status,
+            record.diagnostic_outcome,
+            record.feedback_event_id,
+            record.feedback_event_fingerprint,
+            record.idempotency_key,
+            json.dumps(record.details),
+            record.created_at,
+        )
+        with self._lock, self._get_connection() as conn:
+            conn.execute(sql, params)
+            conn.commit()
+        return record
+
+    def get_feedback_record(
+        self, tenant_id: str, workspace_id: str, feedback_id: str
+    ) -> Optional[VerificationFeedbackRecord]:
+        """Retrieves a single feedback record scoped strictly to tenant and workspace."""
+        query = """
+            SELECT * FROM verification_feedback_records
+            WHERE tenant_id = ? AND workspace_id = ? AND feedback_id = ?
+        """
+        with self._lock, self._get_connection() as conn:
+            row = conn.execute(query, (tenant_id, workspace_id, feedback_id)).fetchone()
+            if not row:
+                return None
+            return self._row_to_feedback_record(row)
+
+    def list_feedback_records(
+        self, tenant_id: str, workspace_id: str, mission_id: Optional[str] = None, limit: int = 50
+    ) -> List[VerificationFeedbackRecord]:
+        """Lists feedback records scoped strictly to tenant and workspace."""
+        query = """
+            SELECT * FROM verification_feedback_records
+            WHERE tenant_id = ? AND workspace_id = ?
+        """
+        params: List[Any] = [tenant_id, workspace_id]
+        if mission_id:
+            query += " AND mission_id = ?"
+            params.append(mission_id)
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(min(max(1, limit), 200))
+
+        with self._lock, self._get_connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+            return [self._row_to_feedback_record(r) for r in rows]
+
+    def get_feedback_by_trigger_event(
+        self, tenant_id: str, trigger_event_id: str
+    ) -> Optional[VerificationFeedbackRecord]:
+        """Retrieves feedback record for a given trigger event within tenant boundary."""
+        query = """
+            SELECT * FROM verification_feedback_records
+            WHERE tenant_id = ? AND trigger_event_id = ?
+            ORDER BY created_at DESC LIMIT 1
+        """
+        with self._lock, self._get_connection() as conn:
+            row = conn.execute(query, (tenant_id, trigger_event_id)).fetchone()
+            if not row:
+                return None
+            return self._row_to_feedback_record(row)
+
+    def check_feedback_idempotency(
+        self, tenant_id: str, workspace_id: str, idempotency_key: str
+    ) -> Optional[VerificationFeedbackRecord]:
+        """Finds existing feedback record for a deterministic idempotency key."""
+        if not idempotency_key:
+            return None
+        query = """
+            SELECT * FROM verification_feedback_records
+            WHERE tenant_id = ? AND workspace_id = ? AND idempotency_key = ?
+            LIMIT 1
+        """
+        with self._lock, self._get_connection() as conn:
+            row = conn.execute(query, (tenant_id, workspace_id, idempotency_key)).fetchone()
+            if not row:
+                return None
+            return self._row_to_feedback_record(row)
 
 
 # Canonical singleton repository instance
