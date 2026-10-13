@@ -213,6 +213,11 @@ CANONICAL_PERMISSIONS: List[Permission] = [
     Permission(permission_id="mission.verification.request", resource="mission_verification", action="request", description="Request bounded continuous verification run for a mission"),
     Permission(permission_id="mission.verification.cancel", resource="mission_verification", action="cancel", description="Cancel pending or in-progress verification run"),
 
+    # Event Driven Architecture Foundation (Prompt 16)
+    Permission(permission_id="events.record", resource="events", action="record", description="Record canonical events to event store"),
+    Permission(permission_id="events.read", resource="events", action="read", description="Read canonical events and query event streams"),
+    Permission(permission_id="events.dispatch.read", resource="events", action="dispatch.read", description="Inspect event bus subscriptions and deliveries"),
+
     # System Administration (Strictly Non-Operational)
     Permission(permission_id="user.manage", resource="user", action="manage", description="Create, update, or suspend user identities", is_sensitive=True),
     Permission(permission_id="system.config", resource="system", action="config", description="Configure platform infrastructure and endpoints", is_sensitive=True),
@@ -249,7 +254,7 @@ SYSTEM_ROLES: List[Role] = [
         role_id="VIEWER",
         name="Viewer",
         scope_type=RoleScopeType.SYSTEM,
-        permissions=["telemetry.read", "database.read", "action.read", "policy.read", "transaction.read", "ontology.read", "knowledge_graph.read", "digital_twin.read", "data_quality.read", "incidents.read", "rca.read", "blast_radius.read", "demand_forecasting.read", "supplier_risk.read", "sensor_fusion.read", "what_if_simulation.read", "optimization.read", "decision_engine.read", "evidence_explainability.read", "confidence_uncertainty.read", "sop_rag.read", "memory.read", "mission.read", "mission.verification.read"],
+        permissions=["telemetry.read", "database.read", "action.read", "policy.read", "transaction.read", "ontology.read", "knowledge_graph.read", "digital_twin.read", "data_quality.read", "incidents.read", "rca.read", "blast_radius.read", "demand_forecasting.read", "supplier_risk.read", "sensor_fusion.read", "what_if_simulation.read", "optimization.read", "decision_engine.read", "evidence_explainability.read", "confidence_uncertainty.read", "sop_rag.read", "memory.read", "mission.read", "mission.verification.read", "events.read", "events.dispatch.read"],
         inherits_from=[],
         description="Read-only observer access to telemetry, action states, and policy rules.",
         is_system_role=True
@@ -272,7 +277,8 @@ SYSTEM_ROLES: List[Role] = [
             "transaction.plan", "transaction.cancel", "action.execute", "transaction.execute",
             "incidents.create", "incidents.acknowledge", "incidents.transition", "incidents.update",
             "incidents.assign", "incidents.evidence.write", "incidents.notes.write", "rca.analyze",
-            "blast_radius.analyze", "sop_rag.ingest", "memory.write", "mission.create", "mission.update", "mission.cancel", "mission.verification.cancel"
+            "blast_radius.analyze", "sop_rag.ingest", "memory.write", "mission.create", "mission.update", "mission.cancel", "mission.verification.cancel",
+            "events.record"
         ],
         inherits_from=["ANALYST"],
         description="Line operator authorized to propose and execute structured operational actions on assigned plant lines.",
@@ -331,7 +337,8 @@ SYSTEM_ROLES: List[Role] = [
             "user.manage", "system.config", "tenant.admin", "role.assign",
             "database.connection.create", "database.connection.admin", "ontology.manage", "knowledge_graph.manage", "digital_twin.manage", "data_quality.manage", "incidents.admin", "rca.admin", "blast_radius.admin", "demand_forecasting.admin", "supplier_risk.admin", "sensor_fusion.admin", "what_if_simulation.admin", "optimization.admin", "decision_engine.admin", "evidence_explainability.admin", "confidence_uncertainty.admin", "sop_rag.ingest", "sop_rag.admin", "memory.write", "memory.verify", "memory.admin",
             "mission.read", "mission.create", "mission.update", "mission.validate", "mission.review", "mission.cancel", "mission.admin",
-            "mission.verification.read", "mission.verification.request", "mission.verification.cancel"
+            "mission.verification.read", "mission.verification.request", "mission.verification.cancel",
+            "events.record", "events.read", "events.dispatch.read"
         ],
         inherits_from=["VIEWER"],
         description="Platform administrator. Strictly non-operational; cannot propose or approve factory actions.",

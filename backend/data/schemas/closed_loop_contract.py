@@ -106,8 +106,8 @@ class EligibilityDecision(BaseModel):
 
     # Authoritative Scopes derived from canonical event (never from payload)
     tenant_id: str = Field(..., max_length=128)
-    workspace_id: str = Field(default="global", max_length=128)
-    plant_id: str = Field(default="global", max_length=128)
+    workspace_id: str = Field(..., max_length=128)
+    plant_id: str = Field(..., max_length=128)
 
     # Event references
     trigger_event_id: str = Field(..., max_length=128)
@@ -147,8 +147,8 @@ class VerificationFeedbackRecord(BaseModel):
 
     feedback_id: str = Field(..., max_length=64, description="Unique feedback identifier")
     tenant_id: str = Field(..., max_length=128, description="Authoritative tenant isolation boundary")
-    workspace_id: str = Field(default="global", max_length=128)
-    plant_id: str = Field(default="global", max_length=128)
+    workspace_id: str = Field(..., max_length=128)
+    plant_id: str = Field(..., max_length=128)
 
     # Trigger Event linkage
     trigger_event_id: str = Field(..., max_length=128)

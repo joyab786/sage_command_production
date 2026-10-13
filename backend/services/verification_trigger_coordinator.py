@@ -81,6 +81,9 @@ try:
         VerificationRepository,
         verification_repository,
     )
+    from services.mission_service import MissionService, mission_service
+    from repositories.mission_repository import MissionRepository
+    from data.schemas.mission_contract import Mission
     from services.verification_rules import _parse_iso_timestamp
 except (ImportError, ModuleNotFoundError):
     from backend.core.config import (
@@ -133,6 +136,9 @@ except (ImportError, ModuleNotFoundError):
         VerificationRepository,
         verification_repository,
     )
+    from backend.services.mission_service import MissionService, mission_service
+    from backend.repositories.mission_repository import MissionRepository
+    from backend.data.schemas.mission_contract import Mission
     from backend.services.verification_rules import _parse_iso_timestamp
 
 logger = logging.getLogger("verification_trigger_coordinator")
@@ -161,12 +167,16 @@ class VerificationTriggerCoordinator:
         event_bus: Optional[EventBus] = None,
         verification_svc: Optional[VerificationService] = None,
         repository: Optional[VerificationRepository] = None,
+        mission_svc: Optional[MissionService] = None,
+        mission_repo: Optional[MissionRepository] = None,
         enabled: Optional[bool] = None,
         event_trigger_enabled: Optional[bool] = None,
     ):
         self.event_bus = event_bus or get_event_bus()
         self.verification_service = verification_svc or verification_service
         self.repository = repository or verification_repository
+        self.mission_service = mission_svc or getattr(self.verification_service, "mission_service", mission_service)
+        self.mission_repository = mission_repo or getattr(self.mission_service, "repository", None) or MissionRepository()
         self.enabled = SAGE_CLOSED_LOOP_ENABLED if enabled is None else enabled
         self.event_trigger_enabled = (
             SAGE_VERIFICATION_EVENT_TRIGGER_ENABLED
@@ -184,8 +194,15 @@ class VerificationTriggerCoordinator:
     ) -> Subscription:
         """
         Binds the coordinator to the tenant's EventBus subscription channel.
-        Strict tenant boundary is preserved.
+        Strict tenant boundary is preserved. Rejects wildcard and manufactured scopes.
         """
+        if not tenant_id or not tenant_id.strip() or tenant_id.lower() in ("*", "global", "default", "unknown"):
+            raise ValueError(f"Cannot register closed-loop subscription with invalid tenant: '{tenant_id}'.")
+        if workspace_id is not None and (not workspace_id.strip() or workspace_id.lower() in ("*", "global", "default", "unknown")):
+            raise ValueError(f"Cannot register closed-loop subscription with invalid workspace: '{workspace_id}'.")
+        if plant_id is not None and (not plant_id.strip() or plant_id.lower() in ("*", "global", "default", "unknown")):
+            raise ValueError(f"Cannot register closed-loop subscription with invalid plant: '{plant_id}'.")
+
         sub_id = f"sub_closed_loop_{tenant_id}"
         if workspace_id:
             sub_id += f"_{workspace_id}"
@@ -266,9 +283,9 @@ class VerificationTriggerCoordinator:
                 status=EligibilityStatus.IGNORED,
                 reason_code=EligibilityReasonCode.DISABLED.value,
                 explanation="Closed-loop verification trigger is currently disabled by configuration.",
-                tenant_id=event.tenant_id,
-                workspace_id=event.workspace_id,
-                plant_id=event.plant_id,
+                tenant_id=str(event.tenant_id or ""),
+                workspace_id=str(event.workspace_id or ""),
+                plant_id=str(event.plant_id or ""),
                 trigger_event_id=event.event_id,
                 trigger_event_fingerprint=event.event_fingerprint or event.compute_fingerprint(),
                 trigger_event_type=event.event_type,
@@ -282,9 +299,9 @@ class VerificationTriggerCoordinator:
                 status=EligibilityStatus.IGNORED,
                 reason_code=EligibilityReasonCode.FEEDBACK_LOOP_GUARD.value,
                 explanation="Event is a verification feedback event and was ignored by the feedback loop guard.",
-                tenant_id=event.tenant_id,
-                workspace_id=event.workspace_id,
-                plant_id=event.plant_id,
+                tenant_id=str(event.tenant_id or ""),
+                workspace_id=str(event.workspace_id or ""),
+                plant_id=str(event.plant_id or ""),
                 trigger_event_id=event.event_id,
                 trigger_event_fingerprint=event.event_fingerprint or event.compute_fingerprint(),
                 trigger_event_type=event.event_type,
@@ -292,15 +309,15 @@ class VerificationTriggerCoordinator:
                 decided_at=now_iso,
             )
 
-        # 3. Check Scope Boundaries (Fail-closed on missing or invalid tenant/plant)
-        if not event.tenant_id or not event.tenant_id.strip() or event.tenant_id == "global":
+        # 3. Check Scope Boundaries (Fail-closed on missing, blank, or 'global'/'unknown'/'default')
+        if not event.tenant_id or not event.tenant_id.strip() or event.tenant_id.lower() in ("global", "unknown", "default"):
             return EligibilityDecision(
                 status=EligibilityStatus.REJECTED,
                 reason_code=EligibilityReasonCode.MISSING_SCOPE.value,
                 explanation="Authoritative tenant isolation boundary is missing or invalid.",
-                tenant_id=event.tenant_id or "unknown",
-                workspace_id=event.workspace_id,
-                plant_id=event.plant_id,
+                tenant_id=str(event.tenant_id or ""),
+                workspace_id=str(event.workspace_id or ""),
+                plant_id=str(event.plant_id or ""),
                 trigger_event_id=event.event_id,
                 trigger_event_fingerprint=event.event_fingerprint or event.compute_fingerprint(),
                 trigger_event_type=event.event_type,
@@ -308,14 +325,29 @@ class VerificationTriggerCoordinator:
                 decided_at=now_iso,
             )
 
-        if not event.plant_id or not event.plant_id.strip() or event.plant_id == "global":
+        if not event.workspace_id or not event.workspace_id.strip() or event.workspace_id.lower() in ("global", "unknown", "default"):
+            return EligibilityDecision(
+                status=EligibilityStatus.REJECTED,
+                reason_code=EligibilityReasonCode.MISSING_SCOPE.value,
+                explanation="Authoritative workspace isolation boundary is missing or non-specific ('global').",
+                tenant_id=event.tenant_id,
+                workspace_id=str(event.workspace_id or ""),
+                plant_id=str(event.plant_id or ""),
+                trigger_event_id=event.event_id,
+                trigger_event_fingerprint=event.event_fingerprint or event.compute_fingerprint(),
+                trigger_event_type=event.event_type,
+                trigger_category=event.category.value,
+                decided_at=now_iso,
+            )
+
+        if not event.plant_id or not event.plant_id.strip() or event.plant_id.lower() in ("global", "unknown", "default"):
             return EligibilityDecision(
                 status=EligibilityStatus.REJECTED,
                 reason_code=EligibilityReasonCode.MISSING_SCOPE.value,
                 explanation="Authoritative plant scope boundary is missing or non-specific ('global').",
                 tenant_id=event.tenant_id,
                 workspace_id=event.workspace_id,
-                plant_id=event.plant_id or "unknown",
+                plant_id=str(event.plant_id or ""),
                 trigger_event_id=event.event_id,
                 trigger_event_fingerprint=event.event_fingerprint or event.compute_fingerprint(),
                 trigger_event_type=event.event_type,
@@ -323,7 +355,24 @@ class VerificationTriggerCoordinator:
                 decided_at=now_iso,
             )
 
-        # 4. Check Event Provenance
+        # 4. Check Event Fingerprint Determinism (Client cannot forge arbitrary fingerprint)
+        computed_fp = event.compute_fingerprint()
+        if event.event_fingerprint and event.event_fingerprint != computed_fp:
+            return EligibilityDecision(
+                status=EligibilityStatus.REJECTED,
+                reason_code=EligibilityReasonCode.UNTRUSTED_PROVENANCE.value,
+                explanation="Event fingerprint does not match deterministically computed canonical content.",
+                tenant_id=event.tenant_id,
+                workspace_id=event.workspace_id,
+                plant_id=event.plant_id,
+                trigger_event_id=event.event_id,
+                trigger_event_fingerprint=computed_fp,
+                trigger_event_type=event.event_type,
+                trigger_category=event.category.value,
+                decided_at=now_iso,
+            )
+
+        # 5. Check Event Provenance
         prov_val = str(getattr(event.provenance, "source", None) or event.provenance or "").strip()
         if not prov_val or prov_val.lower() in ("untrusted", "unknown", "fake", "spoofed"):
             return EligibilityDecision(
@@ -435,7 +484,11 @@ class VerificationTriggerCoordinator:
         clean_mission_id = str(mission_id).strip()
 
         # Parse optional target specifics from payload
-        mission_rev = payload.get("mission_revision") or payload.get("expected_mission_revision")
+        mission_rev = (
+            payload.get("mission_revision")
+            or payload.get("expected_mission_revision")
+            or payload.get("target_revision")
+        )
         if mission_rev is not None:
             try:
                 mission_rev = int(mission_rev)
@@ -472,16 +525,35 @@ class VerificationTriggerCoordinator:
     # Trusted Server Identity Construction
     # -------------------------------------------------------------------------
 
-    def _build_trusted_service_identity(self, event: CanonicalEvent) -> Identity:
+    def _build_trusted_service_identity(self, target: Any) -> Identity:
         """
-        Builds a strictly bound, server-authoritative service identity.
-        NEVER accepts client-supplied or payload-injected user_id, roles, or clearance.
+        Builds a strictly bound, server-authoritative service identity from
+        independently validated scope.
+        NEVER accepts client-supplied or payload-injected user_id, roles, clearance, or envelope scopes.
         """
+        if isinstance(target, Mission):
+            tenant_id = target.scope.tenant_id
+            workspace_id = target.scope.workspace_id
+            plant_id = target.scope.plant_id
+        elif isinstance(target, CanonicalEvent):
+            tenant_id = target.tenant_id
+            workspace_id = target.workspace_id
+            plant_id = target.plant_id
+        else:
+            raise ValueError(f"Unsupported target for service identity construction: {type(target)}")
+
+        if not tenant_id or not tenant_id.strip() or tenant_id.lower() in ("global", "unknown", "default"):
+            raise ValueError(f"Cannot construct trusted service identity with invalid tenant: '{tenant_id}'.")
+        if not workspace_id or not workspace_id.strip() or workspace_id.lower() in ("global", "unknown", "default"):
+            raise ValueError(f"Cannot construct trusted service identity with invalid workspace: '{workspace_id}'.")
+        if not plant_id or not plant_id.strip() or plant_id.lower() in ("global", "unknown", "default"):
+            raise ValueError(f"Cannot construct trusted service identity with invalid plant: '{plant_id}'.")
+
         return Identity(
-            user_id=f"system:closed_loop_coordinator:{event.tenant_id}",
-            tenant_id=event.tenant_id,
-            workspace_id=event.workspace_id or "global",
-            assigned_plants=[event.plant_id] if event.plant_id and event.plant_id != "global" else [],
+            user_id=f"system:closed_loop_coordinator:{tenant_id}",
+            tenant_id=tenant_id,
+            workspace_id=workspace_id,
+            assigned_plants=[plant_id],
             roles=["SYSTEM_VERIFIER"],
             permissions=[
                 "mission.verification.request",
@@ -528,12 +600,77 @@ class VerificationTriggerCoordinator:
     ) -> Tuple[Optional[VerificationRun], Optional[str]]:
         """
         Invokes continuous verification through the existing VerificationService.
-        Enforces scope validation and idempotency. Returns (VerificationRun, error_reason).
+        Enforces independent mission scope validation and idempotency. Returns (VerificationRun, error_reason).
         """
-        if not decision.mission_id:
-            return None, "MISSING_MISSION_ID"
+        # 1. Validate that tenant, workspace, and plant are present and valid
+        if (
+            not event.tenant_id or not event.tenant_id.strip() or event.tenant_id.lower() in ("global", "unknown", "default")
+            or not event.workspace_id or not event.workspace_id.strip() or event.workspace_id.lower() in ("global", "unknown", "default")
+            or not event.plant_id or not event.plant_id.strip() or event.plant_id.lower() in ("global", "unknown", "default")
+        ):
+            logger.warning("Event '%s' has missing or invalid scope boundary", event.event_id)
+            return None, EligibilityReasonCode.MISSING_SCOPE.value
 
-        trusted_identity = self._build_trusted_service_identity(event)
+        if not decision.mission_id or not str(decision.mission_id).strip():
+            return None, EligibilityReasonCode.MISSING_TARGET_REFERENCE.value
+
+        # 2. Resolve the referenced mission using existing repository methods
+        mission = self.mission_repository.get_mission(
+            tenant_id=event.tenant_id,
+            workspace_id=event.workspace_id,
+            mission_id=decision.mission_id,
+        )
+        if not mission:
+            logger.warning(
+                "Mission '%s' not found within authorized scope (tenant='%s', workspace='%s')",
+                decision.mission_id,
+                event.tenant_id,
+                event.workspace_id,
+            )
+            return None, EligibilityReasonCode.MISSING_TARGET_REFERENCE.value
+
+        # 3. Verify that the mission actually belongs to the event's authorized tenant, workspace, and plant scope
+        if (
+            mission.scope.tenant_id != event.tenant_id
+            or mission.scope.workspace_id != event.workspace_id
+            or mission.scope.plant_id != event.plant_id
+        ):
+            logger.warning(
+                "Scope mismatch for mission '%s': mission scope (%s/%s/%s) does not match event scope (%s/%s/%s)",
+                decision.mission_id,
+                mission.scope.tenant_id,
+                mission.scope.workspace_id,
+                mission.scope.plant_id,
+                event.tenant_id,
+                event.workspace_id,
+                event.plant_id,
+            )
+            return None, EligibilityReasonCode.SCOPE_MISMATCH.value
+
+        # 4. Verify that the requested mission revision and target are valid
+        if decision.mission_revision is not None and decision.mission_revision != mission.revision:
+            logger.warning(
+                "Mission '%s' revision mismatch: requested revision %s, current revision %s",
+                decision.mission_id,
+                decision.mission_revision,
+                mission.revision,
+            )
+            return None, EligibilityReasonCode.SCOPE_MISMATCH.value
+
+        if decision.target_type and decision.target_id:
+            if decision.target_type == VerificationTargetType.CRITERION:
+                crit_ids = {c.criterion_id for c in mission.success_criteria}
+                if decision.target_id not in crit_ids:
+                    logger.warning("Target criterion '%s' not found on mission '%s'", decision.target_id, decision.mission_id)
+                    return None, EligibilityReasonCode.MISSING_TARGET_REFERENCE.value
+            elif decision.target_type == VerificationTargetType.STEP:
+                step_ids = {s.step_id for s in mission.planned_steps}
+                if decision.target_id not in step_ids:
+                    logger.warning("Target step '%s' not found on mission '%s'", decision.target_id, decision.mission_id)
+                    return None, EligibilityReasonCode.MISSING_TARGET_REFERENCE.value
+
+        # 5. Confirm that the service identity is constructed from independently validated scope
+        trusted_identity = self._build_trusted_service_identity(mission)
         idempotency_key = self._compute_trigger_idempotency_key(event, decision)
 
         req = VerificationRequest(
@@ -548,7 +685,7 @@ class VerificationTriggerCoordinator:
         try:
             run = self.verification_service.request_verification(
                 identity=trusted_identity,
-                mission_id=decision.mission_id,
+                mission_id=mission.mission_id,
                 request=req,
                 request_id=f"req_cl_{event.event_id[:16]}",
                 trace_id=event.correlation_id or event.event_id,
@@ -606,11 +743,20 @@ class VerificationTriggerCoordinator:
         decision: EligibilityDecision,
         run: Optional[VerificationRun],
         error_reason: Optional[str] = None,
-    ) -> VerificationFeedbackRecord:
+    ) -> Optional[VerificationFeedbackRecord]:
         """
         Records durable feedback in the repository and publishes a structured
         feedback event to the EventBus.
+        Fails safe and refuses to persist fabricated scopes when scope is incomplete.
         """
+        # Invariant: Do not persist a fabricated scope in feedback records
+        if (
+            not event.tenant_id or not event.tenant_id.strip() or event.tenant_id.lower() in ("global", "unknown", "default")
+            or not event.workspace_id or not event.workspace_id.strip() or event.workspace_id.lower() in ("global", "unknown", "default")
+            or not event.plant_id or not event.plant_id.strip() or event.plant_id.lower() in ("global", "unknown", "default")
+        ):
+            logger.info("Skipping feedback record persistence: scope is incomplete or fabricated.")
+            return None
         now_dt = datetime.now(timezone.utc)
         now_iso = now_dt.isoformat().replace("+00:00", "Z")
         feedback_id = f"fb_{uuid.uuid4().hex[:16]}"

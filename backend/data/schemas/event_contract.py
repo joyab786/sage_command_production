@@ -66,8 +66,8 @@ class CanonicalEvent(BaseModel):
 
     # Scope boundaries (MANDATORY)
     tenant_id: str = Field(..., description="Authoritative tenant isolation boundary")
-    workspace_id: str = Field(default="global", description="Workspace isolation boundary")
-    plant_id: str = Field(default="global", description="Physical plant boundary")
+    workspace_id: str = Field(default="", description="Workspace isolation boundary")
+    plant_id: str = Field(default="", description="Physical plant boundary")
 
     # Classification
     category: EventCategory = Field(...)

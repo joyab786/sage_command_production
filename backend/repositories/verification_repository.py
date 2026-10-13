@@ -1173,7 +1173,24 @@ class VerificationRepository:
         """
         Persists a closed-loop verification feedback record within tenant & workspace boundaries.
         Thread-safe, atomic SQLite WAL operation.
+        Fails closed if scope is missing, blank, or manufactured.
         """
+        if (
+            not record.tenant_id
+            or not record.tenant_id.strip()
+            or record.tenant_id.lower() in ("global", "unknown", "default")
+            or not record.workspace_id
+            or not record.workspace_id.strip()
+            or record.workspace_id.lower() in ("global", "unknown", "default")
+            or not record.plant_id
+            or not record.plant_id.strip()
+            or record.plant_id.lower() in ("global", "unknown", "default")
+        ):
+            raise ValueError(
+                f"Cannot persist feedback record with missing or fabricated scope: "
+                f"tenant='{record.tenant_id}', workspace='{record.workspace_id}', plant='{record.plant_id}'."
+            )
+
         sql = """
             INSERT INTO verification_feedback_records (
                 feedback_id, tenant_id, workspace_id, plant_id,

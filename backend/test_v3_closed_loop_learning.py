@@ -95,6 +95,7 @@ try:
     )
     from services.event_bus import EventBus
     from services.event_delivery_repository import EventDeliveryRepository
+    from services.event_repository import EventRepository
     from repositories.verification_repository import VerificationRepository
     from services.verification_service import VerificationService
     from repositories.mission_repository import MissionRepository
@@ -151,6 +152,7 @@ except (ImportError, ModuleNotFoundError):
     )
     from backend.services.event_bus import EventBus
     from backend.services.event_delivery_repository import EventDeliveryRepository
+    from backend.services.event_repository import EventRepository
     from backend.repositories.verification_repository import VerificationRepository
     from backend.services.verification_service import VerificationService
     from backend.repositories.mission_repository import MissionRepository
@@ -842,3 +844,494 @@ class TestClosedLoopRestApi:
         finally:
             vr.verification_service = orig_vs
             app.dependency_overrides.clear()
+
+
+# =============================================================================
+# 8. AUTHENTICATED EVENT PRODUCER SECURITY (Prompt 37A Section 3 & 9)
+# =============================================================================
+
+class TestAuthenticatedEventProducerSecurity:
+    @pytest.fixture
+    def api_setup(self, temp_dbs):
+        event_db = temp_dbs[0]
+        delivery_db = temp_dbs[1]
+        ev_repo = EventRepository(db_path=event_db)
+        deliv_repo = EventDeliveryRepository(db_path=delivery_db)
+        ebus = EventBus(deliv_repo)
+        ebus.enabled = True
+        client = TestClient(app)
+        try:
+            import api.event_routes as er
+        except (ImportError, ModuleNotFoundError):
+            import backend.api.event_routes as er
+        app.dependency_overrides[er.get_event_repo] = lambda: ev_repo
+        app.dependency_overrides[er.get_event_bus] = lambda: ebus
+        yield client, ev_repo, ebus
+        app.dependency_overrides.clear()
+
+    def test_25_producer_submits_different_tenant_event_rejected(self, api_setup):
+        """Producer authenticated in tenant_alpha cannot submit event for tenant_bravo (HTTP 403)."""
+        client, ev_repo, _ = api_setup
+        producer = Identity(
+            user_id="op_alpha",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            assigned_plants=["plant_01"],
+            roles=["OPERATOR"],
+            permissions=["events.record"],
+        )
+        app.dependency_overrides[get_current_identity] = lambda: producer
+
+        evt = make_operational_event(tenant_id="tenant_bravo", workspace_id="workspace_prod", plant_id="plant_01")
+        resp = client.post("/api/v3/events", json=evt.model_dump())
+        assert resp.status_code == 403
+        assert "different tenant" in resp.json()["detail"].lower()
+        # Ensure rejected event is NOT persisted
+        assert ev_repo.get_event("tenant_bravo", evt.event_id) is None
+        assert ev_repo.get_event("tenant_alpha", evt.event_id) is None
+
+    def test_26_producer_submits_unauthorized_workspace_rejected(self, api_setup):
+        """Producer in workspace_prod cannot submit event targeting unauthorized workspace_dev (HTTP 403)."""
+        client, ev_repo, _ = api_setup
+        producer = Identity(
+            user_id="op_alpha",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            assigned_plants=["plant_01"],
+            roles=["OPERATOR"],
+            permissions=["events.record"],
+        )
+        app.dependency_overrides[get_current_identity] = lambda: producer
+
+        evt = make_operational_event(tenant_id="tenant_alpha", workspace_id="workspace_dev", plant_id="plant_01")
+        resp = client.post("/api/v3/events", json=evt.model_dump())
+        assert resp.status_code == 403
+        assert "workspace" in resp.json()["detail"].lower()
+        assert ev_repo.get_event("tenant_alpha", evt.event_id) is None
+
+    def test_27_producer_submits_unauthorized_plant_rejected(self, api_setup):
+        """Producer authorized only for plant_01 cannot submit event for plant_02 (HTTP 403)."""
+        client, ev_repo, _ = api_setup
+        producer = Identity(
+            user_id="op_alpha",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            assigned_plants=["plant_01"],
+            roles=["OPERATOR"],
+            permissions=["events.record"],
+        )
+        app.dependency_overrides[get_current_identity] = lambda: producer
+
+        evt = make_operational_event(tenant_id="tenant_alpha", workspace_id="workspace_prod", plant_id="plant_02")
+        resp = client.post("/api/v3/events", json=evt.model_dump())
+        assert resp.status_code == 403
+        assert "plant" in resp.json()["detail"].lower()
+        assert ev_repo.get_event("tenant_alpha", evt.event_id) is None
+
+    def test_28_producer_forged_payload_fields_no_escalation(self, api_setup):
+        """Producer attempting to forge identity/permissions in payload cannot escalate privileges."""
+        client, ev_repo, _ = api_setup
+        producer = Identity(
+            user_id="op_alpha",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            assigned_plants=["plant_01"],
+            roles=["OPERATOR"],
+            permissions=["events.record"],
+        )
+        app.dependency_overrides[get_current_identity] = lambda: producer
+
+        forged_payload = {
+            "user_id": "root_admin",
+            "roles": ["SUPERADMIN", "ADMINISTRATOR"],
+            "permissions": ["*"],
+            "clearance": 5,
+            "workspace_id": "system_admin",
+            "plant_id": "all_plants",
+        }
+        evt = make_operational_event(
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            plant_id="plant_01",
+            payload_extra=forged_payload,
+        )
+        resp = client.post("/api/v3/events", json=evt.model_dump())
+        assert resp.status_code == 201
+        saved = ev_repo.get_event("tenant_alpha", evt.event_id)
+        assert saved is not None
+        # Verify event saved has strictly the authenticated producer's tenant/workspace
+        assert saved.tenant_id == "tenant_alpha"
+        assert saved.workspace_id == "workspace_prod"
+        assert saved.plant_id == "plant_01"
+
+    def test_29_missing_workspace_scope_rejected(self, api_setup):
+        """Submitting event with missing or blank workspace fails closed (HTTP 400)."""
+        client, ev_repo, _ = api_setup
+        producer = Identity(
+            user_id="op_alpha",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            assigned_plants=["plant_01"],
+            roles=["OPERATOR"],
+            permissions=["events.record"],
+        )
+        app.dependency_overrides[get_current_identity] = lambda: producer
+
+        raw_evt = make_operational_event().model_dump()
+        raw_evt["workspace_id"] = ""
+        raw_evt["event_fingerprint"] = ""
+        resp = client.post("/api/v3/events", json=raw_evt)
+        assert resp.status_code == 400
+        assert "workspace scope is missing or invalid" in resp.json()["detail"].lower()
+
+    def test_30_missing_plant_scope_rejected(self, api_setup):
+        """Submitting event with missing or blank plant fails closed (HTTP 400)."""
+        client, ev_repo, _ = api_setup
+        producer = Identity(
+            user_id="op_alpha",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            assigned_plants=["plant_01"],
+            roles=["OPERATOR"],
+            permissions=["events.record"],
+        )
+        app.dependency_overrides[get_current_identity] = lambda: producer
+
+        raw_evt = make_operational_event().model_dump()
+        raw_evt["plant_id"] = ""
+        raw_evt["event_fingerprint"] = ""
+        resp = client.post("/api/v3/events", json=raw_evt)
+        assert resp.status_code == 400
+        assert "plant scope is missing or invalid" in resp.json()["detail"].lower()
+
+    def test_31_global_scope_without_authorization_rejected(self, api_setup):
+        """Submitting manufactured 'global' scope is rejected (HTTP 400)."""
+        client, ev_repo, _ = api_setup
+        producer = Identity(
+            user_id="op_alpha",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            assigned_plants=["plant_01"],
+            roles=["OPERATOR"],
+            permissions=["events.record"],
+        )
+        app.dependency_overrides[get_current_identity] = lambda: producer
+
+        raw_evt = make_operational_event().model_dump()
+        raw_evt["workspace_id"] = "global"
+        raw_evt["event_fingerprint"] = ""
+        resp = client.post("/api/v3/events", json=raw_evt)
+        assert resp.status_code == 400
+        assert "workspace scope is missing or invalid" in resp.json()["detail"].lower()
+
+    def test_32_rejected_events_not_persisted_or_dispatched(self, api_setup):
+        """Assert that rejected event is neither in SQLite store nor dispatched to subscribers."""
+        client, ev_repo, ebus = api_setup
+        producer = Identity(
+            user_id="op_alpha",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            assigned_plants=["plant_01"],
+            roles=["OPERATOR"],
+            permissions=["events.record"],
+        )
+        app.dependency_overrides[get_current_identity] = lambda: producer
+
+        received_events = []
+        async def on_event(delivery, ev):
+            received_events.append(ev)
+            return True
+
+        sub = Subscription(subscription_id="sub_test", subscriber_id="sub_test", tenant_id="tenant_bravo")
+        ebus.subscribe(sub, on_event)
+
+        evt = make_operational_event(tenant_id="tenant_bravo", workspace_id="workspace_prod", plant_id="plant_01")
+        resp = client.post("/api/v3/events", json=evt.model_dump())
+        assert resp.status_code == 403
+        assert ev_repo.get_event("tenant_bravo", evt.event_id) is None
+        assert len(received_events) == 0
+
+
+# =============================================================================
+# 9. COORDINATOR SCOPE & INDEPENDENT VERIFICATION BOUNDARY (Prompt 37A Section 4 & 9)
+# =============================================================================
+
+class TestCoordinatorScopeSecurity:
+    def test_33_forged_envelope_cannot_obtain_service_identity_for_other_workspace(
+        self, coordinator, sample_mission, v_repo
+    ):
+        """Forged envelope workspace cannot grant service identity for that workspace."""
+        forged_evt = make_operational_event(
+            workspace_id="workspace_stolen",
+            payload_extra={"roles": ["SUPERADMIN"], "clearance": 5}
+        )
+        dec = coordinator.evaluate_eligibility(forged_evt)
+
+        async def run():
+            run_obj, err = await coordinator.request_verification(forged_evt, dec)
+            assert run_obj is None
+            assert err in (EligibilityReasonCode.SCOPE_MISMATCH.value, EligibilityReasonCode.MISSING_TARGET_REFERENCE.value)
+            # Assert absence of any unauthorized verification runs in database
+            _, total = v_repo.list_runs("tenant_alpha", "workspace_prod", sample_mission.mission_id)
+            assert total == 0
+
+        asyncio.run(run())
+
+    def test_34_forged_plant_cannot_cause_cross_plant_verification(
+        self, coordinator, sample_mission, v_repo
+    ):
+        """Event with unauthorized plant_02 cannot trigger verification on mission in plant_01."""
+        evt = make_operational_event(plant_id="plant_02")
+        dec = coordinator.evaluate_eligibility(evt)
+
+        async def run():
+            run_obj, err = await coordinator.request_verification(evt, dec)
+            assert run_obj is None
+            assert err == EligibilityReasonCode.SCOPE_MISMATCH.value
+            _, total = v_repo.list_runs("tenant_alpha", "workspace_prod", sample_mission.mission_id)
+            assert total == 0
+
+        asyncio.run(run())
+
+    def test_35_mission_in_another_tenant_cannot_be_verified(
+        self, coordinator, sample_mission, v_repo
+    ):
+        """Event from tenant_bravo cannot verify mission belonging to tenant_alpha."""
+        evt = make_operational_event(tenant_id="tenant_bravo", mission_id=sample_mission.mission_id)
+        dec = coordinator.evaluate_eligibility(evt)
+
+        async def run():
+            run_obj, err = await coordinator.request_verification(evt, dec)
+            assert run_obj is None
+            assert err in (EligibilityReasonCode.SCOPE_MISMATCH.value, EligibilityReasonCode.MISSING_TARGET_REFERENCE.value)
+            _, total = v_repo.list_runs("tenant_alpha", "workspace_prod", sample_mission.mission_id)
+            assert total == 0
+
+        asyncio.run(run())
+
+    def test_36_mismatched_mission_revision_rejected(
+        self, coordinator, sample_mission, v_repo
+    ):
+        """Event specifying target_revision=99 against a revision=1 mission is rejected."""
+        evt = make_operational_event(payload_extra={"target_revision": 99})
+        dec = coordinator.evaluate_eligibility(evt)
+
+        async def run():
+            run_obj, err = await coordinator.request_verification(evt, dec)
+            assert run_obj is None
+            assert err == EligibilityReasonCode.SCOPE_MISMATCH.value
+            _, total = v_repo.list_runs("tenant_alpha", "workspace_prod", sample_mission.mission_id)
+            assert total == 0
+
+        asyncio.run(run())
+
+    def test_37_missing_authoritative_scope_does_not_create_run(
+        self, coordinator, sample_mission, v_repo
+    ):
+        """Event with missing plant scope fails closed and creates zero runs."""
+        evt = make_operational_event(plant_id="")
+        dec = coordinator.evaluate_eligibility(evt)
+        assert dec.status == EligibilityStatus.REJECTED
+        assert dec.reason_code == EligibilityReasonCode.MISSING_SCOPE.value
+
+        async def run():
+            run_obj, err = await coordinator.request_verification(evt, dec)
+            assert run_obj is None
+            assert err == EligibilityReasonCode.MISSING_SCOPE.value
+            _, total = v_repo.list_runs("tenant_alpha", "workspace_prod", sample_mission.mission_id)
+            assert total == 0
+
+        asyncio.run(run())
+
+    def test_38_schema_valid_event_with_untrusted_scope_fails(
+        self, coordinator, sample_mission, v_repo
+    ):
+        """CanonicalEvent schema valid with manufactured 'default' scope fails closed."""
+        evt = make_operational_event(workspace_id="default")
+        dec = coordinator.evaluate_eligibility(evt)
+        assert dec.status == EligibilityStatus.REJECTED
+        assert dec.reason_code == EligibilityReasonCode.MISSING_SCOPE.value
+
+        async def run():
+            run_obj, err = await coordinator.request_verification(evt, dec)
+            assert run_obj is None
+            _, total = v_repo.list_runs("tenant_alpha", "workspace_prod", sample_mission.mission_id)
+            assert total == 0
+
+        asyncio.run(run())
+
+
+# =============================================================================
+# 10. FEATURE FLAGS & STARTUP SAFETY (Prompt 37A Section 6, 7 & 9)
+# =============================================================================
+
+class TestFeatureFlagsAndStartupSecurity:
+    def test_39_flags_default_to_disabled_when_env_absent(self):
+        """Both closed-loop and event-trigger flags default to false when env vars absent."""
+        from core.config import SAGE_CLOSED_LOOP_ENABLED, SAGE_VERIFICATION_EVENT_TRIGGER_ENABLED
+        assert SAGE_CLOSED_LOOP_ENABLED is False or str(os.getenv("SAGE_CLOSED_LOOP_ENABLED", "false")).lower() in ("0", "false")
+        assert SAGE_VERIFICATION_EVENT_TRIGGER_ENABLED is False or str(os.getenv("SAGE_VERIFICATION_EVENT_TRIGGER_ENABLED", "false")).lower() in ("0", "false")
+
+    def test_40_either_flag_disabled_prevents_event_triggered_verification(
+        self, event_bus, v_service, v_repo
+    ):
+        """When either SAGE_CLOSED_LOOP_ENABLED or SAGE_VERIFICATION_EVENT_TRIGGER_ENABLED is false, no event triggering occurs."""
+        coord_disabled_1 = VerificationTriggerCoordinator(
+            event_bus=event_bus,
+            verification_svc=v_service,
+            repository=v_repo,
+            enabled=False,
+            event_trigger_enabled=True,
+        )
+        evt = make_operational_event()
+        dec1 = coord_disabled_1.evaluate_eligibility(evt)
+        assert dec1.status == EligibilityStatus.IGNORED
+        assert dec1.reason_code == EligibilityReasonCode.DISABLED.value
+
+        coord_disabled_2 = VerificationTriggerCoordinator(
+            event_bus=event_bus,
+            verification_svc=v_service,
+            repository=v_repo,
+            enabled=True,
+            event_trigger_enabled=False,
+        )
+        dec2 = coord_disabled_2.evaluate_eligibility(evt)
+        assert dec2.status == EligibilityStatus.IGNORED
+        assert dec2.reason_code == EligibilityReasonCode.DISABLED.value
+
+    def test_41_startup_does_not_subscribe_to_default_tenant(self):
+        """AST check: backend/server.py must not contain register_tenant_subscription('default')."""
+        server_path = os.path.join(os.path.dirname(__file__), "server.py")
+        with open(server_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        assert 'register_tenant_subscription("default")' not in content
+        assert "register_tenant_subscription('default')" not in content
+
+    def test_42_missing_subscription_config_leaves_coordinator_inactive(
+        self, event_bus, v_service, v_repo
+    ):
+        """Coordinator with no registered subscriptions processes 0 subscriptions."""
+        coord = VerificationTriggerCoordinator(
+            event_bus=event_bus,
+            verification_svc=v_service,
+            repository=v_repo,
+            enabled=True,
+            event_trigger_enabled=True,
+        )
+        assert len(coord._subscribed_tenants) == 0
+
+    def test_43_explicit_valid_test_scopes_work(
+        self, event_bus, v_service, v_repo
+    ):
+        """Explicit tenant, workspace, plant registration succeeds and rejects manufactured scopes."""
+        coord = VerificationTriggerCoordinator(
+            event_bus=event_bus,
+            verification_svc=v_service,
+            repository=v_repo,
+            enabled=True,
+            event_trigger_enabled=True,
+        )
+        sub = coord.register_tenant_subscription("tenant_alpha", workspace_id="workspace_prod", plant_id="plant_01")
+        assert sub is not None
+        assert sub.tenant_id == "tenant_alpha"
+        assert sub.workspace_id == "workspace_prod"
+        assert sub.plant_id == "plant_01"
+
+        with pytest.raises(ValueError):
+            coord.register_tenant_subscription("default")
+        with pytest.raises(ValueError):
+            coord.register_tenant_subscription("tenant_alpha", workspace_id="*")
+
+    def test_44_manually_requested_continuous_verification_remains_functional(
+        self, v_service, sample_mission, sample_evidence, coordinator
+    ):
+        """Manual VerificationService verification works even if event-trigger coordinator is disabled."""
+        coordinator.enabled = False
+        coordinator.event_trigger_enabled = False
+
+        analyst = Identity(
+            user_id="analyst_direct",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            assigned_plants=["plant_01"],
+            roles=["ANALYST"],
+            permissions=["mission.verification.request"],
+        )
+        req = VerificationRequest(
+            rule_type=RuleType.EVIDENCE_EXISTS,
+            trigger_type=TriggerType.MANUAL,
+        )
+        run_obj = v_service.request_verification(
+            identity=analyst,
+            mission_id=sample_mission.mission_id,
+            request=req,
+        )
+        assert run_obj is not None
+        assert run_obj.mission_id == sample_mission.mission_id
+        assert run_obj.trigger_type == TriggerType.MANUAL
+
+
+# =============================================================================
+# 11. FINGERPRINTS & IDEMPOTENCY INTEGRITY (Prompt 37A Section 8 & 9)
+# =============================================================================
+
+class TestFingerprintIntegrityAndIdempotency:
+    def test_45_missing_fingerprint_safely_computed(self):
+        """An event created without a fingerprint computes its deterministic fingerprint."""
+        evt = make_operational_event()
+        evt.event_fingerprint = ""
+        computed = evt.compute_fingerprint()
+        assert computed != ""
+        evt.apply_fingerprint()
+        assert evt.event_fingerprint == computed
+
+    def test_46_correct_supplied_fingerprint_accepted(self, coordinator):
+        """Event with correct deterministic fingerprint is eligible."""
+        evt = make_operational_event()
+        assert evt.event_fingerprint == evt.compute_fingerprint()
+        dec = coordinator.evaluate_eligibility(evt)
+        assert dec.status == EligibilityStatus.ELIGIBLE
+
+    def test_47_incorrect_supplied_fingerprint_rejected(self, coordinator):
+        """Event with incorrect client-supplied fingerprint fails boundary checks."""
+        evt = make_operational_event()
+        evt.event_fingerprint = "fake_sha256_hash_1234567890abcdef"
+        dec = coordinator.evaluate_eligibility(evt)
+        assert dec.status == EligibilityStatus.REJECTED
+        assert dec.reason_code == EligibilityReasonCode.UNTRUSTED_PROVENANCE.value
+
+    def test_48_fingerprint_reuse_with_different_content_cannot_impersonate(
+        self, coordinator, v_repo
+    ):
+        """Reusing fingerprint of Event A on mutated Event B cannot impersonate Event A."""
+        evt_a = make_operational_event(payload_extra={"measurement": 42.0})
+        fp_a = evt_a.event_fingerprint
+
+        evt_b = make_operational_event(payload_extra={"measurement": 999.0})
+        evt_b.event_fingerprint = fp_a
+
+        dec = coordinator.evaluate_eligibility(evt_b)
+        assert dec.status == EligibilityStatus.REJECTED
+        assert dec.reason_code == EligibilityReasonCode.UNTRUSTED_PROVENANCE.value
+
+    def test_49_legitimate_event_retries_remain_idempotent(
+        self, coordinator, sample_mission, sample_evidence, v_repo
+    ):
+        """Re-delivery of identical event deterministically returns existing verification run."""
+        evt = make_operational_event()
+        dec = coordinator.evaluate_eligibility(evt)
+
+        async def run():
+            run1, err1 = await coordinator.request_verification(evt, dec)
+            assert run1 is not None
+            assert err1 is None
+
+            run2, err2 = await coordinator.request_verification(evt, dec)
+            assert run2 is not None
+            assert err2 is None
+            assert run1.verification_id == run2.verification_id
+
+            runs, total = v_repo.list_runs("tenant_alpha", "workspace_prod", sample_mission.mission_id)
+            assert total == 1
+
+        asyncio.run(run())

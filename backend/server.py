@@ -53,7 +53,11 @@ try:
     from api.verification_routes import router as verification_router, feedback_router
     from services.event_bus import get_event_bus
     from services.verification_trigger_coordinator import get_verification_trigger_coordinator
-    from core.config import SAGE_CLOSED_LOOP_ENABLED
+    from core.config import (
+        SAGE_CLOSED_LOOP_ENABLED,
+        SAGE_VERIFICATION_EVENT_TRIGGER_ENABLED,
+        SAGE_CLOSED_LOOP_SUBSCRIPTION_SCOPES,
+    )
 except (ImportError, ModuleNotFoundError):
     from backend.core.config import SAGE_ALLOWED_ORIGINS, IS_PRODUCTION
     from backend.governance.middleware import (
@@ -98,7 +102,11 @@ except (ImportError, ModuleNotFoundError):
     from backend.api.verification_routes import router as verification_router, feedback_router
     from backend.services.event_bus import get_event_bus
     from backend.services.verification_trigger_coordinator import get_verification_trigger_coordinator
-    from backend.core.config import SAGE_CLOSED_LOOP_ENABLED
+    from backend.core.config import (
+        SAGE_CLOSED_LOOP_ENABLED,
+        SAGE_VERIFICATION_EVENT_TRIGGER_ENABLED,
+        SAGE_CLOSED_LOOP_SUBSCRIPTION_SCOPES,
+    )
 
 app = FastAPI(title="SageCommand V3 Industrial Operations AI OS")
 
@@ -141,10 +149,35 @@ async def startup_event():
     event_bus.start()
     print(" [Server Startup] Launching Factory Simulator background anomaly generator...")
     asyncio.create_task(run_factory_simulation_loop(interval_seconds=40))
-    if SAGE_CLOSED_LOOP_ENABLED:
+    if SAGE_CLOSED_LOOP_ENABLED and SAGE_VERIFICATION_EVENT_TRIGGER_ENABLED:
         print(" [Server Startup] Initializing Closed-Loop Learning Coordinator...")
         coordinator = get_verification_trigger_coordinator()
-        coordinator.register_tenant_subscription("default")
+        raw_scopes = SAGE_CLOSED_LOOP_SUBSCRIPTION_SCOPES.strip()
+        if not raw_scopes:
+            print(
+                " [Server Startup] Closed-loop event triggering is enabled, but no authorized subscription scopes are configured. "
+                "Automatic event-triggered subscription remains inactive (fail-closed)."
+            )
+        else:
+            for scope_entry in raw_scopes.split(","):
+                parts = [p.strip() for p in scope_entry.split(":") if p.strip()]
+                if len(parts) == 3:
+                    t, w, p = parts
+                    if all(v and v not in ("*", "global", "default", "unknown") for v in (t, w, p)):
+                        print(f" [Server Startup] Registering authorized closed-loop subscription for scope {t}/{w}/{p}...")
+                        coordinator.register_tenant_subscription(t, workspace_id=w, plant_id=p)
+                    else:
+                        print(
+                            f" [Server Startup] WARNING: Ignoring invalid closed-loop scope '{scope_entry}': "
+                            "wildcards and manufactured scopes are forbidden."
+                        )
+                else:
+                    print(
+                        f" [Server Startup] WARNING: Ignoring invalid subscription scope format '{scope_entry}': "
+                        "expected 'tenant:workspace:plant'."
+                    )
+    else:
+        print(" [Server Startup] Closed-loop event-triggered verification is disabled by configuration.")
 
 @app.on_event("shutdown")
 async def shutdown_event():
