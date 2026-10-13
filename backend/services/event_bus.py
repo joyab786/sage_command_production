@@ -8,7 +8,8 @@ from core.config import (
     SAGE_EVENT_BUS_ENABLED,
     SAGE_EVENT_BUS_QUEUE_SIZE,
     SAGE_EVENT_BUS_MAX_WORKERS,
-    SAGE_EVENT_BUS_MAX_RETRIES
+    SAGE_EVENT_BUS_MAX_RETRIES,
+    SAGE_EVENT_BUS_SWEEPER_INTERVAL_SECONDS
 )
 from data.schemas.event_contract import CanonicalEvent
 from data.schemas.event_delivery_contract import (
@@ -33,11 +34,13 @@ class EventBus:
     
     CRITICAL RESTRICTION: This bus MUST NOT import the execution gateway or execute physical actions.
     """
-    def __init__(self, repository: EventDeliveryRepository):
+    def __init__(self, repository: EventDeliveryRepository, event_repository: Optional[Any] = None):
         self.repository = repository
+        self.event_repository = event_repository
         self.enabled = SAGE_EVENT_BUS_ENABLED
-        self.queue: asyncio.Queue[EventDelivery] = asyncio.Queue(maxsize=SAGE_EVENT_BUS_QUEUE_SIZE)
+        self.queue: asyncio.Queue = asyncio.Queue(maxsize=SAGE_EVENT_BUS_QUEUE_SIZE)
         self.workers: List[asyncio.Task] = []
+        self._sweeper_task: Optional[asyncio.Task] = None
         self._running = False
         self._callbacks: Dict[str, SubscriberCallback] = {} # subscription_id -> callback
         
@@ -45,24 +48,40 @@ class EventBus:
         self._subscriptions_cache: Dict[str, List[Subscription]] = {}
 
     def start(self):
-        """Initializes the background dispatcher workers."""
+        """Initializes the background dispatcher workers and recovery sweeper."""
         if not self.enabled or self._running:
             return
         
         self._running = True
         logger.info(f"Starting EventBus with {SAGE_EVENT_BUS_MAX_WORKERS} workers")
-        for i in range(SAGE_EVENT_BUS_MAX_WORKERS):
-            task = asyncio.create_task(self._worker_loop(i))
-            self.workers.append(task)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            for i in range(SAGE_EVENT_BUS_MAX_WORKERS):
+                task = asyncio.create_task(self._worker_loop(i))
+                self.workers.append(task)
+            if self._sweeper_task is None:
+                self._sweeper_task = asyncio.create_task(self._sweeper_loop())
 
     async def stop(self):
-        """Gracefully shuts down dispatcher workers."""
+        """Gracefully shuts down dispatcher workers and recovery sweeper."""
         if not self._running:
             return
             
         self._running = False
-        logger.info("Stopping EventBus workers...")
+        logger.info("Stopping EventBus workers and sweeper...")
         
+        if self._sweeper_task:
+            self._sweeper_task.cancel()
+            try:
+                await self._sweeper_task
+            except asyncio.CancelledError:
+                pass
+            self._sweeper_task = None
+
         # Unblock workers
         for _ in range(len(self.workers)):
             try:
@@ -73,6 +92,18 @@ class EventBus:
         await asyncio.gather(*self.workers, return_exceptions=True)
         self.workers.clear()
         logger.info("EventBus gracefully stopped.")
+
+    async def _sweeper_loop(self):
+        """Background sweeper periodically recovering pending deliveries."""
+        while self._running:
+            try:
+                await asyncio.sleep(SAGE_EVENT_BUS_SWEEPER_INTERVAL_SECONDS)
+                if self._running:
+                    await self.recover_pending_deliveries()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"EventBus sweeper encountered unhandled error: {e}")
 
     def subscribe(self, subscription: Subscription, callback: SubscriberCallback) -> Subscription:
         """Registers a subscription and binds its callback in-memory."""
@@ -122,6 +153,23 @@ class EventBus:
             matches.append(sub)
             
         return matches
+
+    def has_unfulfilled_deliveries(self, event: CanonicalEvent) -> bool:
+        """
+        Determines if an event has unfulfilled subscriptions requiring publication/retry.
+        Returns True if there are matching subscriptions that have not yet succeeded.
+        Returns False if there are no matching subscriptions or all matched deliveries succeeded.
+        """
+        subs = self._match_subscriptions(event)
+        if not subs:
+            return False
+            
+        for sub in subs:
+            delivery_id = compute_delivery_id(event.event_fingerprint, sub.subscription_id)
+            existing_delivery = self.repository.get_delivery(delivery_id, event.tenant_id)
+            if not existing_delivery or existing_delivery.status != DeliveryStatus.SUCCESS:
+                return True
+        return False
 
     async def publish(self, event: CanonicalEvent):
         """
@@ -229,6 +277,55 @@ class EventBus:
                 self.repository.record_dead_letter(dl)
                 
         self.repository.record_delivery_attempt(delivery)
+
+    async def recover_pending_deliveries(
+        self,
+        tenant_id: Optional[str] = None,
+        event_repo: Optional[Any] = None,
+        limit: int = 50,
+        respect_backoff: bool = False
+    ) -> int:
+        """
+        Recovers and processes pending event deliveries stored in the repository.
+        Fetches pending deliveries, resolves the canonical event from EventRepository,
+        and dispatches them to subscriber callbacks.
+        Returns the number of recovered deliveries processed.
+        """
+        if not self.enabled:
+            return 0
+            
+        repo = event_repo or self.event_repository
+        if not repo:
+            try:
+                from services.event_repository import EventRepository
+                repo = EventRepository()
+                self.event_repository = repo
+            except Exception as e:
+                logger.warning(f"Cannot recover pending deliveries: failed to load EventRepository: {e}")
+                return 0
+                
+        now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z") if respect_backoff else None
+        pending_deliveries = self.repository.get_pending_deliveries(tenant_id=tenant_id, limit=limit, now_iso=now_iso)
+        processed_count = 0
+        
+        for delivery in pending_deliveries:
+            event = repo.get_event(delivery.tenant_id, delivery.event_id)
+            if not event:
+                logger.warning(f"Pending delivery {delivery.delivery_id} references missing event {delivery.event_id}.")
+                continue
+                
+            # Process delivery either via running workers queue or direct invocation
+            if self._running and self.workers:
+                try:
+                    self.queue.put_nowait((delivery, event))
+                    processed_count += 1
+                except asyncio.QueueFull:
+                    logger.warning(f"Queue full during recovery for delivery {delivery.delivery_id}")
+            else:
+                await self._process_delivery(delivery, event)
+                processed_count += 1
+                
+        return processed_count
 
 # Global instances for dependency injection
 _event_delivery_repository = EventDeliveryRepository()

@@ -1749,3 +1749,491 @@ class TestEventFingerprintIsolationAndDeduplication:
         assert len(events_a) == 1
         assert events_a[0]["tenant_id"] == "tenant_alpha"
 
+
+class TestEventReturnIntegrityAndPublicationRecovery:
+    """Prompt 37C: Repository-Return Tampering Rejection & Publication Failure Recovery Tests."""
+
+    @pytest.fixture
+    def test_setup(self, tmp_path):
+        import uuid
+        from fastapi.testclient import TestClient
+        from server import app
+        from services.event_repository import EventRepository
+        from services.event_delivery_repository import EventDeliveryRepository
+        from services.event_bus import EventBus
+        try:
+            import api.event_routes as er
+        except (ImportError, ModuleNotFoundError):
+            import backend.api.event_routes as er
+
+        db_path = str(tmp_path / f"ev_{uuid.uuid4().hex[:8]}.sqlite")
+        del_db_path = str(tmp_path / f"del_{uuid.uuid4().hex[:8]}.sqlite")
+        
+        ev_repo = EventRepository(db_path=db_path)
+        del_repo = EventDeliveryRepository(db_path=del_db_path)
+        ebus = EventBus(repository=del_repo, event_repository=ev_repo)
+        ebus.enabled = True
+        
+        client = TestClient(app)
+        app.dependency_overrides[er.get_event_repo] = lambda: ev_repo
+        app.dependency_overrides[er.get_event_bus] = lambda: ebus
+        
+        yield client, ev_repo, del_repo, ebus, er
+        app.dependency_overrides.clear()
+
+    def test_60_repo_tampered_plant_rejected_even_with_wildcard_auth(self, test_setup):
+        """Repository returning a different authorized plant is rejected with HTTP 403 and never published."""
+        client, ev_repo, del_repo, ebus, er = test_setup
+        
+        # Producer has wildcard plant authorization
+        producer = Identity(
+            user_id="op_wildcard",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            assigned_plants=["*"],
+            roles=["OPERATOR"],
+            permissions=["events.record"],
+        )
+        app.dependency_overrides[get_current_identity] = lambda: producer
+
+        published_events = []
+        original_publish = ebus.publish
+        async def spy_publish(evt):
+            published_events.append(evt)
+            return await original_publish(evt)
+        ebus.publish = spy_publish
+
+        # Mock repo to return a saved event with plant_02 when request specified plant_01
+        class TamperedPlantRepo:
+            def record_event_ex(self, event):
+                tampered = event.model_copy(deep=True)
+                tampered.plant_id = "plant_02"  # Tampered to different plant!
+                tampered.apply_fingerprint()
+                return tampered, False
+
+        app.dependency_overrides[er.get_event_repo] = lambda: TamperedPlantRepo()
+
+        req_evt = make_operational_event(
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            plant_id="plant_01"
+        )
+        resp = client.post("/api/v3/events", json=req_evt.model_dump())
+        assert resp.status_code == 403
+        assert "does not match requested plant" in resp.json()["detail"].lower()
+        assert len(published_events) == 0
+
+    def test_61_repo_tampered_workspace_rejected(self, test_setup):
+        """Repository returning a different workspace is rejected with HTTP 403 and never published."""
+        client, ev_repo, del_repo, ebus, er = test_setup
+        
+        producer = Identity(
+            user_id="op_ws",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            assigned_plants=["plant_01"],
+            roles=["OPERATOR"],
+            permissions=["events.record"],
+        )
+        app.dependency_overrides[get_current_identity] = lambda: producer
+
+        published_events = []
+        original_publish = ebus.publish
+        async def spy_publish(evt):
+            published_events.append(evt)
+            return await original_publish(evt)
+        ebus.publish = spy_publish
+
+        class TamperedWsRepo:
+            def record_event_ex(self, event):
+                tampered = event.model_copy(deep=True)
+                tampered.workspace_id = "workspace_dev"  # Tampered workspace!
+                tampered.apply_fingerprint()
+                return tampered, False
+
+        app.dependency_overrides[er.get_event_repo] = lambda: TamperedWsRepo()
+
+        req_evt = make_operational_event(
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            plant_id="plant_01"
+        )
+        resp = client.post("/api/v3/events", json=req_evt.model_dump())
+        assert resp.status_code == 403
+        assert "workspace mismatch" in resp.json()["detail"].lower()
+        assert len(published_events) == 0
+
+    def test_62_repo_tampered_tenant_rejected(self, test_setup):
+        """Repository returning a different tenant is rejected with HTTP 403 and never published."""
+        client, ev_repo, del_repo, ebus, er = test_setup
+        
+        producer = Identity(
+            user_id="op_tenant",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            assigned_plants=["plant_01"],
+            roles=["OPERATOR"],
+            permissions=["events.record"],
+        )
+        app.dependency_overrides[get_current_identity] = lambda: producer
+
+        published_events = []
+        original_publish = ebus.publish
+        async def spy_publish(evt):
+            published_events.append(evt)
+            return await original_publish(evt)
+        ebus.publish = spy_publish
+
+        class TamperedTenantRepo:
+            def record_event_ex(self, event):
+                tampered = event.model_copy(deep=True)
+                tampered.tenant_id = "tenant_beta"  # Tampered tenant!
+                tampered.apply_fingerprint()
+                return tampered, False
+
+        app.dependency_overrides[er.get_event_repo] = lambda: TamperedTenantRepo()
+
+        req_evt = make_operational_event(
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            plant_id="plant_01"
+        )
+        resp = client.post("/api/v3/events", json=req_evt.model_dump())
+        assert resp.status_code == 403
+        assert "tenant mismatch" in resp.json()["detail"].lower()
+        assert len(published_events) == 0
+
+    def test_63_repo_tampered_payload_with_original_fingerprint_string_rejected(self, test_setup):
+        """Repository returning altered payload with original fingerprint string is rejected with HTTP 409."""
+        client, ev_repo, del_repo, ebus, er = test_setup
+        
+        producer = Identity(
+            user_id="op_tamper",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            assigned_plants=["plant_01"],
+            roles=["OPERATOR"],
+            permissions=["events.record"],
+        )
+        app.dependency_overrides[get_current_identity] = lambda: producer
+
+        published_events = []
+        original_publish = ebus.publish
+        async def spy_publish(evt):
+            published_events.append(evt)
+            return await original_publish(evt)
+        ebus.publish = spy_publish
+
+        class TamperedPayloadRepo:
+            def record_event_ex(self, event):
+                tampered = event.model_copy(deep=True)
+                # Keep original fingerprint string, but tamper the payload dict!
+                tampered.payload = {"compromised": True}
+                return tampered, False
+
+        app.dependency_overrides[er.get_event_repo] = lambda: TamperedPayloadRepo()
+
+        req_evt = make_operational_event(
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            plant_id="plant_01",
+            payload_extra={"compromised": False}
+        )
+        resp = client.post("/api/v3/events", json=req_evt.model_dump())
+        assert resp.status_code == 409
+        detail = resp.json()["detail"].lower()
+        assert "tampering detected" in detail or "canonical fields do not match" in detail
+        assert len(published_events) == 0
+
+    def test_64_repo_tampered_canonical_field_with_original_fingerprint_rejected(self, test_setup):
+        """Repository returning changed canonical field with original fingerprint is rejected with HTTP 409."""
+        client, ev_repo, del_repo, ebus, er = test_setup
+        
+        producer = Identity(
+            user_id="op_field",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            assigned_plants=["plant_01"],
+            roles=["OPERATOR"],
+            permissions=["events.record"],
+        )
+        app.dependency_overrides[get_current_identity] = lambda: producer
+
+        published_events = []
+        original_publish = ebus.publish
+        async def spy_publish(evt):
+            published_events.append(evt)
+            return await original_publish(evt)
+        ebus.publish = spy_publish
+
+        class TamperedFieldRepo:
+            def record_event_ex(self, event):
+                tampered = event.model_copy(deep=True)
+                # Keep original fingerprint, but alter event_type
+                tampered.event_type = "tampered.action.executed"
+                return tampered, False
+
+        app.dependency_overrides[er.get_event_repo] = lambda: TamperedFieldRepo()
+
+        req_evt = make_operational_event(
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            plant_id="plant_01"
+        )
+        resp = client.post("/api/v3/events", json=req_evt.model_dump())
+        assert resp.status_code == 409
+        detail = resp.json()["detail"].lower()
+        assert "tampering detected" in detail or "canonical fields do not match" in detail
+        assert len(published_events) == 0
+
+    def test_65_publication_transient_failure_fails_safely_and_persists_event(self, test_setup):
+        """When publication encounters a transient error, request fails with HTTP 500 but event is preserved."""
+        client, ev_repo, del_repo, ebus, er = test_setup
+        
+        producer = Identity(
+            user_id="op_pub_fail",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            assigned_plants=["plant_01"],
+            roles=["OPERATOR"],
+            permissions=["events.record"],
+        )
+        app.dependency_overrides[get_current_identity] = lambda: producer
+
+        # Simulate transient error in EventBus.publish
+        async def failing_publish(evt):
+            raise RuntimeError("Transient EventBus transport failure")
+        ebus.publish = failing_publish
+
+        req_evt = make_operational_event(
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            plant_id="plant_01"
+        )
+        resp = client.post("/api/v3/events", json=req_evt.model_dump())
+        assert resp.status_code == 500
+        assert "publication encountered transient error" in resp.json()["detail"].lower()
+
+        # The event is safely persisted in the repository!
+        saved = ev_repo.get_event_by_scope_and_fingerprint(
+            "tenant_alpha", "workspace_prod", "plant_01", req_evt.event_fingerprint
+        )
+        assert saved is not None
+        assert saved.event_id == req_evt.event_id
+
+    def test_66_publication_recovery_via_replay_delivers_without_creating_second_event(self, test_setup):
+        """Retrying an event whose publication failed recovers delivery without creating a duplicate record."""
+        client, ev_repo, del_repo, ebus, er = test_setup
+        import uuid
+        import asyncio
+        import httpx
+        from server import app
+        from data.schemas.event_contract import EventCategory
+        from data.schemas.event_delivery_contract import Subscription, DeliveryStatus
+        
+        producer = Identity(
+            user_id="op_replay_recovery",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            assigned_plants=["plant_01"],
+            roles=["OPERATOR"],
+            permissions=["events.record"],
+        )
+        app.dependency_overrides[get_current_identity] = lambda: producer
+
+        async def run():
+            # 1. Register subscription on the real EventBus
+            sub = Subscription(
+                subscription_id=f"sub_recov_{uuid.uuid4().hex[:8]}",
+                subscriber_id="recovery_subscriber",
+                tenant_id="tenant_alpha",
+                workspace_id="workspace_prod",
+                plant_id="plant_01",
+                category=EventCategory.TELEMETRY.value
+            )
+            
+            delivered_events = []
+            async def subscriber_callback(delivery, event):
+                delivered_events.append((delivery, event))
+                return True
+
+            ebus.subscribe(sub, subscriber_callback)
+            ebus.start()
+
+            try:
+                # 2. First attempt encounters transient failure during publish
+                fail_count = 0
+                real_publish = ebus.publish
+                async def transient_fail_once_publish(evt):
+                    nonlocal fail_count
+                    if fail_count == 0:
+                        fail_count += 1
+                        raise RuntimeError("Transient network timeout during initial publish")
+                    return await real_publish(evt)
+
+                ebus.publish = transient_fail_once_publish
+
+                req_evt = make_operational_event(
+                    tenant_id="tenant_alpha",
+                    workspace_id="workspace_prod",
+                    plant_id="plant_01"
+                )
+
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as ac:
+                    resp_1 = await ac.post("/api/v3/events", json=req_evt.model_dump())
+                    assert resp_1.status_code == 500
+                    assert len(delivered_events) == 0
+
+                    # Event is persisted in store
+                    events_in_db = ev_repo.list_events("tenant_alpha")
+                    assert len(events_in_db) == 1
+
+                    # 3. Client retries the EXACT SAME canonical event
+                    resp_2 = await ac.post("/api/v3/events", json=req_evt.model_dump())
+                    assert resp_2.status_code == 201
+
+                    # Zero second event created!
+                    events_in_db_after = ev_repo.list_events("tenant_alpha")
+                    assert len(events_in_db_after) == 1
+
+                    # Wait briefly for worker queue dispatch
+                    await asyncio.sleep(0.15)
+
+                    # Delivery succeeded!
+                    assert len(delivered_events) == 1
+                    assert delivered_events[0][1].event_fingerprint == req_evt.event_fingerprint
+                    deliv = del_repo.get_delivery(delivered_events[0][0].delivery_id, "tenant_alpha")
+                    assert deliv is not None
+                    assert deliv.status == DeliveryStatus.SUCCESS
+            finally:
+                await ebus.stop()
+
+        asyncio.run(run())
+
+    def test_67_replay_of_already_fulfilled_event_does_not_republish_or_deliver_duplicates(self, test_setup):
+        """Submitting an event whose deliveries already succeeded does not republish or duplicate deliveries."""
+        client, ev_repo, del_repo, ebus, er = test_setup
+        import uuid
+        import asyncio
+        import httpx
+        from server import app
+        from data.schemas.event_contract import EventCategory
+        from data.schemas.event_delivery_contract import Subscription
+        
+        producer = Identity(
+            user_id="op_idemp_check",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            assigned_plants=["plant_01"],
+            roles=["OPERATOR"],
+            permissions=["events.record"],
+        )
+        app.dependency_overrides[get_current_identity] = lambda: producer
+
+        async def run():
+            sub = Subscription(
+                subscription_id=f"sub_idemp_{uuid.uuid4().hex[:8]}",
+                subscriber_id="idemp_subscriber",
+                tenant_id="tenant_alpha",
+                workspace_id="workspace_prod",
+                plant_id="plant_01",
+                category=EventCategory.TELEMETRY.value
+            )
+            
+            delivered_events = []
+            async def subscriber_callback(delivery, event):
+                delivered_events.append((delivery, event))
+                return True
+
+            ebus.subscribe(sub, subscriber_callback)
+            ebus.start()
+
+            try:
+                req_evt = make_operational_event(
+                    tenant_id="tenant_alpha",
+                    workspace_id="workspace_prod",
+                    plant_id="plant_01"
+                )
+
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as ac:
+                    # Initial submit: persists and delivers
+                    resp_1 = await ac.post("/api/v3/events", json=req_evt.model_dump())
+                    assert resp_1.status_code == 201
+                    await asyncio.sleep(0.15)
+                    assert len(delivered_events) == 1
+
+                    # Second submit (replay of fulfilled event)
+                    resp_2 = await ac.post("/api/v3/events", json=req_evt.model_dump())
+                    assert resp_2.status_code == 201
+                    await asyncio.sleep(0.15)
+
+                    # Callback NOT invoked again! Exactly 1 delivery!
+                    assert len(delivered_events) == 1
+                    assert len(ev_repo.list_events("tenant_alpha")) == 1
+            finally:
+                await ebus.stop()
+
+        asyncio.run(run())
+
+    def test_68_background_recovery_processes_pending_deliveries(self, test_setup):
+        """recover_pending_deliveries() sweeps and fulfills pending deliveries from repository."""
+        import asyncio
+        import uuid
+        from data.schemas.event_contract import EventCategory
+        from data.schemas.event_delivery_contract import EventDelivery, DeliveryStatus, Subscription
+        client, ev_repo, del_repo, ebus, er = test_setup
+
+        # Persist event in event_repo
+        evt = make_operational_event(
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            plant_id="plant_01"
+        )
+        ev_repo.record_event(evt)
+
+        # Register subscription
+        sub = Subscription(
+            subscription_id=f"sub_sweep_{uuid.uuid4().hex[:8]}",
+            subscriber_id="sweeper_sub",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            plant_id="plant_01",
+            category=EventCategory.TELEMETRY.value
+        )
+        
+        delivered_items = []
+        async def subscriber_callback(delivery, event):
+            delivered_items.append((delivery, event))
+            return True
+
+        ebus.subscribe(sub, subscriber_callback)
+
+        # Insert a pending delivery row directly into del_repo
+        deliv = EventDelivery(
+            delivery_id=f"deliv_pend_{uuid.uuid4().hex[:8]}",
+            event_id=evt.event_id,
+            event_fingerprint=evt.event_fingerprint,
+            subscription_id=sub.subscription_id,
+            tenant_id="tenant_alpha",
+            status=DeliveryStatus.PENDING,
+            attempts=0
+        )
+        del_repo.record_delivery_attempt(deliv)
+
+        assert len(del_repo.get_pending_deliveries("tenant_alpha")) == 1
+
+        # Run recovery
+        async def run_recovery():
+            count = await ebus.recover_pending_deliveries(tenant_id="tenant_alpha", event_repo=ev_repo)
+            return count
+
+        recovered = asyncio.run(run_recovery())
+        assert recovered == 1
+        assert len(delivered_items) == 1
+        assert delivered_items[0][1].event_id == evt.event_id
+
+        # Delivery status updated to SUCCESS
+        updated = del_repo.get_delivery(deliv.delivery_id, "tenant_alpha")
+        assert updated.status == DeliveryStatus.SUCCESS
+        assert len(del_repo.get_pending_deliveries("tenant_alpha")) == 0
+

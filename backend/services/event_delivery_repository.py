@@ -156,6 +156,29 @@ class EventDeliveryRepository:
                 return EventDelivery(**dict(row))
             return None
 
+    def get_deliveries_for_event(self, event_fingerprint: str, tenant_id: str) -> List[EventDelivery]:
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM deliveries WHERE event_fingerprint = ? AND tenant_id = ? ORDER BY created_at ASC",
+                (event_fingerprint, tenant_id)
+            ).fetchall()
+            return [EventDelivery(**dict(row)) for row in rows]
+
+    def get_pending_deliveries(self, tenant_id: Optional[str] = None, limit: int = 50, now_iso: Optional[str] = None) -> List[EventDelivery]:
+        with self._get_conn() as conn:
+            query = "SELECT * FROM deliveries WHERE status = ?"
+            params: list = [DeliveryStatus.PENDING.value]
+            if now_iso:
+                query += " AND (next_retry_at IS NULL OR next_retry_at <= ?)"
+                params.append(now_iso)
+            if tenant_id:
+                query += " AND tenant_id = ?"
+                params.append(tenant_id)
+            query += " ORDER BY created_at ASC LIMIT ?"
+            params.append(limit)
+            rows = conn.execute(query, params).fetchall()
+            return [EventDelivery(**dict(row)) for row in rows]
+
     def list_deliveries(self, tenant_id: str, limit: int = 100) -> List[EventDelivery]:
         with self._get_conn() as conn:
             rows = conn.execute("SELECT * FROM deliveries WHERE tenant_id = ? ORDER BY created_at DESC LIMIT ?", (tenant_id, limit)).fetchall()

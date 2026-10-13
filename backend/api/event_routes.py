@@ -2,6 +2,9 @@
 from typing import List
 from fastapi import APIRouter, Depends, HTTPException, status
 import sqlite3
+import logging
+
+logger = logging.getLogger(__name__)
 
 try:
     from data.schemas.event_contract import CanonicalEvent
@@ -143,7 +146,7 @@ async def record_event(
             detail="Duplicate event fingerprint collision."
         )
 
-    # 5. Scope & Identity Verification on Repository-Returned Event (Never trust repo blindly)
+    # 5. Scope & Canonical Content Verification on Repository-Returned Event (Fail-closed on tampering or corruption)
     if saved_event.tenant_id != identity.tenant_id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -154,6 +157,11 @@ async def record_event(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Persisted event workspace mismatch: cross-workspace boundary violation."
         )
+    if saved_event.plant_id != event.plant_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Persisted event plant '{saved_event.plant_id}' does not match requested plant '{event.plant_id}'."
+        )
     if "*" not in auth_plants and saved_event.plant_id not in auth_plants:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -162,13 +170,55 @@ async def record_event(
     if saved_event.event_fingerprint != computed_fp:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Persisted event fingerprint mismatch."
+            detail="Persisted event fingerprint string mismatch."
+        )
+    if saved_event.compute_fingerprint() != computed_fp:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Persisted event computed fingerprint mismatch: canonical content tampering detected."
         )
 
-    # 6. EventBus Dispatch: Publish newly persisted events only.
-    # Replays are returned idempotently without duplicate EventBus publication to avoid redundant downstream processing.
+    # Verify that the returned event's canonical fields match the validated request's canonical fields
+    saved_cat = saved_event.category.value if hasattr(saved_event.category, "value") else str(saved_event.category)
+    req_cat = event.category.value if hasattr(event.category, "value") else str(event.category)
+    if (
+        saved_event.schema_version != event.schema_version
+        or saved_cat != req_cat
+        or saved_event.event_type != event.event_type
+        or saved_event.occurred_at != event.occurred_at
+        or saved_event.provenance != event.provenance
+        or saved_event.payload != event.payload
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Persisted event canonical fields do not match validated request."
+        )
+
+    # 6. EventBus Dispatch & Publication Failure Recovery:
+    # - If newly persisted (not is_replay): publish to bus. Fail closed with HTTP 500 on transient publish failure.
+    # - If exact replay (is_replay): check if unfulfilled deliveries exist (due to prior transient failure).
+    #   If unfulfilled deliveries exist, retry publication idempotently (only delivering to unfulfilled subscriptions).
+    #   If all deliveries previously succeeded, return saved_event immediately without republishing.
     if not is_replay:
-        await bus.publish(saved_event)
+        try:
+            await bus.publish(saved_event)
+        except Exception as pub_err:
+            logger.error(f"Transient publication error for event {saved_event.event_id}: {pub_err}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Event persisted but publication encountered transient error: {str(pub_err)}"
+            )
+    else:
+        # Exact replay: check if recovery/retry is needed for unfulfilled deliveries
+        if bus.has_unfulfilled_deliveries(saved_event):
+            try:
+                await bus.publish(saved_event)
+            except Exception as pub_err:
+                logger.error(f"Transient publication retry error for replayed event {saved_event.event_id}: {pub_err}")
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Event persisted but publication retry encountered transient error: {str(pub_err)}"
+                )
 
     return saved_event
 
