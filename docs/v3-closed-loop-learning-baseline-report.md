@@ -1,7 +1,7 @@
 # SageCommand V3 — Closed-Loop Learning Foundation Baseline & Security Audit Report
 
-**Prompt Reference:** Prompt 37, Prompt 37A & Prompt 37B (Security Corrections)  
-**Starting Baseline Git Commit:** `dc39e78f49253c857a4752ff7be8623e3d3088a0`  
+**Prompt Reference:** Prompt 37, Prompt 37A, Prompt 37B & Prompt 37C (Security Corrections)  
+**Starting Baseline Git Commit:** `dd74214dbc8b4543948e9e17eed8c9cd206ea51a`  
 **Branch:** `main`  
 **Repository:** `joyab786/sage_command_production`  
 **Local Workspace:** `E:\js\sage_command_production`  
@@ -11,7 +11,7 @@
 
 ## 1. Commit Audit Trail & Baseline Correction
 
-As required by Prompt 37A Section 14 and Prompt 37B Section 8, the git commit history and audit documentation have been reconciled against actual git history:
+As required by Prompt 37A, 37B, and 37C, the git commit history and audit documentation have been reconciled against actual git history:
 
 - **Original Prompt 37 Implementation Commit:** `bad6c5cc5f90f99cde5edb02f73470239a03bd94` (`feat(verification): add governed closed-loop learning foundation (Prompt 37)`)  
   *(Audit Correction Note: In the initial Prompt 37 baseline report, the implementation commit SHA was omitted and only the pre-Prompt 37 baseline `8c18e674...` was referenced. This is now explicitly corrected and recorded above with the exact verified SHA.)*
@@ -21,7 +21,10 @@ As required by Prompt 37A Section 14 and Prompt 37B Section 8, the git commit hi
 - **Prompt 37A Dedicated Documentation Commit:** `dc39e78f49253c857a4752ff7be8623e3d3088a0` (`docs(security): document closed-loop scope hardening (Prompt 37A)`)
 - **Prompt 37B Starting Baseline:** `dc39e78f49253c857a4752ff7be8623e3d3088a0`
 - **Prompt 37B Dedicated Implementation Commit:** `274034f992ed9a2dca8ab18b7ea2098758c5b921` (`fix(security): isolate event fingerprints and prevent duplicate cross-scope resolution (Prompt 37B)`)
-- **Prompt 37B Dedicated Documentation Commit:** `docs(security): document event fingerprint isolation and deduplication safety (Prompt 37B)`
+- **Prompt 37B Dedicated Documentation Commit:** `dd74214dbc8b4543948e9e17eed8c9cd206ea51a` (`docs(security): document event fingerprint isolation and deduplication safety (Prompt 37B)`)
+- **Prompt 37C Starting Baseline:** `dd74214dbc8b4543948e9e17eed8c9cd206ea51a`
+- **Prompt 37C Dedicated Implementation Commit:** `53f63a3819bb0b9f9dd93205dabb56b38cc82f93` (`fix(security): enforce returned event integrity and publication failure recovery (Prompt 37C)`)
+- **Prompt 37C Dedicated Documentation Commit:** `docs(security): document returned event integrity and publication failure recovery (Prompt 37C)`
 
 ---
 
@@ -302,4 +305,64 @@ Implemented in `backend/test_v3_closed_loop_learning.py` (`TestEventFingerprintI
 
 ### 7.8 Remaining Limitations
 1. **Historical Legacy Event Backfill:** Historical events lacking workspace or plant bindings fail closed upon deduplication lookup. If replay support for legacy pre-Prompt 37B events is required, an explicit tenant-governed migration script must populate verified scope and recompute fingerprints.
+2. **LangGraph Copilot Tool Exposure:** Verification tools remain unregistered pending request-scoped identity propagation in LangGraph subagent `ToolNode`.
+
+---
+
+## 8. Prompt 37C Security Audit: Final Event Return Integrity & Publication Recovery
+
+### 8.1 Audit Trail & Baselines
+- **Starting Baseline:** `dd74214dbc8b4543948e9e17eed8c9cd206ea51a`
+- **Implementation Commit:** `53f63a3819bb0b9f9dd93205dabb56b38cc82f93` (`fix(security): enforce returned event integrity and publication failure recovery (Prompt 37C)`)
+- **Documentation Commit:** `docs(security): document returned event integrity and publication failure recovery (Prompt 37C)`
+- **Security Invariant:**
+  > An event returned by the repository must match the exact validated scope and canonical reality of the submitted request; a duplicate lookup must never return or publish cross-scope data; and publication failures must recover safely and idempotently without duplicate event storage or duplicate delivery side-effects.
+
+### 8.2 Repository-Return Tampering & Scope Integrity (`backend/api/event_routes.py`)
+After `EventRepository.record_event_ex()` completes, the API validates the returned record with multi-layer defense-in-depth:
+1. `saved_event.tenant_id == identity.tenant_id` (HTTP 403 on tenant boundary violation).
+2. `saved_event.workspace_id == identity.workspace_id` (HTTP 403 on cross-workspace violation).
+3. `saved_event.plant_id == event.plant_id` (HTTP 403 on plant mismatch; mandatory exact check enforced even when caller has wildcard `*` plant authorization).
+4. `saved_event.plant_id in auth_plants or "*" in auth_plants` (HTTP 403 if saved plant is unauthorized).
+5. `saved_event.event_fingerprint == computed_fp` (HTTP 409 on fingerprint string mismatch).
+6. `saved_event.compute_fingerprint() == computed_fp` (HTTP 409 on recomputed canonical JSON hash mismatch, detecting payload tampering).
+7. Field-by-field canonical comparison: verifies `schema_version`, `category`, `event_type`, `occurred_at`, `provenance`, and `payload` match the validated request.
+8. If any check fails, the route fails closed immediately: zero EventBus publication and zero cross-scope data returned.
+
+### 8.3 Publication Failure Recovery & Replay Idempotency
+1. **Transient Publication Failure:** If `EventBus.publish()` fails due to transient connection or transport errors, the API request safely fails with `HTTP 500 Internal Server Error`, while the event remains durably persisted in `EventRepository`.
+2. **Replay Retry:** Re-submitting the exact same canonical event resolves to `is_replay=True`, creating **0 duplicate event records** in `EventRepository`.
+3. **Selective Publication via `has_unfulfilled_deliveries()`:**
+   - Evaluates whether matching subscriptions have pending, failed, or un-attempted deliveries.
+   - If unfulfilled deliveries exist, `bus.publish()` is retried (skipping already-succeeded subscriptions and delivering only to unfulfilled ones).
+   - If all deliveries already succeeded, publication is skipped completely, preserving exact-replay idempotency with zero duplicate deliveries.
+4. **Background Sweeper Recovery:** `EventBus.recover_pending_deliveries()` queries `EventDeliveryRepository.get_pending_deliveries()`, resolves the canonical event from `EventRepository`, and dispatches it directly to subscriber callbacks.
+
+### 8.4 Security Regression Tests (Prompt 37C Tests 60–68)
+Implemented in `backend/test_v3_closed_loop_learning.py` (`TestEventReturnIntegrityAndPublicationRecovery`):
+- **Test 60:** Repository returning a different authorized plant (under wildcard identity) is rejected with `HTTP 403` and 0 published events.
+- **Test 61:** Repository returning a different workspace is rejected with `HTTP 403` and 0 published events.
+- **Test 62:** Repository returning a different tenant is rejected with `HTTP 403` and 0 published events.
+- **Test 63:** Repository returning altered payload content with the original fingerprint string is rejected with `HTTP 409` and 0 published events.
+- **Test 64:** Repository returning changed canonical field (`event_type`) with the original fingerprint string is rejected with `HTTP 409` and 0 published events.
+- **Test 65:** Transient publication transport error fails safely with `HTTP 500` while preserving persisted event in `EventRepository`.
+- **Test 66:** Publication recovery via exact replay retry successfully delivers without creating duplicate event records (verified: exactly 1 event in store, status `SUCCESS`).
+- **Test 67:** Exact replay of an already fulfilled event skips publication and produces zero duplicate deliveries (callback called exactly 1 time).
+- **Test 68:** Background recovery sweeper (`recover_pending_deliveries()`) processes pending deliveries directly from SQLite store to `SUCCESS`.
+
+### 8.5 Comprehensive Test Suite Matrix
+- `backend/test_v3_closed_loop_learning.py`: 68 passed (11.49s)
+- `backend/test_v3_event_model.py`: 33 passed (1.75s)
+- `backend/test_v3_event_driven_architecture.py`: 5 passed (1.34s)
+- `backend/test_v3_continuous_verification.py`: 128 passed (10.90s)
+- `backend/test_v3_mission_architecture.py`: 74 passed (6.49s)
+- `backend/test_v3_evidence_explainability.py`: 140 passed (6.77s)
+- `backend/test_v3_organizational_memory.py`: 83 passed (8.66s)
+- `backend/test_v3_root_cause_analysis.py`: 30 passed (6.19s)
+- `backend/test_v3_incident_management.py`: 56 passed (11.06s)
+- `backend/test_v3_confidence_uncertainty.py` & `backend/test_v3_authorization.py`: 171 passed (7.94s)
+- **Total:** **788 passed, 0 failed.**
+
+### 8.6 Remaining Limitations
+1. **Historical Legacy Event Backfill:** Pre-Prompt 37B events lacking workspace/plant scope fail closed on deduplication. An explicit migration script is required if replay support for historical events is needed.
 2. **LangGraph Copilot Tool Exposure:** Verification tools remain unregistered pending request-scoped identity propagation in LangGraph subagent `ToolNode`.

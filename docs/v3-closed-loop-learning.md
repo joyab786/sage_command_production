@@ -202,6 +202,26 @@ No competing event bus was introduced. The coordinator integrates with the exist
    - Fails closed by raising `LegacyEventFingerprintError`.
    - Never returned as a verified exact replay.
 
+### 6.3 Returned Event Integrity & Canonical Re-Verification (Prompt 37C)
+After `EventRepository.record_event_ex()` returns, `POST /api/v3/events` requires comprehensive verification before returning or publishing the event:
+- `saved_event.tenant_id == identity.tenant_id` (403 on mismatch)
+- `saved_event.workspace_id == identity.workspace_id` (403 on mismatch)
+- `saved_event.plant_id == event.plant_id` (403 on mismatch; mandatory exact check even for wildcard callers)
+- Saved plant is authorized for caller (`"*" in auth_plants or saved_event.plant_id in auth_plants`)
+- `saved_event.event_fingerprint == computed_fp` (409 on mismatch)
+- `saved_event.compute_fingerprint() == computed_fp` (recomputes deterministic fingerprint; 409 on tampering)
+- Canonical field comparison: verifies `schema_version`, `category`, `event_type`, `occurred_at`, `provenance`, and `payload` match the validated request.
+- **Fail-Closed Guarantee:** If any check fails, the mismatched or tampered record is immediately rejected without publication to `EventBus` and without returning cross-scope data.
+
+### 6.4 Publication Failure Recovery & Idempotent Retry (Prompt 37C)
+To guarantee at-least-once delivery without duplicate executions:
+1. **Initial Publication Failure:** If `EventBus.publish()` fails due to transient transport errors, the API request fails safely with `HTTP 500 Internal Server Error`, while preserving the persisted event in `EventRepository`.
+2. **Replay Retry:** Re-submitting the exact same canonical event resolves to `is_replay=True`, creating **zero duplicate event records**.
+3. **Selective Publication:** On replay, `bus.has_unfulfilled_deliveries(saved_event)` checks whether matching subscriptions lack `DeliveryStatus.SUCCESS`.
+   - If unfulfilled deliveries exist, `bus.publish()` is retried (skipping already-succeeded subscriptions and delivering only to unfulfilled ones).
+   - If all deliveries already succeeded, publication is skipped completely, preserving exact-replay idempotency with zero duplicate deliveries.
+4. **Background Sweeper Recovery:** `EventBus.recover_pending_deliveries()` and background `_sweeper_loop()` sweep `deliveries` where `status = 'PENDING'`, resolve the canonical event from `EventRepository`, and fulfill deliveries directly.
+
 ---
 
 ## 7. Feedback Event Contract & Schema
@@ -323,8 +343,8 @@ Configured in `backend/core/config.py`:
 ## 13. Test Coverage Summary
 
 - **Focused Closed-Loop Test Suite:** `backend/test_v3_closed_loop_learning.py`
-  - 59 tests covering eligibility, identity boundary, scope isolation, idempotency, loop guards, AST checks, producer authorization, coordinator independent scope verification, feature flag defaults, fingerprint integrity, workspace/plant fingerprint isolation, exact replay, and conflicting duplicate rejection.
-  - **Result: 59 passed (100%)**.
+  - 68 tests covering eligibility, identity boundary, scope isolation, idempotency, loop guards, AST checks, producer authorization, coordinator independent scope verification, feature flag defaults, fingerprint integrity, workspace/plant fingerprint isolation, exact replay, conflicting duplicate rejection, repository-return tampering rejection, and publication failure recovery.
+  - **Result: 68 passed (100%)**.
 - **All Core Regression Suites:**
   - Canonical Event Model: 33 passed
   - Event Driven Architecture: 5 passed
@@ -335,7 +355,7 @@ Configured in `backend/core/config.py`:
   - Root Cause Analysis: 30 passed
   - Incident Management: 56 passed
   - Confidence Uncertainty & Authorization: 171 passed
-  - **Total: 779 passed, 0 failed.**
+  - **Total: 788 passed, 0 failed.**
 
 ---
 
