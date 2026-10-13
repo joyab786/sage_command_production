@@ -59,6 +59,7 @@ try:
         EVALUATOR_VERSION,
         validate_identifier,
         _validate_safe_text,
+        compute_diagnostic_run_fields,
     )
     from data.schemas.mission_contract import (
         Mission,
@@ -128,6 +129,7 @@ except (ImportError, ModuleNotFoundError):
         EVALUATOR_VERSION,
         validate_identifier,
         _validate_safe_text,
+        compute_diagnostic_run_fields,
     )
     from backend.data.schemas.mission_contract import (
         Mission,
@@ -921,73 +923,63 @@ class VerificationService:
         stale_count = sum(1 for f in findings if f.status == VerificationStatus.STALE)
         conflicting_count = sum(1 for f in findings if f.status == VerificationStatus.CONFLICTING)
 
-        if target_count == 0:
-            overall_status = VerificationStatus.INDETERMINATE
-            summary = "No targets were eligible or requested for verification."
-            if is_diagnostic_run:
-                diagnostic_status = VerificationStatus.INDETERMINATE
-                diagnostic_outcome = "NO_TARGETS"
-        elif blocked_count > 0:
-            overall_status = VerificationStatus.BLOCKED
-            summary = f"{blocked_count} verification target(s) blocked due to scope boundary or clearance restrictions."
-            if is_diagnostic_run:
-                diagnostic_status = VerificationStatus.BLOCKED
-                diagnostic_outcome = "BLOCKED"
-        elif failed_count > 0:
-            overall_status = VerificationStatus.FAILED
-            summary = f"{failed_count} verification check(s) failed evaluation preconditions."
-            if is_diagnostic_run:
-                diagnostic_status = VerificationStatus.FAILED
-                diagnostic_outcome = "FAILED"
-        elif conflicting_count > 0:
-            overall_status = VerificationStatus.CONFLICTING
-            summary = f"{conflicting_count} verification target(s) have conflicting evidence sources."
-            if is_diagnostic_run:
-                diagnostic_status = VerificationStatus.CONFLICTING
-                diagnostic_outcome = "CONFLICTING"
-        elif unverified_count > 0:
-            overall_status = VerificationStatus.NOT_VERIFIED
-            summary = f"{unverified_count} of {target_count} target(s) remain unverified due to missing, invalid, or inadequate evidence."
-            if is_diagnostic_run:
-                diagnostic_status = VerificationStatus.NOT_VERIFIED
-                diagnostic_outcome = "NOT_FOUND"
-        elif indeterminate_count > 0:
-            overall_status = VerificationStatus.INDETERMINATE
-            summary = f"{indeterminate_count} target(s) have indeterminate, unverified, or unproven evidence."
-            if is_diagnostic_run:
-                diagnostic_status = VerificationStatus.INDETERMINATE
-                diagnostic_outcome = "INDETERMINATE"
-        elif stale_count > 0:
-            overall_status = VerificationStatus.STALE
-            summary = f"{stale_count} verification target(s) rely on stale evidence beyond threshold ({freshness_threshold:.0f}s)."
-            if is_diagnostic_run:
-                diagnostic_status = VerificationStatus.STALE
-                diagnostic_outcome = "STALE"
-        elif verified_count == target_count:
-            if is_diagnostic_run:
-                # Prompt 36E: A diagnostic existence check must not produce a run-level status
-                # that can be mistaken for authoritative mission verification.
-                # Conservative run status: NOT_VERIFIED
-                # Explicit machine-readable diagnostic outcome: diagnostic_status = VERIFIED, diagnostic_outcome = "CONFIRMED"
-                overall_status = VerificationStatus.NOT_VERIFIED
-                diagnostic_status = VerificationStatus.VERIFIED
-                diagnostic_outcome = "CONFIRMED"
+        if is_diagnostic_run:
+            diag_run_st, diag_st, diag_out = compute_diagnostic_run_fields([f.status for f in findings], target_count)
+            overall_status = diag_run_st
+            diagnostic_status = diag_st
+            diagnostic_outcome = diag_out
+            if verified_count == target_count and target_count > 0:
                 summary = (
                     f"All {target_count} target(s) verified under diagnostic rule '{rule_to_use.rule_id}'. "
                     f"DIAGNOSTIC ONLY: Evidence existence check does not certify authoritative mission completion, freshness, or multi-source consistency."
                 )
                 all_limitations.append("Diagnostic evaluation only (EVIDENCE_EXISTS): does not certify authoritative mission completion, freshness, or multi-source consistency.")
+            elif target_count == 0:
+                summary = "No targets were eligible or requested for verification."
+            elif blocked_count > 0:
+                summary = f"{blocked_count} verification target(s) blocked due to scope boundary or clearance restrictions."
+            elif failed_count > 0:
+                summary = f"{failed_count} verification check(s) failed evaluation preconditions."
+            elif conflicting_count > 0:
+                summary = f"{conflicting_count} verification target(s) have conflicting evidence sources."
+            elif unverified_count > 0:
+                summary = f"{unverified_count} of {target_count} target(s) remain unverified due to missing, invalid, or inadequate evidence."
+            elif indeterminate_count > 0:
+                summary = f"{indeterminate_count} target(s) have indeterminate, unverified, or unproven evidence."
+            elif stale_count > 0:
+                summary = f"{stale_count} verification target(s) rely on stale evidence beyond threshold ({freshness_threshold:.0f}s)."
             else:
-                overall_status = VerificationStatus.VERIFIED
-                diagnostic_status = None
-                diagnostic_outcome = None
-                summary = f"All {target_count} target(s) successfully verified by authorized, current evidence."
+                summary = f"{indeterminate_count} target(s) have indeterminate evidence."
         else:
-            overall_status = VerificationStatus.INDETERMINATE
-            summary = f"{indeterminate_count} target(s) have indeterminate evidence."
-            if is_diagnostic_run:
-                diagnostic_status = VerificationStatus.INDETERMINATE
-                diagnostic_outcome = "INDETERMINATE"
+            diagnostic_status = None
+            diagnostic_outcome = None
+            if target_count == 0:
+                overall_status = VerificationStatus.INDETERMINATE
+                summary = "No targets were eligible or requested for verification."
+            elif blocked_count > 0:
+                overall_status = VerificationStatus.BLOCKED
+                summary = f"{blocked_count} verification target(s) blocked due to scope boundary or clearance restrictions."
+            elif failed_count > 0:
+                overall_status = VerificationStatus.FAILED
+                summary = f"{failed_count} verification check(s) failed evaluation preconditions."
+            elif conflicting_count > 0:
+                overall_status = VerificationStatus.CONFLICTING
+                summary = f"{conflicting_count} verification target(s) have conflicting evidence sources."
+            elif unverified_count > 0:
+                overall_status = VerificationStatus.NOT_VERIFIED
+                summary = f"{unverified_count} of {target_count} target(s) remain unverified due to missing, invalid, or inadequate evidence."
+            elif indeterminate_count > 0:
+                overall_status = VerificationStatus.INDETERMINATE
+                summary = f"{indeterminate_count} target(s) have indeterminate, unverified, or unproven evidence."
+            elif stale_count > 0:
+                overall_status = VerificationStatus.STALE
+                summary = f"{stale_count} verification target(s) rely on stale evidence beyond threshold ({freshness_threshold:.0f}s)."
+            elif verified_count == target_count:
+                overall_status = VerificationStatus.VERIFIED
+                summary = f"All {target_count} target(s) successfully verified by authorized, current evidence."
+            else:
+                overall_status = VerificationStatus.INDETERMINATE
+                summary = f"{indeterminate_count} target(s) have indeterminate evidence."
 
         now_iso = eval_dt.isoformat()
         v_id = f"vrun_{uuid.uuid4().hex[:16]}"

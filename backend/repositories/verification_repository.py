@@ -15,6 +15,7 @@ import json
 import sqlite3
 import threading
 import logging
+import uuid
 from typing import Dict, Any, List, Optional, Tuple, Set
 from datetime import datetime, timezone
 
@@ -33,6 +34,7 @@ try:
         VerificationRunSummary,
         VerificationProvenance,
         TriggerType,
+        compute_diagnostic_run_fields,
     )
 except (ImportError, ModuleNotFoundError):
     from backend.core.config import (
@@ -49,6 +51,7 @@ except (ImportError, ModuleNotFoundError):
         VerificationRunSummary,
         VerificationProvenance,
         TriggerType,
+        compute_diagnostic_run_fields,
     )
 
 logger = logging.getLogger("verification_repository")
@@ -225,7 +228,239 @@ class VerificationRepository:
             except sqlite3.OperationalError:
                 pass
 
+        # Prompt 36F: Non-destructive, idempotent migration of legacy diagnostic runs
+        self._migrate_legacy_diagnostic_runs(conn)
+
         conn.commit()
+
+    def _migrate_legacy_diagnostic_runs(self, conn: sqlite3.Connection) -> int:
+        """
+        Prompt 36F — Legacy Diagnostic Run Migration:
+        Identifies historical diagnostic verification runs created prior to Prompt 36E
+        and normalizes their machine-readable status contract:
+        - Sets is_diagnostic = 1
+        - Normalizes run-level status = NOT_VERIFIED if previously VERIFIED
+        - Populates diagnostic_status and diagnostic_outcome deterministically from finding statuses
+        - Preserves finding-level statuses and actual rule_id ('RULE_EVIDENCE_EXISTS_V1')
+        - Appends an audit ledger event in verification_audit_ledger idempotently
+        - Preserves authoritative verification runs untouched
+        """
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT tenant_id, workspace_id, plant_id, mission_id, mission_revision,
+                   verification_id, status, summary, target_count, verified_count,
+                   is_diagnostic, diagnostic_status, diagnostic_outcome, provenance_json
+            FROM verification_runs
+        """)
+        runs = cursor.fetchall()
+        corrected_count = 0
+
+        authoritative_rules = {
+            "RULE_EVIDENCE_VALIDATED_V1",
+            "RULE_EVIDENCE_FRESH_V1",
+            "RULE_REQUIRED_EVIDENCE_PRESENT_V1",
+            "RULE_REQUIRED_EVIDENCE_VALIDATED_V1",
+            "RULE_EVIDENCE_SCOPE_MATCH_V1",
+            "RULE_REQUIRED_FIELDS_PRESENT_V1",
+            "RULE_SOURCE_CONSISTENCY_V1",
+        }
+
+        for r in runs:
+            v_id = r["verification_id"]
+            t_id = r["tenant_id"]
+            w_id = r["workspace_id"]
+            p_id = r["plant_id"]
+            m_id = r["mission_id"]
+            m_rev = r["mission_revision"]
+            curr_status = r["status"]
+            curr_summary = r["summary"] or ""
+            target_count = r["target_count"]
+            curr_is_diag = bool(r["is_diagnostic"]) if r["is_diagnostic"] is not None else False
+            curr_diag_status = r["diagnostic_status"]
+            curr_diag_outcome = r["diagnostic_outcome"]
+
+            # If the run is already marked diagnostic and complies with the safety contract
+            # (status is not VERIFIED, diagnostic_status and outcome are populated), skip it idempotently.
+            if (
+                curr_is_diag
+                and curr_status != VerificationStatus.VERIFIED.value
+                and curr_diag_status is not None
+                and curr_diag_outcome is not None
+            ):
+                continue
+
+            cursor.execute("""
+                SELECT rule_id, status
+                FROM verification_findings
+                WHERE tenant_id = ? AND workspace_id = ? AND verification_id = ?
+            """, (t_id, w_id, v_id))
+            findings_rows = cursor.fetchall()
+
+            rule_ids = set(fr["rule_id"] for fr in findings_rows if fr["rule_id"])
+            finding_statuses = [VerificationStatus(fr["status"]) for fr in findings_rows if fr["status"]]
+
+            is_diag = False
+            is_ambiguous = False
+
+            if "RULE_EVIDENCE_EXISTS_V1" in rule_ids:
+                is_diag = True
+                if len(rule_ids) > 1:
+                    is_ambiguous = True
+            elif not findings_rows:
+                if "DIAGNOSTIC ONLY" in curr_summary or "EVIDENCE_EXISTS" in curr_summary:
+                    is_diag = True
+                    is_ambiguous = True
+                elif curr_status == VerificationStatus.VERIFIED.value:
+                    # Ambiguous legacy run: claimed VERIFIED without findings
+                    is_diag = True
+                    is_ambiguous = True
+            else:
+                if rule_ids.issubset(authoritative_rules):
+                    is_diag = False
+                else:
+                    if curr_status == VerificationStatus.VERIFIED.value:
+                        is_diag = True
+                        is_ambiguous = True
+
+            if not is_diag:
+                continue
+
+            if is_ambiguous and not finding_statuses:
+                new_run_status = VerificationStatus.NOT_VERIFIED
+                new_diag_status = VerificationStatus.INDETERMINATE
+                new_diag_outcome = "AMBIGUOUS_NO_FINDINGS"
+            elif is_ambiguous and "RULE_EVIDENCE_EXISTS_V1" in rule_ids:
+                run_st, diag_st, diag_out = compute_diagnostic_run_fields(finding_statuses, target_count)
+                new_run_status = run_st
+                new_diag_status = diag_st
+                new_diag_outcome = "INCONSISTENT_RULES"
+            elif is_ambiguous:
+                new_run_status = VerificationStatus.NOT_VERIFIED
+                new_diag_status = VerificationStatus.INDETERMINATE
+                new_diag_outcome = "UNRECOGNIZED_RULES"
+            else:
+                run_st, diag_st, diag_out = compute_diagnostic_run_fields(finding_statuses, target_count)
+                new_run_status = run_st
+                new_diag_status = diag_st
+                new_diag_outcome = diag_out
+
+            needs_update = (
+                not curr_is_diag
+                or curr_status != new_run_status.value
+                or curr_diag_status != new_diag_status.value
+                or curr_diag_outcome != new_diag_outcome
+            )
+
+            if needs_update:
+                updated_summary = curr_summary
+                if "DIAGNOSTIC ONLY" not in updated_summary:
+                    if updated_summary:
+                        updated_summary += " | DIAGNOSTIC ONLY: Evidence existence check does not certify authoritative mission completion."
+                    else:
+                        updated_summary = "DIAGNOSTIC ONLY: Evidence existence check does not certify authoritative mission completion."
+
+                updated_prov_json = r["provenance_json"]
+                try:
+                    prov_dict = json.loads(updated_prov_json)
+                    prov_limits = prov_dict.get("limitations", [])
+                    diag_caveat = "Diagnostic evaluation only (EVIDENCE_EXISTS): does not certify authoritative mission completion, freshness, or multi-source consistency."
+                    if not any("Diagnostic evaluation only" in lim for lim in prov_limits):
+                        prov_limits.append(diag_caveat)
+                        prov_dict["limitations"] = prov_limits[:30]
+                        updated_prov_json = json.dumps(prov_dict, separators=(",", ":"))
+                except Exception:
+                    pass
+
+                cursor.execute("""
+                    UPDATE verification_runs
+                    SET is_diagnostic = 1,
+                        status = ?,
+                        diagnostic_status = ?,
+                        diagnostic_outcome = ?,
+                        summary = ?,
+                        provenance_json = ?
+                    WHERE tenant_id = ? AND workspace_id = ? AND verification_id = ?
+                """, (
+                    new_run_status.value,
+                    new_diag_status.value,
+                    new_diag_outcome,
+                    updated_summary,
+                    updated_prov_json,
+                    t_id, w_id, v_id
+                ))
+
+                cursor.execute("""
+                    SELECT audit_id FROM verification_audit_ledger
+                    WHERE tenant_id = ? AND workspace_id = ? AND verification_id = ?
+                      AND event_type = 'MIGRATION_DIAGNOSTIC_STATUS_CORRECTION'
+                """, (t_id, w_id, v_id))
+                existing_audit = cursor.fetchone()
+
+                if not existing_audit:
+                    now_iso = datetime.now(timezone.utc).isoformat()
+                    audit_rec = VerificationAuditRecord(
+                        audit_id=f"vfaud_mig_{uuid.uuid4().hex[:12]}",
+                        verification_id=v_id,
+                        mission_id=m_id,
+                        mission_revision=m_rev,
+                        tenant_id=t_id,
+                        workspace_id=w_id,
+                        plant_id=p_id,
+                        event_type="MIGRATION_DIAGNOSTIC_STATUS_CORRECTION",
+                        result="NORMALIZED",
+                        actor_id="system_migration_p36f",
+                        actor_role="SYSTEM_MIGRATION",
+                        request_id=None,
+                        trace_id=None,
+                        details={
+                            "previous_status": curr_status,
+                            "new_status": new_run_status.value,
+                            "is_diagnostic": True,
+                            "diagnostic_status": new_diag_status.value,
+                            "diagnostic_outcome": new_diag_outcome,
+                            "reason": "Prompt 36F legacy diagnostic status normalization",
+                        },
+                        timestamp=now_iso,
+                    )
+                    cursor.execute("""
+                        INSERT INTO verification_audit_ledger (
+                            audit_id, verification_id, mission_id, mission_revision,
+                            tenant_id, workspace_id, plant_id, event_type, result,
+                            actor_id, actor_role, request_id, trace_id, details_json,
+                            checksum, timestamp
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        audit_rec.audit_id,
+                        audit_rec.verification_id,
+                        audit_rec.mission_id,
+                        audit_rec.mission_revision,
+                        audit_rec.tenant_id,
+                        audit_rec.workspace_id,
+                        audit_rec.plant_id,
+                        audit_rec.event_type,
+                        audit_rec.result,
+                        audit_rec.actor_id,
+                        audit_rec.actor_role,
+                        audit_rec.request_id,
+                        audit_rec.trace_id,
+                        json.dumps(audit_rec.details, separators=(",", ":")),
+                        audit_rec.checksum,
+                        audit_rec.timestamp,
+                    ))
+
+                corrected_count += 1
+
+        return corrected_count
+
+    def migrate_legacy_diagnostic_runs(self) -> int:
+        """
+        Public method to idempotently trigger legacy diagnostic runs migration.
+        Returns the number of runs updated.
+        """
+        with self._lock, self._get_connection() as conn:
+            count = self._migrate_legacy_diagnostic_runs(conn)
+            conn.commit()
+            return count
 
     def check_idempotency(
         self,
@@ -459,6 +694,23 @@ class VerificationRepository:
             diag_stat_raw = row["diagnostic_status"] if "diagnostic_status" in row.keys() else None
             diag_stat = VerificationStatus(diag_stat_raw) if diag_stat_raw else None
             diag_out = row["diagnostic_outcome"] if "diagnostic_outcome" in row.keys() else None
+            status_val = VerificationStatus(row["status"])
+            summary_val = row["summary"] or ""
+
+            # Defensive read-compatibility normalization
+            finding_rules = {f.rule_id for f in findings}
+            if not is_diag and ("RULE_EVIDENCE_EXISTS_V1" in finding_rules or "DIAGNOSTIC ONLY" in summary_val):
+                is_diag = True
+
+            if is_diag:
+                if status_val == VerificationStatus.VERIFIED or diag_stat is None:
+                    run_st, diag_st, d_out = compute_diagnostic_run_fields([f.status for f in findings], row["target_count"])
+                    status_val = run_st
+                    diag_stat = diag_st
+                    diag_out = d_out
+            else:
+                diag_stat = None
+                diag_out = None
 
             return VerificationRun(
                 verification_id=row["verification_id"],
@@ -466,7 +718,7 @@ class VerificationRepository:
                 mission_id=row["mission_id"],
                 mission_revision=row["mission_revision"],
                 verification_scope=row["verification_scope"],
-                status=VerificationStatus(row["status"]),
+                status=status_val,
                 started_at=row["started_at"],
                 completed_at=row["completed_at"],
                 requested_by=row["requested_by"],
@@ -542,6 +794,23 @@ class VerificationRepository:
                 diag_stat_raw = r["diagnostic_status"] if "diagnostic_status" in r.keys() else None
                 diag_stat = VerificationStatus(diag_stat_raw) if diag_stat_raw else None
                 diag_out = r["diagnostic_outcome"] if "diagnostic_outcome" in r.keys() else None
+                status_val = VerificationStatus(r["status"])
+                summary_val = r["summary"] or ""
+
+                # Defensive read-compatibility normalization for summaries
+                if not is_diag and "DIAGNOSTIC ONLY" in summary_val:
+                    is_diag = True
+
+                if is_diag:
+                    if status_val == VerificationStatus.VERIFIED:
+                        status_val = VerificationStatus.NOT_VERIFIED
+                    if diag_stat is None:
+                        diag_stat = VerificationStatus.VERIFIED
+                    if diag_out is None:
+                        diag_out = "CONFIRMED"
+                else:
+                    diag_stat = None
+                    diag_out = None
 
                 summaries.append(
                     VerificationRunSummary(
@@ -549,7 +818,7 @@ class VerificationRepository:
                         mission_id=r["mission_id"],
                         mission_revision=r["mission_revision"],
                         verification_scope=r["verification_scope"],
-                        status=VerificationStatus(r["status"]),
+                        status=status_val,
                         trigger_type=TriggerType(r["trigger_type"]),
                         started_at=r["started_at"],
                         completed_at=r["completed_at"],

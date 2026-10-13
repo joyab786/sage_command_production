@@ -18,7 +18,7 @@ Cardinal Invariants:
 """
 
 from enum import Enum
-from typing import Dict, List, Optional, Any, Set
+from typing import Dict, List, Optional, Any, Set, Tuple
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -333,6 +333,46 @@ class VerificationProvenance(BaseModel):
 # 6. CANONICAL VERIFICATION RUN CONTRACT
 # =============================================================================
 
+def compute_diagnostic_run_fields(
+    finding_statuses: List[VerificationStatus],
+    target_count: Optional[int] = None,
+) -> Tuple[VerificationStatus, VerificationStatus, str]:
+    """
+    Deterministically computes (run_status, diagnostic_status, diagnostic_outcome)
+    for a diagnostic verification run based on its finding statuses.
+
+    Precedence order:
+    1. Zero targets/findings -> run_status=INDETERMINATE, diagnostic_status=INDETERMINATE, diagnostic_outcome='NO_TARGETS'
+    2. Any BLOCKED -> run_status=BLOCKED, diagnostic_status=BLOCKED, diagnostic_outcome='BLOCKED'
+    3. Any FAILED -> run_status=FAILED, diagnostic_status=FAILED, diagnostic_outcome='FAILED'
+    4. Any CONFLICTING -> run_status=CONFLICTING, diagnostic_status=CONFLICTING, diagnostic_outcome='CONFLICTING'
+    5. Any NOT_VERIFIED -> run_status=NOT_VERIFIED, diagnostic_status=NOT_VERIFIED, diagnostic_outcome='NOT_FOUND'
+    6. Any INDETERMINATE -> run_status=INDETERMINATE, diagnostic_status=INDETERMINATE, diagnostic_outcome='INDETERMINATE'
+    7. Any STALE -> run_status=STALE, diagnostic_status=STALE, diagnostic_outcome='STALE'
+    8. All VERIFIED (verified_count == total > 0) -> run_status=NOT_VERIFIED, diagnostic_status=VERIFIED, diagnostic_outcome='CONFIRMED'
+    9. Else -> run_status=INDETERMINATE, diagnostic_status=INDETERMINATE, diagnostic_outcome='INDETERMINATE'
+    """
+    total = target_count if target_count is not None else len(finding_statuses)
+    if total == 0 or len(finding_statuses) == 0:
+        return VerificationStatus.INDETERMINATE, VerificationStatus.INDETERMINATE, "NO_TARGETS"
+
+    if any(s == VerificationStatus.BLOCKED for s in finding_statuses):
+        return VerificationStatus.BLOCKED, VerificationStatus.BLOCKED, "BLOCKED"
+    if any(s == VerificationStatus.FAILED for s in finding_statuses):
+        return VerificationStatus.FAILED, VerificationStatus.FAILED, "FAILED"
+    if any(s == VerificationStatus.CONFLICTING for s in finding_statuses):
+        return VerificationStatus.CONFLICTING, VerificationStatus.CONFLICTING, "CONFLICTING"
+    if any(s == VerificationStatus.NOT_VERIFIED for s in finding_statuses):
+        return VerificationStatus.NOT_VERIFIED, VerificationStatus.NOT_VERIFIED, "NOT_FOUND"
+    if any(s == VerificationStatus.INDETERMINATE for s in finding_statuses):
+        return VerificationStatus.INDETERMINATE, VerificationStatus.INDETERMINATE, "INDETERMINATE"
+    if any(s == VerificationStatus.STALE for s in finding_statuses):
+        return VerificationStatus.STALE, VerificationStatus.STALE, "STALE"
+    if all(s == VerificationStatus.VERIFIED for s in finding_statuses) and len(finding_statuses) == total:
+        return VerificationStatus.NOT_VERIFIED, VerificationStatus.VERIFIED, "CONFIRMED"
+    return VerificationStatus.INDETERMINATE, VerificationStatus.INDETERMINATE, "INDETERMINATE"
+
+
 class VerificationRun(BaseModel):
     """
     Authoritative snapshot of a bounded verification run evaluating a mission revision.
@@ -399,6 +439,30 @@ class VerificationRun(BaseModel):
     @classmethod
     def validate_sum(cls, v: str) -> str:
         return _validate_safe_text(v, "summary") or v
+
+    @model_validator(mode="after")
+    def validate_diagnostic_status_contract(self) -> "VerificationRun":
+        if self.is_diagnostic:
+            if self.status == VerificationStatus.VERIFIED:
+                raise ValueError(
+                    "A diagnostic verification run (is_diagnostic=True) cannot have run-level status VERIFIED. "
+                    "Diagnostic existence checks must never imply authoritative mission verification."
+                )
+            if self.diagnostic_status is None and self.status not in (
+                VerificationStatus.PENDING,
+                VerificationStatus.IN_PROGRESS,
+                VerificationStatus.CANCELLED,
+            ):
+                raise ValueError(
+                    "Completed diagnostic verification runs must have 'diagnostic_status' populated."
+                )
+        else:
+            if self.diagnostic_status is not None or self.diagnostic_outcome is not None:
+                raise ValueError(
+                    "Non-diagnostic verification runs (is_diagnostic=False) cannot have "
+                    "'diagnostic_status' or 'diagnostic_outcome' populated."
+                )
+        return self
 
 
 # =============================================================================
@@ -580,6 +644,20 @@ class VerificationRunSummary(BaseModel):
     diagnostic_status: Optional[VerificationStatus] = None
     diagnostic_outcome: Optional[str] = None
 
+    @model_validator(mode="after")
+    def validate_diagnostic_summary_contract(self) -> "VerificationRunSummary":
+        if self.is_diagnostic:
+            if self.status == VerificationStatus.VERIFIED:
+                raise ValueError(
+                    "Diagnostic verification summary (is_diagnostic=True) cannot have status VERIFIED."
+                )
+        else:
+            if self.diagnostic_status is not None or self.diagnostic_outcome is not None:
+                raise ValueError(
+                    "Non-diagnostic verification summary (is_diagnostic=False) cannot have diagnostic fields populated."
+                )
+        return self
+
 
 class VerificationFindingsResponse(BaseModel):
     """Paginated or complete findings list for a verification run."""
@@ -594,6 +672,20 @@ class VerificationFindingsResponse(BaseModel):
     is_diagnostic: bool = False
     diagnostic_status: Optional[VerificationStatus] = None
     diagnostic_outcome: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_diagnostic_findings_response(self) -> "VerificationFindingsResponse":
+        if self.is_diagnostic:
+            if self.overall_status == VerificationStatus.VERIFIED:
+                raise ValueError(
+                    "Diagnostic findings response (is_diagnostic=True) cannot have overall_status VERIFIED."
+                )
+        else:
+            if self.diagnostic_status is not None or self.diagnostic_outcome is not None:
+                raise ValueError(
+                    "Non-diagnostic findings response (is_diagnostic=False) cannot have diagnostic fields populated."
+                )
+        return self
 
 
 class VerificationCancelRequest(BaseModel):

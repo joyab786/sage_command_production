@@ -74,6 +74,7 @@ import os
 import sqlite3
 import tempfile
 import uuid
+import hashlib
 from datetime import datetime, timezone, timedelta
 import pytest
 from fastapi.testclient import TestClient
@@ -97,6 +98,8 @@ try:
         VerificationAuditRecord,
         VerificationRequest,
         VerificationRunSummary,
+        VerificationFindingsResponse,
+        compute_diagnostic_run_fields,
         RULE_SET_VERSION,
         EVALUATOR_VERSION,
         MANDATORY_VERIFICATION_NOTICE,
@@ -172,6 +175,8 @@ except (ImportError, ModuleNotFoundError):
         VerificationAuditRecord,
         VerificationRequest,
         VerificationRunSummary,
+        VerificationFindingsResponse,
+        compute_diagnostic_run_fields,
         RULE_SET_VERSION,
         EVALUATOR_VERSION,
         MANDATORY_VERIFICATION_NOTICE,
@@ -3309,4 +3314,543 @@ def test_prompt36e_test_e_regressions_and_security(v_service, analyst_identity, 
             rule_type=RuleType.EVIDENCE_EXISTS,
             rule_parameters={"status": "VERIFIED"},
         )
+
+
+# =============================================================================
+# PROMPT 36F: LEGACY DIAGNOSTIC RUN MIGRATION & CONTRACT INTEGRITY SUITE
+# =============================================================================
+
+import tempfile
+import os
+
+
+def _create_pre_36e_test_database(db_path: str):
+    """
+    Creates an explicit pre-Prompt-36E SQLite database structure:
+    - verification_runs table WITHOUT is_diagnostic, diagnostic_status, diagnostic_outcome columns.
+    - Populates realistic legacy historical runs (diagnostic, authoritative, blocked, ambiguous).
+    - Populates legacy findings and audit records with valid SHA-256 checksums.
+    """
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("""
+        CREATE TABLE verification_runs (
+            verification_id TEXT NOT NULL,
+            mission_id TEXT NOT NULL,
+            mission_revision INTEGER NOT NULL,
+            tenant_id TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            plant_id TEXT NOT NULL,
+            session_id TEXT,
+            schema_version TEXT NOT NULL,
+            verification_scope TEXT NOT NULL,
+            status TEXT NOT NULL,
+            trigger_type TEXT NOT NULL,
+            requested_by TEXT NOT NULL,
+            rule_set_version TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            completed_at TEXT,
+            target_count INTEGER NOT NULL DEFAULT 0,
+            verified_count INTEGER NOT NULL DEFAULT 0,
+            unverified_count INTEGER NOT NULL DEFAULT 0,
+            indeterminate_count INTEGER NOT NULL DEFAULT 0,
+            blocked_count INTEGER NOT NULL DEFAULT 0,
+            failed_count INTEGER NOT NULL DEFAULT 0,
+            summary TEXT NOT NULL DEFAULT '',
+            provenance_json TEXT NOT NULL,
+            idempotency_key TEXT,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, workspace_id, verification_id)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE verification_findings (
+            finding_id TEXT NOT NULL,
+            verification_id TEXT NOT NULL,
+            mission_id TEXT NOT NULL,
+            mission_revision INTEGER NOT NULL,
+            tenant_id TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            plant_id TEXT NOT NULL,
+            target_type TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            evidence_references_json TEXT NOT NULL,
+            evidence_assessments_json TEXT NOT NULL,
+            rule_id TEXT NOT NULL,
+            rule_version TEXT NOT NULL,
+            explanation TEXT NOT NULL,
+            limitations_json TEXT NOT NULL,
+            evaluated_at TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, workspace_id, finding_id),
+            FOREIGN KEY (tenant_id, workspace_id, verification_id)
+                REFERENCES verification_runs (tenant_id, workspace_id, verification_id)
+                ON DELETE CASCADE
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE verification_audit_ledger (
+            audit_id TEXT PRIMARY KEY,
+            verification_id TEXT NOT NULL,
+            mission_id TEXT NOT NULL,
+            mission_revision INTEGER NOT NULL,
+            tenant_id TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            plant_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            result TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            actor_role TEXT,
+            request_id TEXT,
+            trace_id TEXT,
+            details_json TEXT NOT NULL,
+            checksum TEXT NOT NULL,
+            timestamp TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE verification_idempotency_records (
+            idempotency_key TEXT NOT NULL,
+            tenant_id TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            verification_id TEXT NOT NULL,
+            mission_id TEXT NOT NULL,
+            request_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, workspace_id, idempotency_key)
+        )
+    """)
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    prov_json_default = json.dumps({
+        "verification_id": "vrun_default",
+        "mission_id": "mission_test_01",
+        "mission_revision": 1,
+        "rule_set_version": "1.0.0",
+        "evaluator_version": "1.0.0",
+        "evidence_ids": ["ev_rec_01"],
+        "evidence_timestamps": {},
+        "evaluation_timestamp": now_iso,
+        "limitations": ["Pre-Prompt 36E legacy baseline run"]
+    })
+
+    # 1. Legacy Successful Diagnostic Run: status=VERIFIED, rule=RULE_EVIDENCE_EXISTS_V1
+    conn.execute("""
+        INSERT INTO verification_runs (
+            verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            schema_version, verification_scope, status, trigger_type, requested_by, rule_set_version,
+            started_at, completed_at, target_count, verified_count, unverified_count,
+            indeterminate_count, blocked_count, failed_count, summary, provenance_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "run_legacy_diag_01", "mission_test_01", 1, "tenant_alpha", "workspace_prod", "plant_01",
+        "3.0.0", "FULL_MISSION", "VERIFIED", "MANUAL", "user_legacy", "1.0.0",
+        now_iso, now_iso, 1, 1, 0, 0, 0, 0,
+        "All 1 target(s) verified under diagnostic rule 'RULE_EVIDENCE_EXISTS_V1'. DIAGNOSTIC ONLY",
+        prov_json_default, now_iso
+    ))
+    conn.execute("""
+        INSERT INTO verification_findings (
+            finding_id, verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            target_type, target_id, status, evidence_references_json, evidence_assessments_json,
+            rule_id, rule_version, explanation, limitations_json, evaluated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "vf_leg_diag_01", "run_legacy_diag_01", "mission_test_01", 1, "tenant_alpha", "workspace_prod", "plant_01",
+        "CRITERION", "crit_01", "VERIFIED", json.dumps(["ev_rec_01"]), json.dumps([]),
+        "RULE_EVIDENCE_EXISTS_V1", "1.0.0", "Legacy existence confirmed", json.dumps([]), now_iso
+    ))
+    raw_chk_1 = f"run_legacy_diag_01:mission_test_01:1:VERIFICATION_COMPLETED:user_legacy:{now_iso}"
+    chk_1 = hashlib.sha256(raw_chk_1.encode("utf-8")).hexdigest()
+    conn.execute("""
+        INSERT INTO verification_audit_ledger (
+            audit_id, verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            event_type, result, actor_id, actor_role, details_json, checksum, timestamp
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "audit_leg_diag_01", "run_legacy_diag_01", "mission_test_01", 1, "tenant_alpha", "workspace_prod", "plant_01",
+        "VERIFICATION_COMPLETED", "VERIFIED", "user_legacy", "ANALYST", "{}", chk_1, now_iso
+    ))
+
+    # 2. Legacy Authoritative Run: status=VERIFIED, rule=RULE_EVIDENCE_VALIDATED_V1
+    conn.execute("""
+        INSERT INTO verification_runs (
+            verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            schema_version, verification_scope, status, trigger_type, requested_by, rule_set_version,
+            started_at, completed_at, target_count, verified_count, unverified_count,
+            indeterminate_count, blocked_count, failed_count, summary, provenance_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "run_legacy_auth_02", "mission_test_01", 1, "tenant_alpha", "workspace_prod", "plant_01",
+        "3.0.0", "FULL_MISSION", "VERIFIED", "MANUAL", "user_legacy", "1.0.0",
+        now_iso, now_iso, 1, 1, 0, 0, 0, 0,
+        "All 1 target(s) successfully verified by validated evidence.",
+        prov_json_default, now_iso
+    ))
+    conn.execute("""
+        INSERT INTO verification_findings (
+            finding_id, verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            target_type, target_id, status, evidence_references_json, evidence_assessments_json,
+            rule_id, rule_version, explanation, limitations_json, evaluated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "vf_leg_auth_02", "run_legacy_auth_02", "mission_test_01", 1, "tenant_alpha", "workspace_prod", "plant_01",
+        "CRITERION", "crit_01", "VERIFIED", json.dumps(["ev_rec_01"]), json.dumps([]),
+        "RULE_EVIDENCE_VALIDATED_V1", "1.0.0", "Authoritative validation confirmed", json.dumps([]), now_iso
+    ))
+    raw_chk_2 = f"run_legacy_auth_02:mission_test_01:1:VERIFICATION_COMPLETED:user_legacy:{now_iso}"
+    chk_2 = hashlib.sha256(raw_chk_2.encode("utf-8")).hexdigest()
+    conn.execute("""
+        INSERT INTO verification_audit_ledger (
+            audit_id, verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            event_type, result, actor_id, actor_role, details_json, checksum, timestamp
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "audit_leg_auth_02", "run_legacy_auth_02", "mission_test_01", 1, "tenant_alpha", "workspace_prod", "plant_01",
+        "VERIFICATION_COMPLETED", "VERIFIED", "user_legacy", "ANALYST", "{}", chk_2, now_iso
+    ))
+
+    # 3. Legacy Blocked Diagnostic Run: status=BLOCKED, rule=RULE_EVIDENCE_EXISTS_V1, finding status=BLOCKED
+    conn.execute("""
+        INSERT INTO verification_runs (
+            verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            schema_version, verification_scope, status, trigger_type, requested_by, rule_set_version,
+            started_at, completed_at, target_count, verified_count, unverified_count,
+            indeterminate_count, blocked_count, failed_count, summary, provenance_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "run_legacy_blocked_03", "mission_test_01", 1, "tenant_alpha", "workspace_prod", "plant_01",
+        "3.0.0", "FULL_MISSION", "BLOCKED", "MANUAL", "user_legacy", "1.0.0",
+        now_iso, now_iso, 1, 0, 0, 0, 1, 0,
+        "1 target(s) blocked due to scope restrictions.",
+        prov_json_default, now_iso
+    ))
+    conn.execute("""
+        INSERT INTO verification_findings (
+            finding_id, verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            target_type, target_id, status, evidence_references_json, evidence_assessments_json,
+            rule_id, rule_version, explanation, limitations_json, evaluated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "vf_leg_blocked_03", "run_legacy_blocked_03", "mission_test_01", 1, "tenant_alpha", "workspace_prod", "plant_01",
+        "CRITERION", "crit_01", "BLOCKED", json.dumps([]), json.dumps([]),
+        "RULE_EVIDENCE_EXISTS_V1", "1.0.0", "Scope blocked", json.dumps([]), now_iso
+    ))
+
+    # 4. Legacy Ambiguous Run: claimed status=VERIFIED, but 0 findings exist
+    conn.execute("""
+        INSERT INTO verification_runs (
+            verification_id, mission_id, mission_revision, tenant_id, workspace_id, plant_id,
+            schema_version, verification_scope, status, trigger_type, requested_by, rule_set_version,
+            started_at, completed_at, target_count, verified_count, unverified_count,
+            indeterminate_count, blocked_count, failed_count, summary, provenance_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        "run_legacy_ambig_04", "mission_test_01", 1, "tenant_alpha", "workspace_prod", "plant_01",
+        "3.0.0", "FULL_MISSION", "VERIFIED", "MANUAL", "user_legacy", "1.0.0",
+        now_iso, now_iso, 1, 1, 0, 0, 0, 0,
+        "Legacy ambiguous run without findings",
+        prov_json_default, now_iso
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+@pytest.fixture
+def legacy_pre_36e_repo():
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        db_path = f.name
+    _create_pre_36e_test_database(db_path)
+    repo = VerificationRepository(db_path=db_path)
+    yield repo
+    try:
+        os.remove(db_path)
+        for ext in ["-wal", "-shm"]:
+            p = db_path + ext
+            if os.path.exists(p):
+                os.remove(p)
+    except Exception:
+        pass
+
+
+def test_prompt36f_test_a_legacy_successful_diagnostic_run(legacy_pre_36e_repo):
+    """
+    Test A — Legacy successful diagnostic run:
+    - Pre-36E historical run with status VERIFIED and RULE_EVIDENCE_EXISTS_V1 findings.
+    - Migration marks it as diagnostic (is_diagnostic = True).
+    - Run-level status is NOT_VERIFIED (never implies authoritative mission verification).
+    - diagnostic_status is VERIFIED, diagnostic_outcome is 'CONFIRMED'.
+    - Finding-level status remains VERIFIED (rule-specific result).
+    - Original rule_id remains 'RULE_EVIDENCE_EXISTS_V1'.
+    - Consistent across get_run, list_runs, and model_dump.
+    """
+    repo = legacy_pre_36e_repo
+    run = repo.get_run("tenant_alpha", "workspace_prod", "mission_test_01", "run_legacy_diag_01")
+    assert run is not None
+    assert run.is_diagnostic is True
+    assert run.status == VerificationStatus.NOT_VERIFIED
+    assert run.diagnostic_status == VerificationStatus.VERIFIED
+    assert run.diagnostic_outcome == "CONFIRMED"
+    assert len(run.findings) == 1
+    assert run.findings[0].status == VerificationStatus.VERIFIED
+    assert run.findings[0].rule_id == "RULE_EVIDENCE_EXISTS_V1"
+    assert "DIAGNOSTIC ONLY" in run.summary
+
+    # Summary list consistency
+    summaries, _ = repo.list_runs("tenant_alpha", "workspace_prod", "mission_test_01")
+    matching = [s for s in summaries if s.verification_id == "run_legacy_diag_01"]
+    assert len(matching) == 1
+    s = matching[0]
+    assert s.is_diagnostic is True
+    assert s.status == VerificationStatus.NOT_VERIFIED
+    assert s.diagnostic_status == VerificationStatus.VERIFIED
+    assert s.diagnostic_outcome == "CONFIRMED"
+
+    # API response serialization
+    d = run.model_dump()
+    assert d["is_diagnostic"] is True
+    assert d["status"] == "NOT_VERIFIED"
+    assert d["diagnostic_status"] == "VERIFIED"
+    assert d["diagnostic_outcome"] == "CONFIRMED"
+
+    resp = VerificationFindingsResponse(
+        verification_id=run.verification_id,
+        mission_id=run.mission_id,
+        mission_revision=run.mission_revision,
+        overall_status=run.status,
+        total_findings=len(run.findings),
+        findings=run.findings,
+        is_diagnostic=run.is_diagnostic,
+        diagnostic_status=run.diagnostic_status,
+        diagnostic_outcome=run.diagnostic_outcome,
+    )
+    assert resp.is_diagnostic is True
+    assert resp.overall_status == VerificationStatus.NOT_VERIFIED
+
+
+def test_prompt36f_test_b_legacy_authoritative_successful_run(legacy_pre_36e_repo):
+    """
+    Test B — Legacy authoritative successful run:
+    - Pre-36E run with status VERIFIED and authoritative rule RULE_EVIDENCE_VALIDATED_V1.
+    - Preserves authoritative status (status == VERIFIED).
+    - is_diagnostic remains False.
+    - diagnostic_status and diagnostic_outcome remain None.
+    - Finding status and rule_id are preserved.
+    """
+    repo = legacy_pre_36e_repo
+    run_auth = repo.get_run("tenant_alpha", "workspace_prod", "mission_test_01", "run_legacy_auth_02")
+    assert run_auth is not None
+    assert run_auth.is_diagnostic is False
+    assert run_auth.status == VerificationStatus.VERIFIED
+    assert run_auth.diagnostic_status is None
+    assert run_auth.diagnostic_outcome is None
+    assert len(run_auth.findings) == 1
+    assert run_auth.findings[0].rule_id == "RULE_EVIDENCE_VALIDATED_V1"
+    assert run_auth.findings[0].status == VerificationStatus.VERIFIED
+
+
+def test_prompt36f_test_c_legacy_blocked_diagnostic_run(legacy_pre_36e_repo):
+    """
+    Test C — Legacy blocked diagnostic run:
+    - Pre-36E diagnostic run with BLOCKED status and findings.
+    - Cannot be represented as successful authoritative verification.
+    - status == BLOCKED, is_diagnostic == True, diagnostic_status == BLOCKED, diagnostic_outcome == 'BLOCKED'.
+    """
+    repo = legacy_pre_36e_repo
+    run_blocked = repo.get_run("tenant_alpha", "workspace_prod", "mission_test_01", "run_legacy_blocked_03")
+    assert run_blocked is not None
+    assert run_blocked.is_diagnostic is True
+    assert run_blocked.status == VerificationStatus.BLOCKED
+    assert run_blocked.diagnostic_status == VerificationStatus.BLOCKED
+    assert run_blocked.diagnostic_outcome == "BLOCKED"
+
+
+def test_prompt36f_test_d_ambiguous_legacy_run(legacy_pre_36e_repo):
+    """
+    Test D — Ambiguous legacy run:
+    - Legacy run claiming VERIFIED with missing findings.
+    - Migration follows conservative policy: does NOT grant authoritative verification.
+    - status != VERIFIED (normalized to NOT_VERIFIED, diagnostic_outcome='AMBIGUOUS_NO_FINDINGS').
+    """
+    repo = legacy_pre_36e_repo
+    run_ambig = repo.get_run("tenant_alpha", "workspace_prod", "mission_test_01", "run_legacy_ambig_04")
+    assert run_ambig is not None
+    assert run_ambig.status != VerificationStatus.VERIFIED
+    assert run_ambig.status == VerificationStatus.NOT_VERIFIED
+    assert run_ambig.is_diagnostic is True
+    assert run_ambig.diagnostic_status == VerificationStatus.INDETERMINATE
+    assert run_ambig.diagnostic_outcome == "AMBIGUOUS_NO_FINDINGS"
+
+
+def test_prompt36f_test_e_migration_idempotency(legacy_pre_36e_repo):
+    """
+    Test E — Migration idempotency:
+    - Repeated execution of migration causes zero duplicate entries or corruptions.
+    - No duplicate audit correction entries.
+    - Resulting machine-readable contract is identical.
+    """
+    repo = legacy_pre_36e_repo
+    count_1 = repo.migrate_legacy_diagnostic_runs()
+    assert count_1 == 0  # Already migrated during initialization
+
+    count_2 = repo.migrate_legacy_diagnostic_runs()
+    assert count_2 == 0
+
+    # Check audit ledger records for migration
+    records = repo.get_audit_records("tenant_alpha", "workspace_prod", "mission_test_01", "run_legacy_diag_01")
+    mig_events = [r for r in records if r.event_type == "MIGRATION_DIAGNOSTIC_STATUS_CORRECTION"]
+    assert len(mig_events) == 1
+
+    # Run again and ensure no duplicate audit events
+    repo.migrate_legacy_diagnostic_runs()
+    records_after = repo.get_audit_records("tenant_alpha", "workspace_prod", "mission_test_01", "run_legacy_diag_01")
+    mig_events_after = [r for r in records_after if r.event_type == "MIGRATION_DIAGNOSTIC_STATUS_CORRECTION"]
+    assert len(mig_events_after) == 1
+
+
+def test_prompt36f_test_f_model_validation():
+    """
+    Test F — Model validation:
+    - is_diagnostic=True cannot coexist with run-level status=VERIFIED.
+    - is_diagnostic=False cannot carry contradictory diagnostic fields.
+    - Legitimate authoritative VERIFIED runs remain valid.
+    - VerificationRunSummary and VerificationFindingsResponse enforce identical invariants.
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    prov = VerificationProvenance(
+        verification_id="vrun_val",
+        mission_id="m_val",
+        mission_revision=1,
+        evaluation_timestamp=now_iso,
+    )
+
+    # 1. is_diagnostic=True with status=VERIFIED must raise ValueError
+    with pytest.raises(ValueError, match="cannot have run-level status VERIFIED"):
+        VerificationRun(
+            verification_id="vrun_val",
+            mission_id="m_val",
+            mission_revision=1,
+            requested_by="user_test",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            plant_id="plant_01",
+            provenance=prov,
+            status=VerificationStatus.VERIFIED,
+            is_diagnostic=True,
+            diagnostic_status=VerificationStatus.VERIFIED,
+            diagnostic_outcome="CONFIRMED",
+        )
+
+    # 2. is_diagnostic=False with diagnostic_status must raise ValueError
+    with pytest.raises(ValueError, match="cannot have 'diagnostic_status'"):
+        VerificationRun(
+            verification_id="vrun_val",
+            mission_id="m_val",
+            mission_revision=1,
+            requested_by="user_test",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            plant_id="plant_01",
+            provenance=prov,
+            status=VerificationStatus.VERIFIED,
+            is_diagnostic=False,
+            diagnostic_status=VerificationStatus.VERIFIED,
+        )
+
+    # 3. Legitimate authoritative VERIFIED run is valid
+    auth_run = VerificationRun(
+        verification_id="vrun_val",
+        mission_id="m_val",
+        mission_revision=1,
+        requested_by="user_test",
+        tenant_id="tenant_alpha",
+        workspace_id="workspace_prod",
+        plant_id="plant_01",
+        provenance=prov,
+        status=VerificationStatus.VERIFIED,
+        is_diagnostic=False,
+    )
+    assert auth_run.status == VerificationStatus.VERIFIED
+    assert auth_run.is_diagnostic is False
+
+    # 4. Summary validation
+    with pytest.raises(ValueError, match="cannot have status VERIFIED"):
+        VerificationRunSummary(
+            verification_id="vrun_val",
+            mission_id="m_val",
+            mission_revision=1,
+            verification_scope="FULL_MISSION",
+            status=VerificationStatus.VERIFIED,
+            trigger_type=TriggerType.MANUAL,
+            started_at=now_iso,
+            target_count=1,
+            verified_count=1,
+            unverified_count=0,
+            indeterminate_count=0,
+            blocked_count=0,
+            failed_count=0,
+            summary="test",
+            is_diagnostic=True,
+        )
+
+    # 5. Findings response validation
+    with pytest.raises(ValueError, match="cannot have overall_status VERIFIED"):
+        VerificationFindingsResponse(
+            verification_id="vrun_val",
+            mission_id="m_val",
+            mission_revision=1,
+            overall_status=VerificationStatus.VERIFIED,
+            total_findings=0,
+            findings=[],
+            is_diagnostic=True,
+        )
+
+
+def test_prompt36f_test_g_serialization_and_api_consistency(legacy_pre_36e_repo):
+    """
+    Test G — Serialization and API consistency:
+    - Normalized legacy runs maintain identical safe representation across model_dump,
+      JSON string round-trip, model_validate, and API response models.
+    - No read path turns a corrected legacy diagnostic run back into an authoritative VERIFIED result.
+    """
+    repo = legacy_pre_36e_repo
+    run = repo.get_run("tenant_alpha", "workspace_prod", "mission_test_01", "run_legacy_diag_01")
+    assert run.status == VerificationStatus.NOT_VERIFIED
+
+    dumped = run.model_dump()
+    json_str = json.dumps(dumped)
+    loaded = json.loads(json_str)
+
+    reconstructed = VerificationRun.model_validate(loaded)
+    assert reconstructed.is_diagnostic is True
+    assert reconstructed.status == VerificationStatus.NOT_VERIFIED
+    assert reconstructed.diagnostic_status == VerificationStatus.VERIFIED
+    assert reconstructed.diagnostic_outcome == "CONFIRMED"
+
+
+def test_prompt36f_test_h_audit_integrity(legacy_pre_36e_repo):
+    """
+    Test H — Audit integrity:
+    - Historical audit entries are preserved with original checksums intact.
+    - Migration audit correction entry follows conventions and has valid SHA-256 checksum.
+    - No duplicate migration entries on repeat calls.
+    """
+    repo = legacy_pre_36e_repo
+    records = repo.get_audit_records("tenant_alpha", "workspace_prod", "mission_test_01", "run_legacy_diag_01")
+    assert len(records) >= 2
+
+    # Original record
+    orig = [r for r in records if r.audit_id == "audit_leg_diag_01"][0]
+    raw_orig = f"{orig.verification_id}:{orig.mission_id}:{orig.mission_revision}:{orig.event_type}:{orig.actor_id}:{orig.timestamp}"
+    assert orig.checksum == hashlib.sha256(raw_orig.encode("utf-8")).hexdigest()
+
+    # Migration record
+    mig = [r for r in records if r.event_type == "MIGRATION_DIAGNOSTIC_STATUS_CORRECTION"][0]
+    assert mig.result == "NORMALIZED"
+    assert mig.actor_id == "system_migration_p36f"
+    raw_mig = f"{mig.verification_id}:{mig.mission_id}:{mig.mission_revision}:{mig.event_type}:{mig.actor_id}:{mig.timestamp}"
+    assert mig.checksum == hashlib.sha256(raw_mig.encode("utf-8")).hexdigest()
+
 
