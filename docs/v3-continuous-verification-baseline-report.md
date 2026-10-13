@@ -259,7 +259,40 @@ The distinction is deterministically exposed via machine-readable fields across 
 
 ---
 
-## 10. Known Limitations
+## 10. Prompt 36F — Legacy Diagnostic Run Migration & Verification Contract Integrity
+
+Prompt 36F eliminated the backward-compatibility vulnerability where SQLite verification runs created prior to Prompt 36E could still contain `status=VERIFIED` for diagnostic `EVIDENCE_EXISTS` checks with default `is_diagnostic=0`:
+
+### A. Defect Analysis & Corrective Actions
+- **Issue:** Independent review identified that historical runs created before Prompt 36E still had `status=VERIFIED`. The Prompt 36E schema migration added `is_diagnostic` defaulting to `0` without backfilling historical records.
+- **Correction:** Implemented non-destructive, idempotent SQLite schema migration in `VerificationRepository._migrate_legacy_diagnostic_runs()`.
+- **Legacy Discovery:** Pre-36E diagnostic records are authoritatively discovered via `verification_findings.rule_id = 'RULE_EVIDENCE_EXISTS_V1'` or explicit summary disclaimers.
+- **Status Normalization:** Historical runs with `status = VERIFIED` are normalized to `NOT_VERIFIED`. Individual finding statuses (`finding.status = VERIFIED`) and their original `rule_id` are preserved.
+- **Audit Integrity:** Preserved historical audit ledger records and their checksums; appended verifiable migration audit entries (`MIGRATION_DIAGNOSTIC_STATUS_CORRECTION`).
+- **Model Boundaries:** Added `@model_validator(mode="after")` to `VerificationRun`, `VerificationRunSummary`, and `VerificationFindingsResponse` to reject `is_diagnostic=True` with `status=VERIFIED`.
+- **Read-Path Defense:** Added in-memory defensive normalization in `get_run()` and `list_runs()` before domain model instantiation.
+
+### B. Verified Test Metrics (Prompt 36F)
+- **Continuous Verification Suite (`backend/test_v3_continuous_verification.py`):** **107 passed, 0 failed** in 9.82s (8 dedicated adversarial Prompt 36F tests using temporary pre-36E SQLite databases).
+  - Test A: Proved legacy successful diagnostic runs are identified, run-level status normalized to `NOT_VERIFIED`, and diagnostic fields populated.
+  - Test B: Proved legacy authoritative successful runs (`RULE_EVIDENCE_VALIDATED_V1`) remain strictly preserved with `status=VERIFIED` and `is_diagnostic=False`.
+  - Test C: Proved legacy blocked diagnostic runs preserve blocked status and cannot certify authoritative success.
+  - Test D: Proved ambiguous legacy runs without findings are conservatively normalized (`status=NOT_VERIFIED`, `outcome='AMBIGUOUS_NO_FINDINGS'`).
+  - Test E: Proved migration idempotency across repeated executions (zero repeated updates, zero duplicate audit entries).
+  - Test F: Proved model boundary validation strictly rejects invalid diagnostic combinations.
+  - Test G: Proved serialization and API consistency across `model_dump()`, JSON round-trips, and response models.
+  - Test H: Proved audit integrity: historical entries untouched with valid checksums; migration audit events verifiable.
+- **Mission Architecture Regression Suite (`backend/test_v3_mission_architecture.py`):** **74 passed, 0 failed** in 6.49s.
+- **Evidence Explainability Suite (`backend/test_v3_evidence_explainability.py`):** **140 passed, 0 failed** in 6.80s.
+- **Organizational Memory Suite (`backend/test_v3_organizational_memory.py`):** **83 passed, 0 failed** in 8.71s.
+- **Root Cause Analysis Suite (`backend/test_v3_root_cause_analysis.py`):** **30 passed, 0 failed** in 6.31s.
+- **Incident Management Suite (`backend/test_v3_incident_management.py`):** **56 passed, 0 failed** in 12.43s.
+- **Confidence Uncertainty & Authorization Suite (`backend/test_v3_confidence_uncertainty.py`, `backend/test_v3_authorization.py`):** **171 passed, 0 failed** in 7.68s.
+- **Combined Prompt 36F Verification Test Count:** **661 passed, 0 failed, 0 skipped** across all executed suites.
+
+---
+
+## 11. Known Limitations
 
 1. **Synchronous Polling vs. Event-Driven Push**: Evidence evaluation is performed on demand during a verification request. Streaming continuous re-evaluation upon telemetry event emission is architecturally prepared but scheduled for Prompt 37.
 2. **Deterministic Rules Bound**: The current rule registry implements 8 explicit deterministic rule types. Non-deterministic probabilistic models are intentionally not permitted to decide verification outcomes.
@@ -270,9 +303,9 @@ The distinction is deterministically exposed via machine-readable fields across 
 
 ---
 
-## 11. Explicitly Deferred Capabilities
+## 12. Explicitly Deferred Capabilities
 
-The following capabilities are explicitly deferred from Prompts 36, 36A, 36B, 36C, 36D & 36E:
+The following capabilities are explicitly deferred from Prompts 36, 36A, 36B, 36C, 36D, 36E & 36F:
 - Autonomous mission execution or dispatch.
 - Direct SCADA / PLC write commands.
 - Operational database updates or deletions.
@@ -282,7 +315,7 @@ The following capabilities are explicitly deferred from Prompts 36, 36A, 36B, 36
 
 ---
 
-## 12. Lineage and Git Lineage
+## 13. Lineage and Git Lineage
 
 - **Prompt 36 Starting Baseline:** `de6dac99df8c1285b33076eeb58d37b0656c1dcc`
 - **Prompt 36A Starting Baseline:** `663f3a491f84a97e580f575fd711d82e87f67f45`
@@ -294,6 +327,8 @@ The following capabilities are explicitly deferred from Prompts 36, 36A, 36B, 36
 - **Prompt 36D Starting Baseline:** `7bb9ff70de4d1c948319f8250216818c63b9e97e`
 - **Prompt 36D Implementation Commit:** `e3b672cd7a3d6041595d610a9f01b07fa6ed944e`
 - **Prompt 36E Starting Baseline:** `e3b672cd7a3d6041595d610a9f01b07fa6ed944e`
+- **Prompt 36E Implementation Commit:** `a53ccd16e34a3bfc9da3c3dbd1fcad54662b16b5`
+- **Prompt 36F Starting Baseline:** `a53ccd16e34a3bfc9da3c3dbd1fcad54662b16b5`
 - **Target Branch:** `main`
 - **Repository:** `joyab786/sage_command_production`
 

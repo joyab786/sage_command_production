@@ -443,11 +443,53 @@ The distinction is deterministically exposed via machine-readable contract field
 
 ---
 
-## 19. Status Summary
+## 19. Legacy Diagnostic Run Migration & Verification Contract Integrity (Prompt 36F)
 
-- **Continuous Verification Engine**: `IMPLEMENTED` & `HARDENED (Prompt 36, 36A, 36B, 36C, 36D & 36E)`
+Prompt 36F resolved the historical backward-compatibility defect where SQLite verification runs created prior to Prompt 36E could still contain `status=VERIFIED` for diagnostic `EVIDENCE_EXISTS` checks with default `is_diagnostic=0`:
+
+### A. Defect Analysis & Root Cause
+- **Vulnerability:** Schema migrations in Prompt 36E added `is_diagnostic` (default `0`), `diagnostic_status` (`NULL`), and `diagnostic_outcome` (`NULL`) to `verification_runs`, but did not backfill or normalize historical rows.
+- **Security Impact:** A historical diagnostic run persisted before Prompt 36E with `status=VERIFIED` would appear to current API clients and downstream automated systems as an authoritative mission verification success.
+- **Permanent Invariant:** A diagnostic `EVIDENCE_EXISTS` run must **never** be represented as an authoritative run-level `VERIFIED` result, whether created today or retrieved from legacy historical tables.
+
+### B. Legacy Record Discovery & Safe Policy
+- **Deterministic Rule Identification:** Historical diagnostic runs are identified authoritatively by inspecting persisted findings in `verification_findings` for `rule_id = 'RULE_EVIDENCE_EXISTS_V1'`.
+- **Text & Summary Markers:** Where findings rows are absent, legacy runs with `"DIAGNOSTIC ONLY"` or `"EVIDENCE_EXISTS"` in their `summary` are identified as diagnostic.
+- **Ambiguous Records Policy:** Legacy runs claiming run-level `VERIFIED` without findings rows or with mixed/unrecognized rule sets are conservatively classified as non-authoritative (`is_diagnostic = 1`, `status = NOT_VERIFIED`, `diagnostic_status = INDETERMINATE`, `diagnostic_outcome = 'AMBIGUOUS_NO_FINDINGS'`). Ambiguous records are never silently upgraded to authoritative verification.
+- **Preservation of Authoritative Runs:** Ordinary historical authoritative runs (`RULE_EVIDENCE_VALIDATED_V1`, `RULE_EVIDENCE_FRESH_V1`, `RULE_REQUIRED_EVIDENCE_PRESENT_V1`, etc.) are strictly preserved (`is_diagnostic = 0`, `status = VERIFIED`).
+
+### C. Non-Destructive, Idempotent Migration
+- **Schema Lifecycle Integration:** The migration runs automatically during database initialization (`VerificationRepository._init_db -> _create_tables_and_indexes -> _migrate_legacy_diagnostic_runs`) and is exposed publicly via `repo.migrate_legacy_diagnostic_runs()`.
+- **Normalized Run Status:** For legacy diagnostic runs whose persisted run-level status was `VERIFIED`, the machine-readable run status is normalized to `NOT_VERIFIED`. Finding-level diagnostic statuses (`finding.status = VERIFIED`) and their original `rule_id` (`RULE_EVIDENCE_EXISTS_V1`) remain completely intact.
+- **Deterministic Field Population:** Populates `is_diagnostic = 1`, `diagnostic_status`, and `diagnostic_outcome` using finding-level diagnostic evaluations via `compute_diagnostic_run_fields`.
+- **Summary & Provenance Caveats:** Appends the standard diagnostic disclaimer to `summary` and `provenance.limitations` if not already present.
+- **Idempotency Guarantee:** Repeated migration runs execute safely without mutating already compliant runs or creating duplicate records (`corrected_count = 0` on repeat invocations).
+
+### D. Audit Ledger Integrity
+- **Non-Destructive Append-Only:** Historical audit ledger records in `verification_audit_ledger` are untouched, preserving original audit entries and cryptographic SHA-256 checksums.
+- **Migration Audit Events:** An idempotent migration event (`event_type = 'MIGRATION_DIAGNOSTIC_STATUS_CORRECTION'`, `actor_id = 'system_migration_p36f'`, `result = 'NORMALIZED'`) is appended with a verifiable SHA-256 checksum for each corrected run. Subsequent migration executions do not duplicate migration audit records.
+
+### E. Model Boundary Validation
+Deterministic Pydantic v2 domain validators (`@model_validator(mode="after")`) enforce safety invariants across `VerificationRun`, `VerificationRunSummary`, and `VerificationFindingsResponse`:
+- `is_diagnostic=True` cannot coexist with run-level `status=VERIFIED`. Any attempt to construct or deserialize such a model raises a `ValueError`.
+- Completed diagnostic runs must specify `diagnostic_status`.
+- Non-diagnostic runs (`is_diagnostic=False`) cannot carry contradictory diagnostic fields (`diagnostic_status` or `diagnostic_outcome`).
+- Finding-level `finding.status = VERIFIED` remains permitted for diagnostic findings under `RULE_EVIDENCE_EXISTS_V1`.
+- Legitimate authoritative `status = VERIFIED` runs remain valid.
+
+### F. Read-Path Defense-in-Depth
+Defensive read-compatibility logic in `VerificationRepository.get_run()` and `VerificationRepository.list_runs()` normalizes legacy database rows dynamically in memory before domain model instantiation, ensuring that even unmigrated or externally imported SQLite databases cannot violate the model boundary or return authoritative verification for legacy diagnostic runs.
+
+---
+
+## 20. Status Summary
+
+- **Continuous Verification Engine**: `IMPLEMENTED` & `HARDENED (Prompts 36, 36A–36F)`
+- **Legacy Diagnostic Migration**: `IMPLEMENTED & VERIFIED` (Prompt 36F SQLite backfill, audit ledger preservation, idempotency verified)
+- **Model-Level Invariant Enforcement**: `IMPLEMENTED & ENFORCED` (`is_diagnostic=True` strictly forbids run-level `status=VERIFIED`)
+- **Read-Path Defense-in-Depth**: `IMPLEMENTED` (Direct in-memory normalization in `get_run()` and `list_runs()`)
 - **Machine-Readable Diagnostic Status**: `IMPLEMENTED & ENFORCED` (`run.status = NOT_VERIFIED`, `is_diagnostic = True`, `diagnostic_status = VERIFIED`)
-- **Universal Scope Enforcement**: `IMPLEMENTED & ENFORCED` across all 8 registered rules
+- **Universal Scope Enforcement**: `IMPLEMENTED & ENFORCED` across all registered rules
 - **Universal Evidence Non-Disclosure**: `IMPLEMENTED & VERIFIED` across all return paths, findings, provenance, and storage
 - **Rule Parameter Boundary**: `ENFORCED` (Prohibited parameters rejected, server parameters authoritative)
 - **Authoritative Optionality**: `DISABLED & FAIL-CLOSED` (No trusted contract; all target evidence required)
@@ -461,4 +503,5 @@ The distinction is deterministically exposed via machine-readable contract field
 - **FastAPI Endpoints**: `IMPLEMENTED`
 - **Real-Time Polling/Continuous Loop**: `DEFERRED` (Prompt 37)
 - **Closed-Loop Learning**: `DEFERRED` (Prompt 37)
+- **Remaining Integration Risk**: `REMAINING RISK` (External third-party API clients asserting `run.status == VERIFIED` for legacy diagnostic runs must update parsers to read `diagnostic_status`)
 
