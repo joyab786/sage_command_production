@@ -505,9 +505,67 @@ All retrieval paths (`get_run()`, `list_runs()`, findings endpoints, API seriali
 
 ---
 
-## 21. Status Summary
+## 21. Diagnostic Finding Reconciliation & Fail-Closed Read Integrity (Prompt 36H)
 
-- **Continuous Verification Engine**: `IMPLEMENTED` & `HARDENED (Prompts 36, 36A–36G)`
+Prompt 36H addresses the read-integrity defect where stored diagnostic metadata (`diagnostic_status` and `diagnostic_outcome`) could contradict actual persisted findings.
+
+### A. Missing Metadata vs. Contradictory Metadata
+- **Missing Metadata (Prompt 36G):** Occurs when historical diagnostic records possess `NULL` values in diagnostic columns. Prompt 36G prevented falling back to fabricated confirmation by recomputing fields from findings when metadata was absent.
+- **Contradictory Metadata (Prompt 36H):** Occurs when a stored database record explicitly contains populated diagnostic fields (e.g., `diagnostic_status = 'VERIFIED'`, `diagnostic_outcome = 'CONFIRMED'`), yet its actual persisted findings are `BLOCKED`, `NOT_VERIFIED`, `INDETERMINATE`, `FAILED`, `CONFLICTING`, empty, or evaluated under mixed/unrecognized rules.
+- **Permanent Invariant:** **Persisted diagnostic metadata is a representation of the verification result, not independent proof of that result.** For every diagnostic verification run, the authoritative diagnostic result is derived deterministically from actual, correctly scoped persisted findings. Existing summary metadata or stored columns must never override contradictory findings.
+
+### B. Findings-Driven Diagnostic Reconciliation on Every Read
+The normalizer `VerificationRepository._normalize_diagnostic_run_fields()` now executes canonical reconciliation on **every read** of an identified diagnostic run across both `get_run()` and `list_runs()`:
+1. **Diagnostic Classification:** Identifies diagnostic runs using established signals (`is_diagnostic` flag, `RULE_EVIDENCE_EXISTS_V1` findings, summary diagnostic markers, or stored diagnostic columns).
+2. **Authoritative Preservation:** Legitimate authoritative runs (`is_diagnostic = False`, authoritative rules) retain their authoritative status (`status = VERIFIED`), with diagnostic fields unset (`None`), preserving authoritative verification integrity.
+3. **No Overriding Stored Confirmation:** Stored `diagnostic_status` and `diagnostic_outcome` are never accepted as authoritative when they contradict actual findings.
+4. **Permanent Run Status Invariant:** Diagnostic runs can never have run-level `status = VERIFIED` (normalized to `NOT_VERIFIED`, `BLOCKED`, `FAILED`, etc.).
+5. **No Read-Side Mutation:** Reads in `get_run()` and `list_runs()` are deterministic and side-effect free, performing zero writes to `verification_runs` or `verification_audit_ledger`.
+
+### C. Safe Handling of Mixed Rule Sets and Missing Findings
+- **Mixed Diagnostic & Authoritative Rules:** When a diagnostic run contains both `RULE_EVIDENCE_EXISTS_V1` and authoritative rules (e.g., `RULE_EVIDENCE_VALIDATED_V1`), it fails closed:
+  - `status = NOT_VERIFIED`
+  - `diagnostic_status = INDETERMINATE`
+  - `diagnostic_outcome = 'INCONSISTENT_RULES'`
+  No ambiguous rule combination can be certified as `CONFIRMED` merely because individual finding statuses are `VERIFIED`.
+- **Zero Persisted Findings:** When an identified diagnostic run has zero persisted findings, it fails closed:
+  - `status = NOT_VERIFIED`
+  - `diagnostic_status = INDETERMINATE`
+  - `diagnostic_outcome = 'AMBIGUOUS_NO_FINDINGS'` (or `'NO_TARGETS'` if `target_count == 0`)
+  Confirmation is never granted without evaluated evidence findings.
+
+### D. Result Matrix
+| Persisted Findings | Stored Metadata | Derived Reconciled Result |
+|---|---|---|
+| All diagnostic findings `VERIFIED` (`RULE_EVIDENCE_EXISTS_V1`) | Missing | `status: NOT_VERIFIED`, `diagnostic_status: VERIFIED`, `diagnostic_outcome: 'CONFIRMED'` |
+| One or more findings `BLOCKED` | Stored: `VERIFIED` / `CONFIRMED` | `status: BLOCKED`, `diagnostic_status: BLOCKED`, `diagnostic_outcome: 'BLOCKED'` |
+| Findings `NOT_VERIFIED` | Stored: `VERIFIED` / `CONFIRMED` | `status: NOT_VERIFIED`, `diagnostic_status: NOT_VERIFIED`, `diagnostic_outcome: 'NOT_FOUND'` |
+| Findings `INDETERMINATE` | Stored: `VERIFIED` / `CONFIRMED` | `status: INDETERMINATE`, `diagnostic_status: INDETERMINATE`, `diagnostic_outcome: 'INDETERMINATE'` |
+| Findings contain `FAILED` | Stored: `VERIFIED` / `CONFIRMED` | `status: FAILED`, `diagnostic_status: FAILED`, `diagnostic_outcome: 'FAILED'` |
+| Findings contain `CONFLICTING` | Stored: `VERIFIED` / `CONFIRMED` | `status: CONFLICTING`, `diagnostic_status: CONFLICTING`, `diagnostic_outcome: 'CONFLICTING'` |
+| Diagnostic run has no findings | Stored: `VERIFIED` / `CONFIRMED` | `status: NOT_VERIFIED`, `diagnostic_status: INDETERMINATE`, `diagnostic_outcome: 'AMBIGUOUS_NO_FINDINGS'` |
+| Mixed diagnostic & authoritative rules | Stored: `VERIFIED` / `CONFIRMED` | `status: NOT_VERIFIED`, `diagnostic_status: INDETERMINATE`, `diagnostic_outcome: 'INCONSISTENT_RULES'` |
+| Authoritative run with authoritative rules | Stored: `VERIFIED` | `status: VERIFIED`, `diagnostic_status: None`, `diagnostic_outcome: None` |
+
+### E. Adversarial Test Coverage
+The suite `backend/test_v3_continuous_verification.py` was extended with tests A through J covering:
+- **Test A:** Contradictory blocked finding overrides stored `CONFIRMED` to `BLOCKED`.
+- **Test B:** Contradictory missing finding overrides stored `CONFIRMED` to `NOT_FOUND`.
+- **Test C:** Contradictory indeterminate finding overrides stored `CONFIRMED` to `INDETERMINATE`.
+- **Test D:** Contradictory mixed-rule record fails closed to `INCONSISTENT_RULES`.
+- **Test E:** Zero findings fail closed to `AMBIGUOUS_NO_FINDINGS`.
+- **Test F:** Consistent success preserves `diagnostic_status=VERIFIED`, `outcome=CONFIRMED`, `status=NOT_VERIFIED`.
+- **Test G:** Read-path parity between `get_run()` and `list_runs()` across all adversarial runs.
+- **Test H:** Legitimate authoritative runs remain `VERIFIED`.
+- **Test I:** Strict tenant, workspace, and mission scoping prevents cross-scope finding leaks.
+- **Test J:** Deterministic repeated reads produce zero database updates and zero audit record creations.
+
+---
+
+## 22. Status Summary
+
+- **Continuous Verification Engine**: `IMPLEMENTED` & `HARDENED (Prompts 36, 36A–36H)`
+- **Findings-Driven Read Reconciliation**: `IMPLEMENTED & ENFORCED` (Prompt 36H deterministic reconciliation on every read; stored metadata never overrides findings)
 - **Unsafe Fallback Prevention**: `IMPLEMENTED & VERIFIED` (Prompt 36G findings-based summary aggregation; zero fabricated confirmations)
 - **Unified Read Contract**: `IMPLEMENTED` (Shared `_normalize_diagnostic_run_fields()` across `get_run()` and `list_runs()`)
 - **Legacy Diagnostic Migration**: `IMPLEMENTED & VERIFIED` (Prompt 36F SQLite backfill, audit ledger preservation, idempotency verified)

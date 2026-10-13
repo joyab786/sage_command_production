@@ -318,17 +318,50 @@ Prompt 36G resolved the unsafe summary fallback in `VerificationRepository.list_
   - Test H: Proved cross-scope isolation prevents summaries for one tenant/workspace from observing or consuming findings from another.
   - Test I: Proved repeated reads and migrations are deterministic, idempotent, and cause zero duplicate audit records.
   - Test J: Explicitly proved all 12 Prompt 36G security invariants.
-- **Mission Architecture Regression Suite (`backend/test_v3_mission_architecture.py`):** **74 passed, 0 failed** in 6.60s.
-- **Evidence Explainability Suite (`backend/test_v3_evidence_explainability.py`):** **140 passed, 0 failed** in 6.87s.
-- **Organizational Memory Suite (`backend/test_v3_organizational_memory.py`):** **83 passed, 0 failed** in 8.65s.
-- **Root Cause Analysis Suite (`backend/test_v3_root_cause_analysis.py`):** **30 passed, 0 failed** in 6.21s.
-- **Incident Management Suite (`backend/test_v3_incident_management.py`):** **56 passed, 0 failed** in 10.91s.
-- **Confidence Uncertainty & Authorization Suite (`backend/test_v3_confidence_uncertainty.py`, `backend/test_v3_authorization.py`):** **171 passed, 0 failed** in 7.64s.
 - **Combined Prompt 36G Verification Test Count:** **671 passed, 0 failed, 0 skipped** across all executed suites.
 
 ---
 
-## 12. Known Limitations
+## 12. Prompt 36H — Diagnostic Finding Reconciliation & Fail-Closed Read Integrity
+
+### A. Defect Addressed
+While Prompt 36G resolved the unpopulated/missing metadata fallback in `list_runs()`, a defect remained when database records possessed explicitly stored, yet contradictory, diagnostic metadata (e.g. stored `diagnostic_status = 'VERIFIED'`, `diagnostic_outcome = 'CONFIRMED'`) where actual findings were `BLOCKED`, `NOT_VERIFIED`, `INDETERMINATE`, `FAILED`, `CONFLICTING`, empty, or evaluated under mixed/unrecognized rules.
+
+### B. Core Permanent Invariant
+> **For every diagnostic verification run, the authoritative diagnostic result must be derived deterministically from the actual, correctly scoped persisted findings. Existing summary metadata or stored fields must never override contradictory findings.**
+
+### C. Implementation Summary
+- **Unified Normalizer Recomputation:** Updated `VerificationRepository._normalize_diagnostic_run_fields()` to unconditionally reconcile **every identified diagnostic run** against its persisted findings on every read, across both `get_run()` and `list_runs()`.
+- **Fail-Closed Mixed Rule Sets:** If findings contain both `RULE_EVIDENCE_EXISTS_V1` and authoritative rules (or unrecognized rules), the read path fails closed to `status = NOT_VERIFIED`, `diagnostic_status = INDETERMINATE`, `diagnostic_outcome = 'INCONSISTENT_RULES'`.
+- **Fail-Closed Empty Findings:** If a diagnostic run contains zero findings, it fails closed to `status = NOT_VERIFIED`, `diagnostic_status = INDETERMINATE`, `diagnostic_outcome = 'AMBIGUOUS_NO_FINDINGS'` (or `'NO_TARGETS'`).
+- **Authoritative Verification Preservation:** Legitimate authoritative runs (`is_diagnostic = False`, authoritative rules) retain their authoritative `status = VERIFIED` with diagnostic fields `None`.
+- **Side-Effect Free Reads:** Read-time reconciliation in `get_run()` and `list_runs()` is side-effect-free, performing zero SQLite mutations or audit ledger appends.
+- **Scope Isolation:** Maintained strict tenant, workspace, mission, and verification isolation on all findings queries.
+
+### D. Prompt 36H Test Suite Results
+- **Focused Continuous Verification Suite (`backend/test_v3_continuous_verification.py`):** **128 passed, 0 failed** (extended with 11 adversarial tests).
+  - Test A: Contradictory blocked finding overrides stored `CONFIRMED` to `BLOCKED` (recomputed `status = BLOCKED`, `diagnostic_status = BLOCKED`, `diagnostic_outcome = 'BLOCKED'`).
+  - Test B: Contradictory missing finding overrides stored `CONFIRMED` to `NOT_FOUND` (recomputed `status = NOT_VERIFIED`, `diagnostic_status = NOT_VERIFIED`, `diagnostic_outcome = 'NOT_FOUND'`).
+  - Test C: Contradictory indeterminate finding overrides stored `CONFIRMED` to `INDETERMINATE`.
+  - Test D: Contradictory mixed-rule record fails closed to `INCONSISTENT_RULES` with `diagnostic_status = INDETERMINATE`.
+  - Test E: Zero findings with stored `CONFIRMED` fails closed to `AMBIGUOUS_NO_FINDINGS`.
+  - Test F: Consistent success under `RULE_EVIDENCE_EXISTS_V1` preserves `status = NOT_VERIFIED`, `diagnostic_status = VERIFIED`, `diagnostic_outcome = 'CONFIRMED'`.
+  - Test G: Read-path parity between `get_run()` and `list_runs()` confirmed across all adversarial runs.
+  - Test H: Authoritative run preservation confirmed (`is_diagnostic = False`, `status = VERIFIED`, diagnostic fields `None`).
+  - Test I: Cross-tenant and cross-workspace scope isolation prevents finding leaks.
+  - Test J: Deterministic repeated reads verified with zero database updates or audit additions.
+  - Additional Test: Contradictory `FAILED` and `CONFLICTING` findings properly preserved over stored `CONFIRMED`.
+- **Mission Architecture Regression Suite (`backend/test_v3_mission_architecture.py`):** **74 passed, 0 failed** in 6.51s.
+- **Evidence Explainability Suite (`backend/test_v3_evidence_explainability.py`):** **140 passed, 0 failed** in 6.94s.
+- **Organizational Memory Suite (`backend/test_v3_organizational_memory.py`):** **83 passed, 0 failed** in 10.02s.
+- **Root Cause Analysis Suite (`backend/test_v3_root_cause_analysis.py`):** **30 passed, 0 failed** in 6.45s.
+- **Incident Management Suite (`backend/test_v3_incident_management.py`):** **56 passed, 0 failed** in 11.34s.
+- **Confidence Uncertainty & Authorization Suite (`backend/test_v3_confidence_uncertainty.py`, `backend/test_v3_authorization.py`):** **171 passed, 0 failed** in 7.63s.
+- **Combined Prompt 36H Verification Test Count:** **682 passed, 0 failed, 0 skipped** across all executed suites.
+
+---
+
+## 13. Known Limitations
 
 1. **Synchronous Polling vs. Event-Driven Push**: Evidence evaluation is performed on demand during a verification request. Streaming continuous re-evaluation upon telemetry event emission is architecturally prepared but scheduled for Prompt 37.
 2. **Deterministic Rules Bound**: The current rule registry implements 8 explicit deterministic rule types. Non-deterministic probabilistic models are intentionally not permitted to decide verification outcomes.
@@ -339,9 +372,9 @@ Prompt 36G resolved the unsafe summary fallback in `VerificationRepository.list_
 
 ---
 
-## 13. Explicitly Deferred Capabilities
+## 14. Explicitly Deferred Capabilities
 
-The following capabilities are explicitly deferred from Prompts 36, 36A, 36B, 36C, 36D, 36E, 36F & 36G:
+The following capabilities are explicitly deferred from Prompts 36, 36A, 36B, 36C, 36D, 36E, 36F, 36G & 36H:
 - Autonomous mission execution or dispatch.
 - Direct SCADA / PLC write commands.
 - Operational database updates or deletions.
@@ -351,7 +384,7 @@ The following capabilities are explicitly deferred from Prompts 36, 36A, 36B, 36
 
 ---
 
-## 14. Lineage and Git Lineage
+## 15. Lineage and Git Lineage
 
 - **Prompt 36 Starting Baseline:** `de6dac99df8c1285b33076eeb58d37b0656c1dcc`
 - **Prompt 36A Starting Baseline:** `663f3a491f84a97e580f575fd711d82e87f67f45`
@@ -368,6 +401,9 @@ The following capabilities are explicitly deferred from Prompts 36, 36A, 36B, 36
 - **Prompt 36F Implementation Commit:** `c6fd972317e1ffb7bfe492da96020545f88da3bd`
 - **Prompt 36F Documentation Commit:** `156ee6204bd00e45ae1a61a01d956ca1edc5cbf9`
 - **Prompt 36G Starting Baseline:** `156ee6204bd00e45ae1a61a01d956ca1edc5cbf9`
+- **Prompt 36G Implementation Commit:** `02575d05d004d75c3353cb40408334d9dabf9df6`
+- **Prompt 36H Starting Baseline:** `02575d05d004d75c3353cb40408334d9dabf9df6`
 - **Target Branch:** `main`
 - **Repository:** `joyab786/sage_command_production`
+
 
