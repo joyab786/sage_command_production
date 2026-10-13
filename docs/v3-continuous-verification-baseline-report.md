@@ -214,19 +214,65 @@ Prompt 36D corrected the remaining security defects in Continuous Verification i
 
 ---
 
-## 9. Known Limitations
+---
+
+## 9. Prompt 36E Hardening & Machine-Readable Diagnostic Verification
+
+Prompt 36E corrected the machine-readable verification-status ambiguity identified during independent review of Prompt 36D:
+
+### A. Core Status Contract & Diagnostic-Only Run Status
+1. **Defect Closed:** In `backend/services/verification_service.py`, evaluating a mission under `RuleType.EVIDENCE_EXISTS` previously returned `overall_status = VerificationStatus.VERIFIED` when all findings passed, adding only a human-readable `DIAGNOSTIC ONLY` disclaimer to the summary. Downstream automated systems relying solely on machine-readable status fields could misinterpret this diagnostic pass as authoritative mission verification.
+2. **Deterministic Run-Level Invariant:**
+   - Under `RuleType.EVIDENCE_EXISTS`, `overall_status` evaluates to `VerificationStatus.NOT_VERIFIED` even when 100% of diagnostic checks pass (`verified_count == target_count`).
+   - Diagnostic existence checks **never** yield an overall run status that can be mistaken for authoritative mission completion.
+   - Individual target findings retain their rule-specific diagnostic result (`finding.status = VerificationStatus.VERIFIED`, `finding.rule_id = "RULE_EVIDENCE_EXISTS_V1"`).
+   - Authoritative evaluation paths (`EVIDENCE_VALIDATED`, `EVIDENCE_FRESH`, etc.) continue to yield `overall_status = VerificationStatus.VERIFIED` when evidence satisfies requirements.
+
+### B. Machine-Readable Distinction Contract
+The distinction is deterministically exposed via machine-readable fields across contracts, storage, APIs, and agent tools:
+- `is_diagnostic: bool`: `True` for diagnostic runs (`EVIDENCE_EXISTS`), `False` for authoritative runs.
+- `diagnostic_status: Optional[VerificationStatus]`: Set to `VERIFIED` when all diagnostic records exist and are accessible, `BLOCKED` on cross-boundary access, or `NOT_VERIFIED` when missing.
+- `diagnostic_outcome: Optional[str]`: `"CONFIRMED"` when records exist, `"BLOCKED"`, `"NOT_FOUND"`, or `"INCOMPLETE"`.
+- **Database & Serialization Support:** `verification_runs` SQLite table was augmented with `is_diagnostic`, `diagnostic_status`, and `diagnostic_outcome` columns with non-destructive migrations. Persisted records and API serialization preserve the fields identically across retrieval and idempotent replay.
+- **Agent Tool Output:** Structured output prints `Diagnostic Check: True (Outcome: CONFIRMED — non-authoritative existence check)` while reporting `Overall Status: NOT_VERIFIED`.
+
+### C. Downstream Consumer Audit
+- Searched all occurrences of `VerificationRun.status`, `VerificationFinding.status`, `run.summary`, `finding.rule_id`, and `request.rule_type`.
+- Verified that no agent tools, background tasks, or API endpoints auto-transition missions based on `EVIDENCE_EXISTS`.
+- Confirmed that missions remain in their immutable `ACCEPTED` lifecycle state throughout verification.
+- Documented that downstream consumers seeking diagnostic existence checks must inspect `run.is_diagnostic` and `run.diagnostic_status == VerificationStatus.VERIFIED` rather than relying on `run.status`.
+
+### D. Verified Test Metrics (Prompt 36E)
+- **Continuous Verification Suite (`backend/test_v3_continuous_verification.py`):** **99 passed, 0 failed** in 8.87s.
+  - Test A (Diagnostic-Only Result): Proved `EVIDENCE_EXISTS` produces `status = NOT_VERIFIED`, `is_diagnostic = True`, `diagnostic_status = VERIFIED`, `diagnostic_outcome = "CONFIRMED"`, and preserves mission state.
+  - Test B (Stronger Authoritative Requirements): Proved diagnostic existence check cannot satisfy or certify stronger requirements.
+  - Test C (Authoritative Validation Path): Proved authoritative rules (`EVIDENCE_FRESH`, `EVIDENCE_VALIDATED`) produce `status = VERIFIED` with `is_diagnostic = False` on valid evidence, and reject invalid/stale/blocked evidence.
+  - Test D (Serialization & Persistence): Proved diagnostic fields survive JSON serialization, database round-trips, and idempotent replays.
+  - Test E (Regression & Security): Proved universal scope enforcement, non-disclosure, and rule parameter defenses remain fully intact.
+- **Mission Architecture Regression Suite (`backend/test_v3_mission_architecture.py`):** **74 passed, 0 failed** in 6.45s.
+- **Evidence Explainability Suite (`backend/test_v3_evidence_explainability.py`):** **140 passed, 0 failed** in 6.72s.
+- **Organizational Memory Suite (`backend/test_v3_organizational_memory.py`):** **83 passed, 0 failed** in 8.68s.
+- **Root Cause Analysis Suite (`backend/test_v3_root_cause_analysis.py`):** **30 passed, 0 failed** in 6.38s.
+- **Incident Management Suite (`backend/test_v3_incident_management.py`):** **56 passed, 0 failed** in 10.93s.
+- **Confidence Uncertainty & Authorization Suite (`backend/test_v3_confidence_uncertainty.py`, `backend/test_v3_authorization.py`):** **171 passed, 0 failed** in 7.61s.
+- **Combined Prompt 36E Verification Test Count:** **653 passed, 0 failed, 0 skipped** across all executed suites.
+
+---
+
+## 10. Known Limitations
 
 1. **Synchronous Polling vs. Event-Driven Push**: Evidence evaluation is performed on demand during a verification request. Streaming continuous re-evaluation upon telemetry event emission is architecturally prepared but scheduled for Prompt 37.
 2. **Deterministic Rules Bound**: The current rule registry implements 8 explicit deterministic rule types. Non-deterministic probabilistic models are intentionally not permitted to decide verification outcomes.
 3. **Cross-Subsystem Adapters**: Evidence resolution queries existing SQLite stores (`ActionStore`, `DecisionEngineRepository`, `IncidentRepository`, `EvidenceExplainabilityRepository`, `RcaRepository`, `OrganizationalMemoryRepository`). Distributed federated databases beyond local SQLite stores rely on the existing `DatabaseConnectionGateway`.
 4. **Agent Tools Registration**: Verification tools are deliberately not registered in the default `copilot_tools` agent registry pending Prompt 37 closed-loop copilot integration.
 5. **Optional Evidence Support**: Optional evidence is currently unsupported because no server-authoritative contract exists in mission schemas. All mission evidence references are treated as strictly required.
+6. **Third-Party Diagnostic Consumer Integration**: External clients that previously asserted `run.status == VERIFIED` for diagnostic runs must migrate to inspect `run.is_diagnostic` and `run.diagnostic_status`.
 
 ---
 
-## 10. Explicitly Deferred Capabilities
+## 11. Explicitly Deferred Capabilities
 
-The following capabilities are explicitly deferred from Prompts 36, 36A, 36B, 36C & 36D:
+The following capabilities are explicitly deferred from Prompts 36, 36A, 36B, 36C, 36D & 36E:
 - Autonomous mission execution or dispatch.
 - Direct SCADA / PLC write commands.
 - Operational database updates or deletions.
@@ -236,7 +282,7 @@ The following capabilities are explicitly deferred from Prompts 36, 36A, 36B, 36
 
 ---
 
-## 11. Lineage and Git Lineage
+## 12. Lineage and Git Lineage
 
 - **Prompt 36 Starting Baseline:** `de6dac99df8c1285b33076eeb58d37b0656c1dcc`
 - **Prompt 36A Starting Baseline:** `663f3a491f84a97e580f575fd711d82e87f67f45`
@@ -246,5 +292,8 @@ The following capabilities are explicitly deferred from Prompts 36, 36A, 36B, 36
 - **Prompt 36C Starting Baseline:** `6dc2de3bc96c6f12a57cf539d173c1973d3463e4`
 - **Prompt 36C Implementation Commit:** `c9fc5eec253bcad43fdddbb71d9a263ba8903c73`
 - **Prompt 36D Starting Baseline:** `7bb9ff70de4d1c948319f8250216818c63b9e97e`
+- **Prompt 36D Implementation Commit:** `e3b672cd7a3d6041595d610a9f01b07fa6ed944e`
+- **Prompt 36E Starting Baseline:** `e3b672cd7a3d6041595d610a9f01b07fa6ed944e`
 - **Target Branch:** `main`
 - **Repository:** `joyab786/sage_command_production`
+

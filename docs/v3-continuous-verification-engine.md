@@ -405,9 +405,48 @@ Prompt 36D corrected the remaining Continuous Verification security defects acro
 
 ---
 
-## 18. Status Summary
+---
 
-- **Continuous Verification Engine**: `IMPLEMENTED` & `HARDENED (Prompt 36, 36A, 36B, 36C & 36D)`
+## 18. Machine-Readable Diagnostic Verification Semantics (Prompt 36E)
+
+Prompt 36E resolved the machine-readable verification-status ambiguity identified during independent review of Prompt 36D:
+
+### A. Diagnostic vs. Authoritative Result Semantics
+- **Diagnostic Semantics (`EVIDENCE_EXISTS`):**
+  - Assesses solely whether evidence records physically exist and are accessible within authorized storage boundaries.
+  - Does NOT assess whether the operational mission's actual evidence requirements (integrity, freshness, validity, or cross-source consistency) have been satisfied.
+  - Under no circumstances does diagnostic verification certify mission completion or authorize mission state transitions.
+- **Authoritative Semantics (`EVIDENCE_VALIDATED`, `EVIDENCE_FRESH`, etc.):**
+  - Authoritatively assesses evidence validity, integrity, freshness, and satisfaction of mission success criteria.
+  - When valid, authorized evidence satisfies all criteria, produces `VerificationStatus.VERIFIED` at the run level.
+
+### B. Conservative Run-Level Status Invariant
+- **Rule:** `EVIDENCE_EXISTS` alone must **never** yield an overall run status that downstream consumers or automation can interpret as authoritative mission verification.
+- **Implementation:** Even when 100% of diagnostic findings pass (`verified_count == target_count`), `run.status` evaluates conservatively to `VerificationStatus.NOT_VERIFIED`.
+- **Finding Preservation:** Individual target findings retain their rule-specific diagnostic result (`finding.status = VerificationStatus.VERIFIED` with `finding.rule_id = "RULE_EVIDENCE_EXISTS_V1"`), preserving compatibility for target-level existence analysis.
+
+### C. Machine-Readable Contract Extension
+The distinction is deterministically exposed via machine-readable contract fields across `VerificationRun`, `VerificationRunSummary`, and `VerificationFindingsResponse`:
+- `is_diagnostic: bool`: `True` when evaluated under a diagnostic rule (`EVIDENCE_EXISTS`); `False` for authoritative rules.
+- `diagnostic_status: Optional[VerificationStatus]`: Reports the diagnostic existence outcome (`VERIFIED` when records exist and are accessible, `BLOCKED` when cross-boundary scope prevents access, `NOT_VERIFIED` when missing, or `INDETERMINATE`).
+- `diagnostic_outcome: Optional[str]`: Machine-readable summary token (`"CONFIRMED"` when records exist, `"BLOCKED"`, `"NOT_FOUND"`, `"INCOMPLETE"`).
+- **Persistence & API Serialization:** Survives SQLite WAL persistence and retrieval across `verification_runs` table columns, API schemas, and idempotency replays.
+- **Agent Tool Output:** `request_mission_verification_tool` and `get_mission_verification_findings_tool` explicitly surface `Diagnostic Check: True (Outcome: CONFIRMED — non-authoritative existence check)` while preserving `Overall Status: NOT_VERIFIED`.
+
+### D. Downstream Consumer Requirements & Audit
+- **Downstream Consumers:** All automated mission gates, copilot decision engines, and lifecycle consumers must inspect `run.status == VerificationStatus.VERIFIED` *and* `not run.is_diagnostic` before treating a verification run as authoritative evidence of mission completion.
+- **Diagnostic Consumers:** API clients and monitoring dashboards inspecting database health or evidence availability must inspect `run.is_diagnostic` and `run.diagnostic_status == VerificationStatus.VERIFIED` (or `run.diagnostic_outcome == "CONFIRMED"`), rather than relying on run-level status.
+- **Mission Lifecycle Integrity:** Missions remain strictly in their original lifecycle state (`ACCEPTED`), preventing diagnostic existence checks from triggering execution, dispatch, or completion.
+
+### E. Residual Integration Risks
+- **Third-Party Client Compatibility:** External clients that previously asserted `run.status == VERIFIED` for diagnostic-only runs will now observe `run.status == NOT_VERIFIED`. They must be updated to inspect the machine-readable `is_diagnostic` and `diagnostic_status` attributes.
+
+---
+
+## 19. Status Summary
+
+- **Continuous Verification Engine**: `IMPLEMENTED` & `HARDENED (Prompt 36, 36A, 36B, 36C, 36D & 36E)`
+- **Machine-Readable Diagnostic Status**: `IMPLEMENTED & ENFORCED` (`run.status = NOT_VERIFIED`, `is_diagnostic = True`, `diagnostic_status = VERIFIED`)
 - **Universal Scope Enforcement**: `IMPLEMENTED & ENFORCED` across all 8 registered rules
 - **Universal Evidence Non-Disclosure**: `IMPLEMENTED & VERIFIED` across all return paths, findings, provenance, and storage
 - **Rule Parameter Boundary**: `ENFORCED` (Prohibited parameters rejected, server parameters authoritative)
@@ -422,3 +461,4 @@ Prompt 36D corrected the remaining Continuous Verification security defects acro
 - **FastAPI Endpoints**: `IMPLEMENTED`
 - **Real-Time Polling/Continuous Loop**: `DEFERRED` (Prompt 37)
 - **Closed-Loop Learning**: `DEFERRED` (Prompt 37)
+
