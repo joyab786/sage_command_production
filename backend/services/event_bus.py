@@ -99,7 +99,7 @@ class EventBus:
             try:
                 await asyncio.sleep(SAGE_EVENT_BUS_SWEEPER_INTERVAL_SECONDS)
                 if self._running:
-                    await self.recover_pending_deliveries()
+                    await self.recover_pending_deliveries(respect_backoff=True)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -118,6 +118,18 @@ class EventBus:
         self._subscriptions_cache[saved_sub.tenant_id] = tenant_cache
         
         return saved_sub
+
+    def register_callback(self, subscription_id: str, callback: SubscriberCallback):
+        """Binds or updates an in-memory subscriber callback for an existing subscription."""
+        self._callbacks[subscription_id] = callback
+
+    def unregister_callback(self, subscription_id: str):
+        """Removes an in-memory subscriber callback (simulating subscriber going offline)."""
+        self._callbacks.pop(subscription_id, None)
+
+    def redrive_dead_letter(self, dead_letter_id: str, tenant_id: str) -> Optional[EventDelivery]:
+        """Administratively re-arms a dead letter for delivery recovery within tenant boundary."""
+        return self.repository.redrive_dead_letter(dead_letter_id, tenant_id)
 
     def _match_subscriptions(self, event: CanonicalEvent) -> List[Subscription]:
         """Finds deterministic subscription matches for an event within the SAME TENANT ONLY."""
@@ -157,8 +169,10 @@ class EventBus:
     def has_unfulfilled_deliveries(self, event: CanonicalEvent) -> bool:
         """
         Determines if an event has unfulfilled subscriptions requiring publication/retry.
-        Returns True if there are matching subscriptions that have not yet succeeded.
-        Returns False if there are no matching subscriptions or all matched deliveries succeeded.
+        Returns True if there are matching subscriptions that have not yet succeeded and
+        have not been terminally exhausted.
+        Returns False if there are no matching subscriptions, all matched deliveries succeeded,
+        or all unfulfilled deliveries have terminally exhausted retries.
         """
         subs = self._match_subscriptions(event)
         if not subs:
@@ -167,7 +181,15 @@ class EventBus:
         for sub in subs:
             delivery_id = compute_delivery_id(event.event_fingerprint, sub.subscription_id)
             existing_delivery = self.repository.get_delivery(delivery_id, event.tenant_id)
-            if not existing_delivery or existing_delivery.status != DeliveryStatus.SUCCESS:
+            if not existing_delivery:
+                return True
+            if existing_delivery.status == DeliveryStatus.SUCCESS:
+                continue
+            if self.repository.get_dead_letter_by_delivery_id(delivery_id, event.tenant_id):
+                continue
+            if existing_delivery.status == DeliveryStatus.PENDING:
+                return True
+            if existing_delivery.status == DeliveryStatus.FAILED and existing_delivery.attempts < existing_delivery.max_attempts:
                 return True
         return False
 
@@ -189,6 +211,10 @@ class EventBus:
             if existing_delivery and existing_delivery.status == DeliveryStatus.SUCCESS:
                 continue # Already successfully delivered
                 
+            # If terminally exhausted (dead-lettered), do not retry indefinitely
+            if existing_delivery and self.repository.get_dead_letter_by_delivery_id(delivery_id, event.tenant_id):
+                continue
+
             delivery = existing_delivery or EventDelivery(
                 delivery_id=delivery_id,
                 event_id=event.event_id,
@@ -232,29 +258,43 @@ class EventBus:
                 
     async def _process_delivery(self, delivery: EventDelivery, event: CanonicalEvent):
         """Attempts to invoke the subscriber callback and records results."""
-        callback = self._callbacks.get(delivery.subscription_id)
-        if not callback:
-            # Subscriber offline or unregistered
-            delivery.last_error = "Subscriber callback not found in memory"
-            delivery.status = DeliveryStatus.FAILED
-            self.repository.record_delivery_attempt(delivery)
+        # Tenant boundary check
+        if delivery.tenant_id != event.tenant_id:
+            logger.error(f"Tenant boundary violation in _process_delivery: delivery tenant {delivery.tenant_id} != event tenant {event.tenant_id}")
             return
 
+        if delivery.status == DeliveryStatus.SUCCESS:
+            return
+
+        # Double check database state to avoid duplicate delivery or overwriting success
+        current = self.repository.get_delivery(delivery.delivery_id, delivery.tenant_id)
+        if current:
+            if current.status == DeliveryStatus.SUCCESS:
+                return
+            if self.repository.get_dead_letter_by_delivery_id(delivery.delivery_id, delivery.tenant_id):
+                return
+
         delivery.attempts += 1
-        
-        try:
-            # Invoke isolated subscriber
-            success = await callback(delivery, event)
-            if success:
-                delivery.status = DeliveryStatus.SUCCESS
-                delivery.last_error = None
-            else:
-                delivery.status = DeliveryStatus.FAILED
-                delivery.last_error = "Subscriber returned failure"
-                
-        except Exception as e:
+
+        callback = self._callbacks.get(delivery.subscription_id)
+        if not callback:
+            # Subscriber offline or unregistered - transient failure eligible for bounded retry
             delivery.status = DeliveryStatus.FAILED
-            delivery.last_error = f"Subscriber raised exception: {str(e)}"
+            delivery.last_error = "Subscriber callback not found in memory"
+        else:
+            try:
+                # Invoke isolated subscriber
+                success = await callback(delivery, event)
+                if success:
+                    delivery.status = DeliveryStatus.SUCCESS
+                    delivery.last_error = None
+                    delivery.next_retry_at = None
+                else:
+                    delivery.status = DeliveryStatus.FAILED
+                    delivery.last_error = "Subscriber returned failure"
+            except Exception as e:
+                delivery.status = DeliveryStatus.FAILED
+                delivery.last_error = f"Subscriber raised exception: {str(e)}"
             
         # Handle Retry / DeadLetter
         if delivery.status == DeliveryStatus.FAILED:
@@ -265,6 +305,7 @@ class EventBus:
                 delivery.status = DeliveryStatus.PENDING # Ready to be swept/retried
             else:
                 # Exhausted retries -> Dead Letter
+                delivery.next_retry_at = None
                 dl = DeadLetter(
                     dead_letter_id=f"dl_{uuid.uuid4().hex}",
                     delivery_id=delivery.delivery_id,
@@ -309,9 +350,17 @@ class EventBus:
         processed_count = 0
         
         for delivery in pending_deliveries:
+            if tenant_id and delivery.tenant_id != tenant_id:
+                logger.error(f"Tenant boundary violation during recovery: delivery {delivery.delivery_id} tenant {delivery.tenant_id} != target {tenant_id}")
+                continue
+
             event = repo.get_event(delivery.tenant_id, delivery.event_id)
             if not event:
                 logger.warning(f"Pending delivery {delivery.delivery_id} references missing event {delivery.event_id}.")
+                continue
+
+            if event.tenant_id != delivery.tenant_id:
+                logger.error(f"Cross-tenant event resolution blocked during recovery: delivery tenant {delivery.tenant_id} != event tenant {event.tenant_id}")
                 continue
                 
             # Process delivery either via running workers queue or direct invocation

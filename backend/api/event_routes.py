@@ -1,6 +1,6 @@
 # backend/api/event_routes.py
 from typing import List
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Request
 import sqlite3
 import logging
 
@@ -16,6 +16,7 @@ try:
     )
     from services.event_bus import get_event_bus, EventBus
     from core.auth import Identity, require_permission
+    from governance.redaction import sanitize_log_message
 except (ImportError, ModuleNotFoundError):
     from backend.data.schemas.event_contract import CanonicalEvent
     from backend.services.event_repository import (
@@ -26,6 +27,7 @@ except (ImportError, ModuleNotFoundError):
     )
     from backend.services.event_bus import get_event_bus, EventBus
     from backend.core.auth import Identity, require_permission
+    from backend.governance.redaction import sanitize_log_message
 
 router = APIRouter(prefix="/api/v3/events", tags=["events"])
 
@@ -46,6 +48,7 @@ def _get_authorized_plants(identity: Identity) -> set:
 @router.post("", response_model=CanonicalEvent, status_code=status.HTTP_201_CREATED)
 async def record_event(
     event: CanonicalEvent,
+    request: Request = None,
     identity: Identity = Depends(require_permission("events.record")),
     repo: EventRepository = Depends(get_event_repo),
     bus: EventBus = Depends(get_event_bus)
@@ -199,14 +202,28 @@ async def record_event(
     # - If exact replay (is_replay): check if unfulfilled deliveries exist (due to prior transient failure).
     #   If unfulfilled deliveries exist, retry publication idempotently (only delivering to unfulfilled subscriptions).
     #   If all deliveries previously succeeded, return saved_event immediately without republishing.
+    correlation_id = (
+        (request.headers.get("x-correlation-id") or request.headers.get("x-request-id"))
+        if request and hasattr(request, "headers")
+        else None
+    ) or getattr(saved_event, "correlation_id", None) or saved_event.event_id
+
+    error_headers = {"X-Correlation-ID": correlation_id} if correlation_id else None
+
     if not is_replay:
         try:
             await bus.publish(saved_event)
         except Exception as pub_err:
-            logger.error(f"Transient publication error for event {saved_event.event_id}: {pub_err}")
+            sanitized_err = sanitize_log_message(str(pub_err))
+            logger.error(
+                f"[EventRoutes] Transient publication error for event {saved_event.event_id} "
+                f"[correlation_id={correlation_id}, tenant={saved_event.tenant_id}]: {sanitized_err}",
+                exc_info=False
+            )
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Event persisted but publication encountered transient error: {str(pub_err)}"
+                detail="Event persisted but publication encountered transient error.",
+                headers=error_headers
             )
     else:
         # Exact replay: check if recovery/retry is needed for unfulfilled deliveries
@@ -214,10 +231,16 @@ async def record_event(
             try:
                 await bus.publish(saved_event)
             except Exception as pub_err:
-                logger.error(f"Transient publication retry error for replayed event {saved_event.event_id}: {pub_err}")
+                sanitized_err = sanitize_log_message(str(pub_err))
+                logger.error(
+                    f"[EventRoutes] Transient publication retry error for replayed event {saved_event.event_id} "
+                    f"[correlation_id={correlation_id}, tenant={saved_event.tenant_id}]: {sanitized_err}",
+                    exc_info=False
+                )
                 raise HTTPException(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail=f"Event persisted but publication retry encountered transient error: {str(pub_err)}"
+                    detail="Event persisted but publication retry encountered transient error.",
+                    headers=error_headers
                 )
 
     return saved_event

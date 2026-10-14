@@ -2237,3 +2237,617 @@ class TestEventReturnIntegrityAndPublicationRecovery:
         assert updated.status == DeliveryStatus.SUCCESS
         assert len(del_repo.get_pending_deliveries("tenant_alpha")) == 0
 
+
+# =============================================================================
+# 9. PROMPT 37D: RECOVERY STATE & SAFE PUBLICATION ERROR TESTS
+# =============================================================================
+
+class TestPrompt37DRecoveryStateAndSafePublicationErrors:
+    """Prompt 37D: Missing-Subscriber Recovery State, Bounded Retries, and Safe Publication Errors."""
+
+    @pytest.fixture
+    def test_setup(self, tmp_path):
+        import uuid
+        from fastapi.testclient import TestClient
+        from server import app
+        from services.event_repository import EventRepository
+        from services.event_delivery_repository import EventDeliveryRepository
+        from services.event_bus import EventBus
+        try:
+            import api.event_routes as er
+        except (ImportError, ModuleNotFoundError):
+            import backend.api.event_routes as er
+
+        db_path = str(tmp_path / f"ev_{uuid.uuid4().hex[:8]}.sqlite")
+        del_db_path = str(tmp_path / f"del_{uuid.uuid4().hex[:8]}.sqlite")
+        
+        ev_repo = EventRepository(db_path=db_path)
+        del_repo = EventDeliveryRepository(db_path=del_db_path)
+        ebus = EventBus(repository=del_repo, event_repository=ev_repo)
+        ebus.enabled = True
+        
+        client = TestClient(app)
+        app.dependency_overrides[er.get_event_repo] = lambda: ev_repo
+        app.dependency_overrides[er.get_event_bus] = lambda: ebus
+        
+        yield client, ev_repo, del_repo, ebus, er
+        app.dependency_overrides.clear()
+
+    def test_69_delivery_becomes_pending_after_transient_subscriber_failure(self, test_setup):
+        """1. A delivery becomes pending with backoff after a transient subscriber callback failure."""
+        client, ev_repo, del_repo, ebus, er = test_setup
+        import asyncio
+        import uuid
+        from data.schemas.event_contract import EventCategory
+        from data.schemas.event_delivery_contract import Subscription, EventDelivery, DeliveryStatus
+
+        evt = make_operational_event(tenant_id="tenant_alpha", workspace_id="workspace_prod", plant_id="plant_01")
+        ev_repo.record_event(evt)
+
+        sub = Subscription(
+            subscription_id=f"sub_trans_{uuid.uuid4().hex[:8]}",
+            subscriber_id="transient_sub",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            plant_id="plant_01",
+            category=EventCategory.TELEMETRY.value
+        )
+
+        async def failing_callback(delivery, event):
+            raise RuntimeError("Transient downstream service failure")
+
+        ebus.subscribe(sub, failing_callback)
+
+        deliv = EventDelivery(
+            delivery_id=f"deliv_t1_{uuid.uuid4().hex[:8]}",
+            event_id=evt.event_id,
+            event_fingerprint=evt.event_fingerprint,
+            subscription_id=sub.subscription_id,
+            tenant_id="tenant_alpha",
+            status=DeliveryStatus.PENDING,
+            attempts=0,
+            max_attempts=3
+        )
+        del_repo.record_delivery_attempt(deliv)
+
+        async def run():
+            await ebus._process_delivery(deliv, evt)
+
+        asyncio.run(run())
+
+        saved = del_repo.get_delivery(deliv.delivery_id, "tenant_alpha")
+        assert saved is not None
+        assert saved.status == DeliveryStatus.PENDING
+        assert saved.attempts == 1
+        assert saved.next_retry_at is not None
+        assert "Transient downstream service failure" in saved.last_error
+
+    def test_70_missing_callback_transitions_delivery_to_pending_without_stranding(self, test_setup):
+        """2. A callback is temporarily missing; delivery is NOT stranded in FAILED and transitions to PENDING."""
+        client, ev_repo, del_repo, ebus, er = test_setup
+        import asyncio
+        import uuid
+        from data.schemas.event_contract import EventCategory
+        from data.schemas.event_delivery_contract import Subscription, EventDelivery, DeliveryStatus
+
+        evt = make_operational_event(tenant_id="tenant_alpha", workspace_id="workspace_prod", plant_id="plant_01")
+        ev_repo.record_event(evt)
+
+        sub = Subscription(
+            subscription_id=f"sub_miss_{uuid.uuid4().hex[:8]}",
+            subscriber_id="missing_callback_sub",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            plant_id="plant_01",
+            category=EventCategory.TELEMETRY.value
+        )
+        # Register subscription in repo and cache, but do NOT register a callback in ebus._callbacks
+        del_repo.register_subscription(sub)
+        ebus._subscriptions_cache.setdefault("tenant_alpha", []).append(sub)
+        assert sub.subscription_id not in ebus._callbacks
+
+        deliv = EventDelivery(
+            delivery_id=f"deliv_t2_{uuid.uuid4().hex[:8]}",
+            event_id=evt.event_id,
+            event_fingerprint=evt.event_fingerprint,
+            subscription_id=sub.subscription_id,
+            tenant_id="tenant_alpha",
+            status=DeliveryStatus.PENDING,
+            attempts=0,
+            max_attempts=3
+        )
+        del_repo.record_delivery_attempt(deliv)
+
+        async def run():
+            await ebus._process_delivery(deliv, evt)
+
+        asyncio.run(run())
+
+        saved = del_repo.get_delivery(deliv.delivery_id, "tenant_alpha")
+        assert saved is not None
+        # Delivery must NOT be permanently stranded in FAILED!
+        assert saved.status == DeliveryStatus.PENDING
+        assert saved.attempts == 1
+        assert saved.next_retry_at is not None
+        assert "not found in memory" in saved.last_error
+
+    def test_71_callback_becomes_available_before_retry_exhaustion(self, test_setup):
+        """3. The callback becomes available before retry exhaustion; delivery succeeds on retry."""
+        client, ev_repo, del_repo, ebus, er = test_setup
+        import asyncio
+        import uuid
+        from data.schemas.event_contract import EventCategory
+        from data.schemas.event_delivery_contract import Subscription, EventDelivery, DeliveryStatus
+
+        evt = make_operational_event(tenant_id="tenant_alpha", workspace_id="workspace_prod", plant_id="plant_01")
+        ev_repo.record_event(evt)
+
+        sub = Subscription(
+            subscription_id=f"sub_avail_{uuid.uuid4().hex[:8]}",
+            subscriber_id="eventual_sub",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            plant_id="plant_01",
+            category=EventCategory.TELEMETRY.value
+        )
+        del_repo.register_subscription(sub)
+
+        # First attempt: callback is missing
+        deliv = EventDelivery(
+            delivery_id=f"deliv_t3_{uuid.uuid4().hex[:8]}",
+            event_id=evt.event_id,
+            event_fingerprint=evt.event_fingerprint,
+            subscription_id=sub.subscription_id,
+            tenant_id="tenant_alpha",
+            status=DeliveryStatus.PENDING,
+            attempts=0,
+            max_attempts=3
+        )
+        del_repo.record_delivery_attempt(deliv)
+
+        async def attempt_1():
+            await ebus._process_delivery(deliv, evt)
+
+        asyncio.run(attempt_1())
+        saved_1 = del_repo.get_delivery(deliv.delivery_id, "tenant_alpha")
+        assert saved_1.status == DeliveryStatus.PENDING
+        assert saved_1.attempts == 1
+
+        # Now the callback becomes available before retry exhaustion!
+        called = []
+        async def registered_callback(delivery, event):
+            called.append(delivery.delivery_id)
+            return True
+
+        ebus.register_callback(sub.subscription_id, registered_callback)
+
+        async def attempt_2():
+            # Process the pending delivery again
+            await ebus._process_delivery(saved_1, evt)
+
+        asyncio.run(attempt_2())
+        saved_2 = del_repo.get_delivery(deliv.delivery_id, "tenant_alpha")
+        assert saved_2.status == DeliveryStatus.SUCCESS
+        assert saved_2.attempts == 2
+        assert saved_2.next_retry_at is None
+        assert saved_2.last_error is None
+        assert len(called) == 1
+
+    def test_72_background_recovery_processes_pending_delivery(self, test_setup):
+        """4. Background recovery eventually processes the delivery from repo."""
+        client, ev_repo, del_repo, ebus, er = test_setup
+        import asyncio
+        import uuid
+        from data.schemas.event_contract import EventCategory
+        from data.schemas.event_delivery_contract import Subscription, EventDelivery, DeliveryStatus
+
+        evt = make_operational_event(tenant_id="tenant_alpha", workspace_id="workspace_prod", plant_id="plant_01")
+        ev_repo.record_event(evt)
+
+        sub = Subscription(
+            subscription_id=f"sub_bg_{uuid.uuid4().hex[:8]}",
+            subscriber_id="bg_recovery_sub",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            plant_id="plant_01",
+            category=EventCategory.TELEMETRY.value
+        )
+        delivered = []
+        async def sub_cb(delivery, event):
+            delivered.append((delivery, event))
+            return True
+
+        ebus.subscribe(sub, sub_cb)
+
+        deliv = EventDelivery(
+            delivery_id=f"deliv_t4_{uuid.uuid4().hex[:8]}",
+            event_id=evt.event_id,
+            event_fingerprint=evt.event_fingerprint,
+            subscription_id=sub.subscription_id,
+            tenant_id="tenant_alpha",
+            status=DeliveryStatus.PENDING,
+            attempts=1,
+            max_attempts=3
+        )
+        del_repo.record_delivery_attempt(deliv)
+
+        async def run_recovery():
+            count = await ebus.recover_pending_deliveries(tenant_id="tenant_alpha", event_repo=ev_repo)
+            return count
+
+        recovered = asyncio.run(run_recovery())
+        assert recovered == 1
+        assert len(delivered) == 1
+        assert delivered[0][1].event_id == evt.event_id
+        saved = del_repo.get_delivery(deliv.delivery_id, "tenant_alpha")
+        assert saved.status == DeliveryStatus.SUCCESS
+
+    def test_73_successful_delivery_not_delivered_again_by_subsequent_sweeps(self, test_setup):
+        """5. A successful delivery is not delivered again by subsequent sweeps."""
+        client, ev_repo, del_repo, ebus, er = test_setup
+        import asyncio
+        import uuid
+        from data.schemas.event_contract import EventCategory
+        from data.schemas.event_delivery_contract import Subscription, EventDelivery, DeliveryStatus
+
+        evt = make_operational_event(tenant_id="tenant_alpha", workspace_id="workspace_prod", plant_id="plant_01")
+        ev_repo.record_event(evt)
+
+        sub = Subscription(
+            subscription_id=f"sub_idemp_{uuid.uuid4().hex[:8]}",
+            subscriber_id="idemp_sub",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            plant_id="plant_01",
+            category=EventCategory.TELEMETRY.value
+        )
+        deliveries_count = 0
+        async def sub_cb(delivery, event):
+            nonlocal deliveries_count
+            deliveries_count += 1
+            return True
+
+        ebus.subscribe(sub, sub_cb)
+
+        # Mark delivery SUCCESS in repository
+        deliv = EventDelivery(
+            delivery_id=f"deliv_t5_{uuid.uuid4().hex[:8]}",
+            event_id=evt.event_id,
+            event_fingerprint=evt.event_fingerprint,
+            subscription_id=sub.subscription_id,
+            tenant_id="tenant_alpha",
+            status=DeliveryStatus.SUCCESS,
+            attempts=1,
+            max_attempts=3
+        )
+        del_repo.record_delivery_attempt(deliv)
+
+        async def sweep_and_publish():
+            # Sweeper should find 0 pending deliveries
+            recovered = await ebus.recover_pending_deliveries(tenant_id="tenant_alpha", event_repo=ev_repo)
+            # Re-publish should not deliver to already SUCCESS delivery
+            ebus.start()
+            try:
+                await ebus.publish(evt)
+                await asyncio.sleep(0.05)
+            finally:
+                await ebus.stop()
+            return recovered
+
+        recovered = asyncio.run(sweep_and_publish())
+        assert recovered == 0
+        assert deliveries_count == 0
+        all_delivs = del_repo.get_deliveries_for_event(evt.event_fingerprint, "tenant_alpha")
+        assert len(all_delivs) == 1
+        assert all_delivs[0].status == DeliveryStatus.SUCCESS
+
+    def test_74_retry_exhaustion_follows_max_attempts_and_dead_letter_policy(self, test_setup):
+        """6. Retry exhaustion follows the existing maximum-attempt and dead-letter policy."""
+        client, ev_repo, del_repo, ebus, er = test_setup
+        import asyncio
+        import uuid
+        from data.schemas.event_contract import EventCategory
+        from data.schemas.event_delivery_contract import Subscription, EventDelivery, DeliveryStatus, compute_delivery_id
+
+        evt = make_operational_event(tenant_id="tenant_alpha", workspace_id="workspace_prod", plant_id="plant_01")
+        ev_repo.record_event(evt)
+
+        sub = Subscription(
+            subscription_id=f"sub_exhaust_{uuid.uuid4().hex[:8]}",
+            subscriber_id="exhaustion_sub",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            plant_id="plant_01",
+            category=EventCategory.TELEMETRY.value
+        )
+        del_repo.register_subscription(sub)
+        ebus._subscriptions_cache.setdefault("tenant_alpha", []).append(sub)
+
+        # Delivery with max_attempts = 3 using deterministic compute_delivery_id
+        delivery_id = compute_delivery_id(evt.event_fingerprint, sub.subscription_id)
+        deliv = EventDelivery(
+            delivery_id=delivery_id,
+            event_id=evt.event_id,
+            event_fingerprint=evt.event_fingerprint,
+            subscription_id=sub.subscription_id,
+            tenant_id="tenant_alpha",
+            status=DeliveryStatus.PENDING,
+            attempts=0,
+            max_attempts=3
+        )
+        del_repo.record_delivery_attempt(deliv)
+
+        async def run_attempts():
+            # Attempt 1
+            await ebus._process_delivery(deliv, evt)
+            s1 = del_repo.get_delivery(deliv.delivery_id, "tenant_alpha")
+            assert s1.status == DeliveryStatus.PENDING
+            assert s1.attempts == 1
+            assert len(del_repo.list_dead_letters("tenant_alpha")) == 0
+
+            # Attempt 2
+            await ebus._process_delivery(s1, evt)
+            s2 = del_repo.get_delivery(deliv.delivery_id, "tenant_alpha")
+            assert s2.status == DeliveryStatus.PENDING
+            assert s2.attempts == 2
+            assert len(del_repo.list_dead_letters("tenant_alpha")) == 0
+
+            # Attempt 3 (final attempt, exhausts retries)
+            await ebus._process_delivery(s2, evt)
+            s3 = del_repo.get_delivery(deliv.delivery_id, "tenant_alpha")
+            assert s3.status == DeliveryStatus.FAILED
+            assert s3.attempts == 3
+            assert s3.next_retry_at is None
+
+            # Dead letter recorded
+            dls = del_repo.list_dead_letters("tenant_alpha")
+            assert len(dls) == 1
+            assert dls[0].delivery_id == deliv.delivery_id
+            assert dls[0].attempt_count == 3
+            assert "not found in memory" in dls[0].failure_reason
+
+            # Verify no longer pending
+            assert len(del_repo.get_pending_deliveries("tenant_alpha")) == 0
+            assert ebus.has_unfulfilled_deliveries(evt) is False
+
+            # Verify administrative redrive re-arms to PENDING
+            redriven = ebus.redrive_dead_letter(dls[0].dead_letter_id, "tenant_alpha")
+            assert redriven is not None
+            assert redriven.status == DeliveryStatus.PENDING
+            assert redriven.attempts == 0
+            assert len(del_repo.list_dead_letters("tenant_alpha")) == 0
+            assert len(del_repo.get_pending_deliveries("tenant_alpha")) == 1
+
+        asyncio.run(run_attempts())
+
+    def test_75_raw_internal_exception_absent_from_api_responses(self, test_setup):
+        """7. Raw internal exception message is absent from initial-publication and replay-retry HTTP responses."""
+        client, ev_repo, del_repo, ebus, er = test_setup
+        import uuid
+        import asyncio
+        import httpx
+        from server import app
+        from data.schemas.event_contract import EventCategory
+        from data.schemas.event_delivery_contract import Subscription
+
+        producer = Identity(
+            user_id="op_sanitization_check",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            assigned_plants=["plant_01"],
+            roles=["OPERATOR"],
+            permissions=["events.record"],
+        )
+        app.dependency_overrides[get_current_identity] = lambda: producer
+
+        sub = Subscription(
+            subscription_id=f"sub_sec_{uuid.uuid4().hex[:8]}",
+            subscriber_id="sec_sub",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            plant_id="plant_01",
+            category=EventCategory.TELEMETRY.value
+        )
+        ebus.subscribe(sub, lambda d, e: None)
+
+        sensitive_error_msg = "DatabaseSecretPassword123!_Bearer_Token_abc_xyz"
+
+        async def run():
+            # Initial publication failure
+            async def failing_publish_initial(evt):
+                raise RuntimeError(f"Connection failure: {sensitive_error_msg}")
+
+            ebus.publish = failing_publish_initial
+
+            req_evt = make_operational_event(
+                tenant_id="tenant_alpha",
+                workspace_id="workspace_prod",
+                plant_id="plant_01"
+            )
+
+            headers = {"X-Correlation-ID": "corr_test_75_init"}
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as ac:
+                resp_1 = await ac.post("/api/v3/events", json=req_evt.model_dump(), headers=headers)
+                assert resp_1.status_code == 500
+                # Raw sensitive text must NOT be present in response
+                assert sensitive_error_msg not in resp_1.text
+                assert "DatabaseSecretPassword123!" not in resp_1.text
+                assert "Bearer_Token" not in resp_1.text
+                assert "Event persisted but publication encountered transient error." in resp_1.json()["detail"]
+                assert resp_1.headers.get("x-correlation-id") == "corr_test_75_init"
+
+                # Replay publication retry failure
+                replay_sensitive_msg = "InternalReplaySecretCredentials999!"
+                async def failing_publish_replay(evt):
+                    raise RuntimeError(f"Replay timeout: {replay_sensitive_msg}")
+
+                ebus.publish = failing_publish_replay
+                replay_headers = {"X-Correlation-ID": "corr_test_75_replay"}
+                resp_2 = await ac.post("/api/v3/events", json=req_evt.model_dump(), headers=replay_headers)
+                assert resp_2.status_code == 500
+                assert replay_sensitive_msg not in resp_2.text
+                assert "InternalReplaySecretCredentials999!" not in resp_2.text
+                assert "Event persisted but publication retry encountered transient error." in resp_2.json()["detail"]
+                assert resp_2.headers.get("x-correlation-id") == "corr_test_75_replay"
+
+        asyncio.run(run())
+
+    def test_76_event_persisted_before_publication_failure_remains_available_for_idempotent_recovery(self, test_setup):
+        """8. Event persisted before publication failure remains available for idempotent recovery."""
+        client, ev_repo, del_repo, ebus, er = test_setup
+        import uuid
+        import asyncio
+        import httpx
+        from server import app
+        from data.schemas.event_contract import EventCategory
+        from data.schemas.event_delivery_contract import Subscription, DeliveryStatus
+
+        producer = Identity(
+            user_id="op_idemp_recovery",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            assigned_plants=["plant_01"],
+            roles=["OPERATOR"],
+            permissions=["events.record"],
+        )
+        app.dependency_overrides[get_current_identity] = lambda: producer
+
+        async def run():
+            sub = Subscription(
+                subscription_id=f"sub_recov_{uuid.uuid4().hex[:8]}",
+                subscriber_id="recov_sub",
+                tenant_id="tenant_alpha",
+                workspace_id="workspace_prod",
+                plant_id="plant_01",
+                category=EventCategory.TELEMETRY.value
+            )
+            delivered_events = []
+            async def sub_cb(delivery, event):
+                delivered_events.append((delivery, event))
+                return True
+
+            ebus.subscribe(sub, sub_cb)
+            ebus.start()
+
+            try:
+                # 1. First publish fails
+                real_publish = ebus.publish
+                fail_flag = True
+                async def mock_publish(evt):
+                    nonlocal fail_flag
+                    if fail_flag:
+                        fail_flag = False
+                        raise RuntimeError("Simulated transient transport down")
+                    return await real_publish(evt)
+
+                ebus.publish = mock_publish
+
+                req_evt = make_operational_event(
+                    tenant_id="tenant_alpha",
+                    workspace_id="workspace_prod",
+                    plant_id="plant_01"
+                )
+
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as ac:
+                    resp_1 = await ac.post("/api/v3/events", json=req_evt.model_dump())
+                    assert resp_1.status_code == 500
+
+                    # Event was safely persisted in EventRepository and NOT rolled back
+                    persisted = ev_repo.get_event("tenant_alpha", req_evt.event_id)
+                    assert persisted is not None
+                    assert persisted.event_fingerprint == req_evt.event_fingerprint
+
+                    # 2. Idempotent recovery via replay
+                    resp_2 = await ac.post("/api/v3/events", json=req_evt.model_dump())
+                    assert resp_2.status_code == 201
+
+                    # Exactly 1 event stored
+                    assert len(ev_repo.list_events("tenant_alpha")) == 1
+
+                    await asyncio.sleep(0.15)
+                    assert len(delivered_events) == 1
+                    assert delivered_events[0][1].event_fingerprint == req_evt.event_fingerprint
+                    deliv = del_repo.get_delivery(delivered_events[0][0].delivery_id, "tenant_alpha")
+                    assert deliv.status == DeliveryStatus.SUCCESS
+            finally:
+                await ebus.stop()
+
+        asyncio.run(run())
+
+    def test_77_recovery_cannot_resolve_event_across_tenant_boundaries(self, test_setup):
+        """9. Recovery cannot resolve an event across tenant boundaries."""
+        client, ev_repo, del_repo, ebus, er = test_setup
+        import asyncio
+        import uuid
+        import pytest
+        from data.schemas.event_contract import EventCategory
+        from data.schemas.event_delivery_contract import Subscription, EventDelivery, DeliveryStatus
+
+        # Event in Tenant Alpha
+        evt_alpha = make_operational_event(tenant_id="tenant_alpha", workspace_id="workspace_prod", plant_id="plant_01")
+        ev_repo.record_event(evt_alpha)
+
+        # Subscription in Tenant Alpha
+        sub_alpha = Subscription(
+            subscription_id=f"sub_alpha_{uuid.uuid4().hex[:8]}",
+            subscriber_id="alpha_sub",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            plant_id="plant_01",
+            category=EventCategory.TELEMETRY.value
+        )
+        del_repo.register_subscription(sub_alpha)
+
+        deliv_alpha = EventDelivery(
+            delivery_id=f"deliv_alpha_{uuid.uuid4().hex[:8]}",
+            event_id=evt_alpha.event_id,
+            event_fingerprint=evt_alpha.event_fingerprint,
+            subscription_id=sub_alpha.subscription_id,
+            tenant_id="tenant_alpha",
+            status=DeliveryStatus.PENDING,
+            attempts=0,
+            max_attempts=3
+        )
+        del_repo.record_delivery_attempt(deliv_alpha)
+
+        alpha_called = []
+        ebus.subscribe(sub_alpha, lambda d, e: alpha_called.append(d.delivery_id) or True)
+
+        async def run_tenant_recovery():
+            # Tenant Beta sweeper attempts recovery
+            beta_recovered = await ebus.recover_pending_deliveries(tenant_id="tenant_beta", event_repo=ev_repo)
+            return beta_recovered
+
+        recovered = asyncio.run(run_tenant_recovery())
+        # Tenant Beta recovery CANNOT process Tenant Alpha's pending deliveries!
+        assert recovered == 0
+        assert len(alpha_called) == 0
+
+        # Direct tenant boundary query isolation
+        assert del_repo.get_delivery(deliv_alpha.delivery_id, "tenant_beta") is None
+        assert len(del_repo.get_pending_deliveries("tenant_beta")) == 0
+
+        # Cross-tenant direct delivery attempt rejection
+        async def run_mismatched_process():
+            evt_beta = make_operational_event(tenant_id="tenant_beta", workspace_id="workspace_prod", plant_id="plant_01")
+            # Delivery belongs to tenant_alpha, event belongs to tenant_beta
+            await ebus._process_delivery(deliv_alpha, evt_beta)
+
+        asyncio.run(run_mismatched_process())
+        assert len(alpha_called) == 0
+
+        # Cross-tenant update rejection in repository
+        mismatched_delivery = EventDelivery(
+            delivery_id=deliv_alpha.delivery_id,
+            event_id=deliv_alpha.event_id,
+            event_fingerprint=deliv_alpha.event_fingerprint,
+            subscription_id=deliv_alpha.subscription_id,
+            tenant_id="tenant_beta", # Mismatched tenant attempting update
+            status=DeliveryStatus.PENDING,
+            attempts=1,
+            max_attempts=3
+        )
+        with pytest.raises(ValueError, match="Cross-tenant delivery update rejected"):
+            del_repo.record_delivery_attempt(mismatched_delivery)
+
+

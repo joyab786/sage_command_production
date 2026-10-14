@@ -127,20 +127,53 @@ class EventDeliveryRepository:
 
     # --- Deliveries ---
     def record_delivery_attempt(self, delivery: EventDelivery) -> EventDelivery:
-        """Upserts a delivery record (handles idempotency tracking)."""
+        """Upserts a delivery record (handles idempotency tracking and prevents resetting success)."""
         delivery.updated_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
         with self._get_conn() as conn:
+            # Check existing record
+            existing = conn.execute(
+                "SELECT * FROM deliveries WHERE event_fingerprint = ? AND subscription_id = ?",
+                (delivery.event_fingerprint, delivery.subscription_id)
+            ).fetchone()
+            if existing:
+                if existing["tenant_id"] != delivery.tenant_id:
+                    raise ValueError(f"Cross-tenant delivery update rejected: existing tenant '{existing['tenant_id']}' != incoming tenant '{delivery.tenant_id}'")
+                if existing["status"] == DeliveryStatus.SUCCESS.value:
+                    # Never reset or downgrade a successful delivery record
+                    delivery.status = DeliveryStatus.SUCCESS
+                    delivery.attempts = existing["attempts"]
+                    delivery.last_error = existing["last_error"]
+                    delivery.next_retry_at = existing["next_retry_at"]
+                    delivery.updated_at = existing["updated_at"]
+                    return delivery
+
             conn.execute("""
                 INSERT INTO deliveries (
                     delivery_id, event_id, event_fingerprint, subscription_id, tenant_id,
                     status, attempts, max_attempts, last_error, next_retry_at, created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(event_fingerprint, subscription_id) DO UPDATE SET
-                    status=excluded.status,
-                    attempts=excluded.attempts,
-                    last_error=excluded.last_error,
-                    next_retry_at=excluded.next_retry_at,
-                    updated_at=excluded.updated_at
+                    status=CASE 
+                        WHEN deliveries.status = 'success' THEN deliveries.status 
+                        ELSE excluded.status 
+                    END,
+                    attempts=CASE 
+                        WHEN deliveries.status = 'success' THEN deliveries.attempts 
+                        ELSE excluded.attempts 
+                    END,
+                    last_error=CASE 
+                        WHEN deliveries.status = 'success' THEN deliveries.last_error 
+                        ELSE excluded.last_error 
+                    END,
+                    next_retry_at=CASE 
+                        WHEN deliveries.status = 'success' THEN deliveries.next_retry_at 
+                        ELSE excluded.next_retry_at 
+                    END,
+                    updated_at=CASE 
+                        WHEN deliveries.status = 'success' THEN deliveries.updated_at 
+                        ELSE excluded.updated_at 
+                    END
+                WHERE deliveries.tenant_id = excluded.tenant_id
             """, (
                 delivery.delivery_id, delivery.event_id, delivery.event_fingerprint, delivery.subscription_id,
                 delivery.tenant_id, delivery.status.value, delivery.attempts, delivery.max_attempts,
@@ -206,3 +239,64 @@ class EventDeliveryRepository:
         with self._get_conn() as conn:
             rows = conn.execute("SELECT * FROM dead_letters WHERE tenant_id = ? ORDER BY recorded_at DESC LIMIT ?", (tenant_id, limit)).fetchall()
             return [DeadLetter(**dict(row)) for row in rows]
+
+    def get_dead_letter(self, dead_letter_id: str, tenant_id: str) -> Optional[DeadLetter]:
+        with self._get_conn() as conn:
+            row = conn.execute("SELECT * FROM dead_letters WHERE dead_letter_id = ? AND tenant_id = ?", (dead_letter_id, tenant_id)).fetchone()
+            if row:
+                return DeadLetter(**dict(row))
+            return None
+
+    def get_dead_letter_by_delivery_id(self, delivery_id: str, tenant_id: str) -> Optional[DeadLetter]:
+        with self._get_conn() as conn:
+            row = conn.execute("SELECT * FROM dead_letters WHERE delivery_id = ? AND tenant_id = ?", (delivery_id, tenant_id)).fetchone()
+            if row:
+                return DeadLetter(**dict(row))
+            return None
+
+    def redrive_dead_letter(self, dead_letter_id: str, tenant_id: str) -> Optional[EventDelivery]:
+        """
+        Administratively recovers a terminally exhausted dead letter.
+        Removes the dead letter record and re-arms the associated delivery to PENDING
+        with reset attempt counter, strictly within tenant boundary.
+        """
+        with self._get_conn() as conn:
+            dl_row = conn.execute(
+                "SELECT * FROM dead_letters WHERE dead_letter_id = ? AND tenant_id = ?",
+                (dead_letter_id, tenant_id)
+            ).fetchone()
+            if not dl_row:
+                return None
+                
+            delivery_id = dl_row["delivery_id"]
+            
+            deliv_row = conn.execute(
+                "SELECT * FROM deliveries WHERE delivery_id = ? AND tenant_id = ?",
+                (delivery_id, tenant_id)
+            ).fetchone()
+            if not deliv_row:
+                return None
+                
+            delivery = EventDelivery(**dict(deliv_row))
+            if delivery.status == DeliveryStatus.SUCCESS:
+                return delivery
+                
+            conn.execute(
+                "DELETE FROM dead_letters WHERE dead_letter_id = ? AND tenant_id = ?",
+                (dead_letter_id, tenant_id)
+            )
+            
+            now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+            conn.execute("""
+                UPDATE deliveries
+                SET status = ?, attempts = 0, last_error = NULL, next_retry_at = NULL, updated_at = ?
+                WHERE delivery_id = ? AND tenant_id = ?
+            """, (DeliveryStatus.PENDING.value, now_iso, delivery_id, tenant_id))
+            conn.commit()
+            
+            delivery.status = DeliveryStatus.PENDING
+            delivery.attempts = 0
+            delivery.last_error = None
+            delivery.next_retry_at = None
+            delivery.updated_at = now_iso
+            return delivery
