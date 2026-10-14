@@ -338,20 +338,104 @@ class EventDeliveryRepository:
                 return EventDelivery(**dict(row))
             return None
 
+    def renew_delivery_lease(
+        self,
+        delivery_id: str,
+        tenant_id: str,
+        claim_token: str,
+        extension_seconds: int = 30,
+        now_iso: Optional[str] = None
+    ) -> Optional[EventDelivery]:
+        """
+        Atomically extends the lease of an active in-flight delivery claim.
+        Requires matching delivery_id, tenant_id, claim_token, and an unexpired lease.
+        Rejects stale claim tokens, expired leases, SUCCESS deliveries, and dead letters.
+        Strictly enforces tenant boundaries (raises ValueError on cross-tenant renewal).
+        """
+        if not now_iso:
+            now_dt = datetime.now(UTC)
+            now_iso = now_dt.isoformat().replace("+00:00", "Z")
+        else:
+            now_dt = datetime.fromisoformat(now_iso.replace("Z", "+00:00"))
+
+        new_lease_expires_at = (now_dt + timedelta(seconds=extension_seconds)).isoformat().replace("+00:00", "Z")
+
+        with self._get_conn() as conn:
+            # 1. Tenant boundary check
+            existing = conn.execute(
+                "SELECT tenant_id, status, claim_token, lease_expires_at FROM deliveries WHERE delivery_id = ?",
+                (delivery_id,)
+            ).fetchone()
+            if not existing:
+                return None
+            if existing["tenant_id"] != tenant_id:
+                raise ValueError(
+                    f"Cross-tenant delivery renewal rejected: delivery belongs to '{existing['tenant_id']}', caller renewed as '{tenant_id}'"
+                )
+
+            # 2. Status and claim check
+            if existing["status"].upper() != "PROCESSING":
+                return None
+            if existing["claim_token"] != claim_token:
+                return None
+            if existing["lease_expires_at"] and existing["lease_expires_at"] < now_iso:
+                # Already expired: cannot renew/resurrect
+                return None
+
+            # 3. Atomic lease extension predicate
+            cur = conn.execute("""
+                UPDATE deliveries
+                SET lease_expires_at = ?,
+                    updated_at = ?
+                WHERE delivery_id = ?
+                  AND tenant_id = ?
+                  AND claim_token = ?
+                  AND UPPER(status) = 'PROCESSING'
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at >= ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM dead_letters dl 
+                      WHERE dl.delivery_id = deliveries.delivery_id 
+                        AND dl.tenant_id = deliveries.tenant_id
+                  )
+            """, (
+                new_lease_expires_at, now_iso,
+                delivery_id, tenant_id, claim_token,
+                now_iso
+            ))
+            conn.commit()
+
+            if cur.rowcount == 0:
+                return None
+
+            row = conn.execute(
+                "SELECT * FROM deliveries WHERE delivery_id = ? AND tenant_id = ?",
+                (delivery_id, tenant_id)
+            ).fetchone()
+            if row:
+                return EventDelivery(**dict(row))
+            return None
+
     def finalize_delivery(
         self,
         delivery_id: str,
         tenant_id: str,
         claim_token: str,
         success: bool,
-        error_msg: Optional[str] = None
+        error_msg: Optional[str] = None,
+        now_iso: Optional[str] = None
     ) -> Optional[EventDelivery]:
         """
-        Finalizes an in-flight delivery attempt using the current claim token.
-        Only the holder of the active claim_token may finalize the delivery.
-        Rejects stale claim tokens, cross-tenant finalizations, and prevents downgrading SUCCESS.
+        Finalizes an in-flight delivery attempt using the current claim token and lease.
+        Only the holder of the active, unexpired claim_token may finalize the delivery.
+        Rejects stale claim tokens, expired leases (even if not yet reclaimed),
+        cross-tenant finalizations, and prevents downgrading SUCCESS.
         """
-        now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        if not now_iso:
+            now_dt = datetime.now(UTC)
+            now_iso = now_dt.isoformat().replace("+00:00", "Z")
+        else:
+            now_dt = datetime.fromisoformat(now_iso.replace("Z", "+00:00"))
 
         with self._get_conn() as conn:
             # 1. Tenant boundary check
@@ -368,11 +452,19 @@ class EventDeliveryRepository:
 
             # Check if delivery is already SUCCESS (cannot be downgraded or mutated by late worker)
             if existing["status"].upper() == "SUCCESS":
-                return EventDelivery(**dict(existing))
+                return None
 
             # Check claim token match
             if existing["claim_token"] != claim_token:
                 # Stale token, expired lease superseded by another worker
+                return None
+
+            # Check lease expiration in-memory check (fail fast if expired)
+            if existing["lease_expires_at"] and existing["lease_expires_at"] < now_iso:
+                # Lease has expired; cannot finalize attempt
+                return None
+
+            if existing["status"].upper() != "PROCESSING":
                 return None
 
             if success:
@@ -387,8 +479,10 @@ class EventDeliveryRepository:
                     WHERE delivery_id = ?
                       AND tenant_id = ?
                       AND claim_token = ?
-                      AND UPPER(status) != 'SUCCESS'
-                """, (now_iso, delivery_id, tenant_id, claim_token))
+                      AND UPPER(status) = 'PROCESSING'
+                      AND lease_expires_at IS NOT NULL
+                      AND lease_expires_at >= ?
+                """, (now_iso, delivery_id, tenant_id, claim_token, now_iso))
                 conn.commit()
                 if cur.rowcount == 0:
                     return None
@@ -398,7 +492,7 @@ class EventDeliveryRepository:
 
                 if attempts < max_attempts:
                     backoff_seconds = min(2 ** attempts, 60)
-                    next_retry_at = (datetime.now(UTC) + timedelta(seconds=backoff_seconds)).isoformat().replace("+00:00", "Z")
+                    next_retry_at = (now_dt + timedelta(seconds=backoff_seconds)).isoformat().replace("+00:00", "Z")
                     cur = conn.execute("""
                         UPDATE deliveries
                         SET status = 'PENDING',
@@ -410,8 +504,10 @@ class EventDeliveryRepository:
                         WHERE delivery_id = ?
                           AND tenant_id = ?
                           AND claim_token = ?
-                          AND UPPER(status) != 'SUCCESS'
-                    """, (error_msg or "Delivery attempt failed", next_retry_at, now_iso, delivery_id, tenant_id, claim_token))
+                          AND UPPER(status) = 'PROCESSING'
+                          AND lease_expires_at IS NOT NULL
+                          AND lease_expires_at >= ?
+                    """, (error_msg or "Delivery attempt failed", next_retry_at, now_iso, delivery_id, tenant_id, claim_token, now_iso))
                     conn.commit()
                     if cur.rowcount == 0:
                         return None
@@ -428,8 +524,10 @@ class EventDeliveryRepository:
                         WHERE delivery_id = ?
                           AND tenant_id = ?
                           AND claim_token = ?
-                          AND UPPER(status) != 'SUCCESS'
-                    """, (error_msg or "Max retry attempts reached", now_iso, delivery_id, tenant_id, claim_token))
+                          AND UPPER(status) = 'PROCESSING'
+                          AND lease_expires_at IS NOT NULL
+                          AND lease_expires_at >= ?
+                    """, (error_msg or "Max retry attempts reached", now_iso, delivery_id, tenant_id, claim_token, now_iso))
 
                     if cur.rowcount > 0:
                         dl = DeadLetter(
@@ -463,6 +561,7 @@ class EventDeliveryRepository:
                 return EventDelivery(**dict(row))
             return None
 
+
     def get_delivery(self, delivery_id: str, tenant_id: str) -> Optional[EventDelivery]:
         with self._get_conn() as conn:
             row = conn.execute("SELECT * FROM deliveries WHERE delivery_id = ? AND tenant_id = ?", (delivery_id, tenant_id)).fetchone()
@@ -485,22 +584,39 @@ class EventDeliveryRepository:
         now_iso: Optional[str] = None,
         include_stale_leases: bool = True
     ) -> List[EventDelivery]:
+        current_time_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
         with self._get_conn() as conn:
-            if now_iso and include_stale_leases:
-                query = """
-                    SELECT * FROM deliveries 
-                    WHERE (
-                        (UPPER(status) = ? AND (next_retry_at IS NULL OR next_retry_at <= ?))
-                        OR
-                        (UPPER(status) = ? AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1 FROM dead_letters dl 
-                        WHERE dl.delivery_id = deliveries.delivery_id 
-                          AND dl.tenant_id = deliveries.tenant_id
-                    )
-                """
-                params = [DeliveryStatus.PENDING.value, now_iso, DeliveryStatus.PROCESSING.value, now_iso]
+            if include_stale_leases:
+                if now_iso:
+                    query = """
+                        SELECT * FROM deliveries 
+                        WHERE (
+                            (UPPER(status) = ? AND (next_retry_at IS NULL OR next_retry_at <= ?))
+                            OR
+                            (UPPER(status) = ? AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1 FROM dead_letters dl 
+                            WHERE dl.delivery_id = deliveries.delivery_id 
+                              AND dl.tenant_id = deliveries.tenant_id
+                        )
+                    """
+                    params = [DeliveryStatus.PENDING.value, now_iso, DeliveryStatus.PROCESSING.value, now_iso]
+                else:
+                    query = """
+                        SELECT * FROM deliveries 
+                        WHERE (
+                            UPPER(status) = ?
+                            OR
+                            (UPPER(status) = ? AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1 FROM dead_letters dl 
+                            WHERE dl.delivery_id = deliveries.delivery_id 
+                              AND dl.tenant_id = deliveries.tenant_id
+                        )
+                    """
+                    params = [DeliveryStatus.PENDING.value, DeliveryStatus.PROCESSING.value, current_time_iso]
             else:
                 query = """
                     SELECT * FROM deliveries 

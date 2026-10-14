@@ -10,7 +10,8 @@ from core.config import (
     SAGE_EVENT_BUS_MAX_WORKERS,
     SAGE_EVENT_BUS_MAX_RETRIES,
     SAGE_EVENT_BUS_SWEEPER_INTERVAL_SECONDS,
-    SAGE_EVENT_DELIVERY_LEASE_SECONDS
+    SAGE_EVENT_DELIVERY_LEASE_SECONDS,
+    SAGE_EVENT_DELIVERY_HEARTBEAT_INTERVAL_SECONDS
 )
 from data.schemas.event_contract import CanonicalEvent
 from data.schemas.event_delivery_contract import (
@@ -294,7 +295,12 @@ class EventBus:
             respect_backoff=respect_backoff
         )
         if not claimed:
-            # Cannot claim: actively leased, backoff window unexpired, already terminal success, or dead-lettered
+            # Check if delivery is already terminal SUCCESS in DB
+            db_d = self.repository.get_delivery(delivery.delivery_id, delivery.tenant_id)
+            if db_d and db_d.status == DeliveryStatus.SUCCESS:
+                delivery.status = DeliveryStatus.SUCCESS
+                return True
+            # Cannot claim: actively leased, backoff window unexpired, or dead-lettered
             logger.debug(f"Delivery {delivery.delivery_id} could not be claimed (active lease, backoff, or finalized).")
             return False
 
@@ -316,6 +322,48 @@ class EventBus:
             )
             return False
 
+        # Set up bounded lease renewal heartbeat for long-running callback safety
+        heartbeat_interval = min(
+            SAGE_EVENT_DELIVERY_HEARTBEAT_INTERVAL_SECONDS,
+            max(0.05, lease_seconds / 3.0)
+        )
+        stop_heartbeat = asyncio.Event()
+
+        async def _heartbeat_loop():
+            while not stop_heartbeat.is_set():
+                try:
+                    await asyncio.wait_for(stop_heartbeat.wait(), timeout=heartbeat_interval)
+                    break
+                except asyncio.TimeoutError:
+                    pass
+                except asyncio.CancelledError:
+                    break
+
+                if stop_heartbeat.is_set():
+                    break
+
+                try:
+                    renewed = self.repository.renew_delivery_lease(
+                        delivery_id=claimed.delivery_id,
+                        tenant_id=claimed.tenant_id,
+                        claim_token=claim_token,
+                        extension_seconds=lease_seconds
+                    )
+                    if not renewed:
+                        logger.warning(
+                            f"Delivery {claimed.delivery_id} lease renewal failed (claim expired or superseded)."
+                        )
+                        break
+                    else:
+                        logger.debug(
+                            f"Delivery {claimed.delivery_id} lease extended until {renewed.lease_expires_at}."
+                        )
+                except Exception as ex:
+                    logger.warning(f"Error during lease renewal for delivery {claimed.delivery_id}: {ex}")
+                    break
+
+        heartbeat_task = asyncio.create_task(_heartbeat_loop())
+
         # Invoke isolated subscriber callback outside of any database transaction
         try:
             success = await callback(claimed, event)
@@ -332,7 +380,7 @@ class EventBus:
                     )
                 return bool(fin)
             else:
-                self.repository.finalize_delivery(
+                fin = self.repository.finalize_delivery(
                     delivery_id=claimed.delivery_id,
                     tenant_id=claimed.tenant_id,
                     claim_token=claim_token,
@@ -349,6 +397,14 @@ class EventBus:
                 error_msg=f"Subscriber raised exception: {str(e)}"
             )
             return False
+        finally:
+            stop_heartbeat.set()
+            if not heartbeat_task.done():
+                heartbeat_task.cancel()
+                try:
+                    await heartbeat_task
+                except asyncio.CancelledError:
+                    pass
 
     async def recover_pending_deliveries(
         self,
