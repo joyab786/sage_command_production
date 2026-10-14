@@ -2851,3 +2851,637 @@ class TestPrompt37DRecoveryStateAndSafePublicationErrors:
             del_repo.record_delivery_attempt(mismatched_delivery)
 
 
+class TestPrompt37EAtomicClaimsAndConcurrencySafety:
+    """
+    Prompt 37E Concurrency and Recovery Safety Tests:
+    1. Two concurrent workers attempt to claim the same pending delivery; only one succeeds.
+    2. A worker and the recovery sweeper race for the same delivery; only one callback begins.
+    3. A successful delivery is not invoked again by a concurrent replay or subsequent sweep.
+    4. An active lease prevents a second claim.
+    5. An expired lease becomes recoverable.
+    6. An old claim token cannot finalize a delivery after a newer claim has been acquired.
+    7. A failed attempt follows the existing backoff and retry limit.
+    8. Retry exhaustion creates the expected dead letter.
+    9. Administrative redrive restores eligibility without bypassing claim validation.
+    10. Cross-tenant claims and finalization attempts are rejected.
+    11. A callback's stable idempotency key remains unchanged across retries.
+    12. Existing Prompt 37A–37D tests continue to pass.
+    """
+
+    @pytest.fixture
+    def test_setup(self, tmp_path):
+        import uuid
+        from fastapi.testclient import TestClient
+        from server import app
+        from services.event_repository import EventRepository
+        from services.event_delivery_repository import EventDeliveryRepository
+        from services.event_bus import EventBus
+        try:
+            import api.event_routes as er
+        except (ImportError, ModuleNotFoundError):
+            import backend.api.event_routes as er
+
+        db_path = str(tmp_path / f"ev_37e_{uuid.uuid4().hex[:8]}.sqlite")
+        del_db_path = str(tmp_path / f"del_37e_{uuid.uuid4().hex[:8]}.sqlite")
+        
+        ev_repo = EventRepository(db_path=db_path)
+        del_repo = EventDeliveryRepository(db_path=del_db_path)
+        ebus = EventBus(repository=del_repo, event_repository=ev_repo)
+        ebus.enabled = True
+        
+        client = TestClient(app)
+        app.dependency_overrides[er.get_event_repo] = lambda: ev_repo
+        app.dependency_overrides[er.get_event_bus] = lambda: ebus
+        
+        yield client, ev_repo, del_repo, ebus, er
+        app.dependency_overrides.clear()
+
+    def test_78_two_concurrent_workers_claim_same_pending_delivery(self, test_setup):
+        """1. Two concurrent workers attempt to claim the same pending delivery; only one succeeds."""
+        client, ev_repo, del_repo, ebus, er = test_setup
+        import asyncio
+        import uuid
+        from data.schemas.event_contract import EventCategory
+        from data.schemas.event_delivery_contract import Subscription, EventDelivery, DeliveryStatus
+
+        evt = make_operational_event(tenant_id="tenant_alpha", workspace_id="workspace_prod", plant_id="plant_01")
+        ev_repo.record_event(evt)
+
+        sub = Subscription(
+            subscription_id=f"sub_c78_{uuid.uuid4().hex[:8]}",
+            subscriber_id="worker_race_sub",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            plant_id="plant_01",
+            category=EventCategory.TELEMETRY.value
+        )
+        del_repo.register_subscription(sub)
+
+        deliv = EventDelivery(
+            delivery_id=f"deliv_c78_{uuid.uuid4().hex[:8]}",
+            event_id=evt.event_id,
+            event_fingerprint=evt.event_fingerprint,
+            subscription_id=sub.subscription_id,
+            tenant_id="tenant_alpha",
+            status=DeliveryStatus.PENDING,
+            attempts=0,
+            max_attempts=3
+        )
+        del_repo.record_delivery_attempt(deliv)
+
+        async def run():
+            # Concurrently attempt claim from two workers
+            async def worker_attempt(wid: int):
+                await asyncio.sleep(0.001)
+                return del_repo.claim_delivery(deliv.delivery_id, "tenant_alpha", lease_seconds=30)
+
+            results = await asyncio.gather(worker_attempt(1), worker_attempt(2))
+            return results
+
+        results = asyncio.run(run())
+        successful_claims = [r for r in results if r is not None]
+        failed_claims = [r for r in results if r is None]
+
+        # Exactly ONE claim succeeded; the other failed
+        assert len(successful_claims) == 1
+        assert len(failed_claims) == 1
+
+        claimed = successful_claims[0]
+        assert claimed.status == DeliveryStatus.PROCESSING
+        assert claimed.claim_token is not None
+        assert claimed.lease_expires_at is not None
+        assert claimed.attempts == 1
+
+        # Check DB state matches the single successful claimant
+        db_record = del_repo.get_delivery(deliv.delivery_id, "tenant_alpha")
+        assert db_record.status == DeliveryStatus.PROCESSING
+        assert db_record.claim_token == claimed.claim_token
+        assert db_record.attempts == 1
+
+    def test_79_worker_and_recovery_sweeper_race(self, test_setup):
+        """2. A worker and the recovery sweeper race for the same delivery; only one callback begins."""
+        client, ev_repo, del_repo, ebus, er = test_setup
+        import asyncio
+        import uuid
+        from data.schemas.event_contract import EventCategory
+        from data.schemas.event_delivery_contract import Subscription, EventDelivery, DeliveryStatus
+
+        evt = make_operational_event(tenant_id="tenant_alpha", workspace_id="workspace_prod", plant_id="plant_01")
+        ev_repo.record_event(evt)
+
+        sub = Subscription(
+            subscription_id=f"sub_c79_{uuid.uuid4().hex[:8]}",
+            subscriber_id="sweeper_race_sub",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            plant_id="plant_01",
+            category=EventCategory.TELEMETRY.value
+        )
+        del_repo.register_subscription(sub)
+
+        callback_invocations = []
+        async def subscriber_callback(delivery, event):
+            callback_invocations.append((delivery.delivery_id, delivery.claim_token))
+            await asyncio.sleep(0.05) # Hold in callback to prove active lease
+            return True
+
+        ebus.subscribe(sub, subscriber_callback)
+
+        deliv = EventDelivery(
+            delivery_id=f"deliv_c79_{uuid.uuid4().hex[:8]}",
+            event_id=evt.event_id,
+            event_fingerprint=evt.event_fingerprint,
+            subscription_id=sub.subscription_id,
+            tenant_id="tenant_alpha",
+            status=DeliveryStatus.PENDING,
+            attempts=0,
+            max_attempts=3
+        )
+        del_repo.record_delivery_attempt(deliv)
+
+        async def run_race():
+            async def worker_dispatch():
+                return await ebus._process_delivery(deliv, evt)
+
+            async def sweeper_dispatch():
+                return await ebus.recover_pending_deliveries(tenant_id="tenant_alpha", event_repo=ev_repo)
+
+            return await asyncio.gather(worker_dispatch(), sweeper_dispatch())
+
+        res = asyncio.run(run_race())
+
+        # Callback was invoked EXACTLY ONCE despite the race
+        assert len(callback_invocations) == 1
+        db_deliv = del_repo.get_delivery(deliv.delivery_id, "tenant_alpha")
+        assert db_deliv.status == DeliveryStatus.SUCCESS
+        assert db_deliv.claim_token is None
+
+    def test_80_successful_delivery_not_invoked_again_by_replay_or_sweep(self, test_setup):
+        """3. A successful delivery is not invoked again by a concurrent replay or subsequent sweep."""
+        client, ev_repo, del_repo, ebus, er = test_setup
+        import asyncio
+        import uuid
+        from data.schemas.event_contract import EventCategory
+        from data.schemas.event_delivery_contract import Subscription, EventDelivery, DeliveryStatus
+
+        evt = make_operational_event(tenant_id="tenant_alpha", workspace_id="workspace_prod", plant_id="plant_01")
+        ev_repo.record_event(evt)
+
+        sub = Subscription(
+            subscription_id=f"sub_c80_{uuid.uuid4().hex[:8]}",
+            subscriber_id="idemp_sweep_sub",
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_prod",
+            plant_id="plant_01",
+            category=EventCategory.TELEMETRY.value
+        )
+        callback_count = 0
+        async def mock_callback(delivery, event):
+            nonlocal callback_count
+            callback_count += 1
+            return True
+
+        ebus.subscribe(sub, mock_callback)
+
+        deliv = EventDelivery(
+            delivery_id=f"deliv_c80_{uuid.uuid4().hex[:8]}",
+            event_id=evt.event_id,
+            event_fingerprint=evt.event_fingerprint,
+            subscription_id=sub.subscription_id,
+            tenant_id="tenant_alpha",
+            status=DeliveryStatus.PENDING,
+            attempts=0,
+            max_attempts=3
+        )
+        del_repo.record_delivery_attempt(deliv)
+
+        async def run():
+            # Initial successful delivery
+            success = await ebus._process_delivery(deliv, evt)
+            assert success is True
+            assert callback_count == 1
+
+            # Subsequent sweep
+            swept = await ebus.recover_pending_deliveries(tenant_id="tenant_alpha", event_repo=ev_repo)
+            assert swept == 0
+            assert callback_count == 1
+
+            # Concurrent replay attempts
+            replay_res = await asyncio.gather(
+                ebus._process_delivery(deliv, evt),
+                ebus.recover_pending_deliveries(tenant_id="tenant_alpha", event_repo=ev_repo)
+            )
+            assert callback_count == 1 # Still exactly 1!
+
+        asyncio.run(run())
+        db_deliv = del_repo.get_delivery(deliv.delivery_id, "tenant_alpha")
+        assert db_deliv.status == DeliveryStatus.SUCCESS
+
+    def test_81_active_lease_prevents_second_claim(self, test_setup):
+        """4. An active lease prevents a second claim."""
+        client, ev_repo, del_repo, ebus, er = test_setup
+        import uuid
+        from data.schemas.event_contract import EventCategory
+        from data.schemas.event_delivery_contract import Subscription, EventDelivery, DeliveryStatus
+
+        evt = make_operational_event(tenant_id="tenant_alpha", workspace_id="workspace_prod", plant_id="plant_01")
+        ev_repo.record_event(evt)
+
+        sub = Subscription(
+            subscription_id=f"sub_c81_{uuid.uuid4().hex[:8]}",
+            subscriber_id="lease_sub",
+            tenant_id="tenant_alpha",
+            category=EventCategory.TELEMETRY.value
+        )
+        del_repo.register_subscription(sub)
+
+        deliv = EventDelivery(
+            delivery_id=f"deliv_c81_{uuid.uuid4().hex[:8]}",
+            event_id=evt.event_id,
+            event_fingerprint=evt.event_fingerprint,
+            subscription_id=sub.subscription_id,
+            tenant_id="tenant_alpha",
+            status=DeliveryStatus.PENDING
+        )
+        del_repo.record_delivery_attempt(deliv)
+
+        # Worker 1 claims with 60-second lease
+        claim_1 = del_repo.claim_delivery(deliv.delivery_id, "tenant_alpha", lease_seconds=60)
+        assert claim_1 is not None
+        assert claim_1.claim_token is not None
+        assert claim_1.status == DeliveryStatus.PROCESSING
+
+        # Worker 2 attempts claim while lease is active
+        claim_2 = del_repo.claim_delivery(deliv.delivery_id, "tenant_alpha", lease_seconds=60)
+        assert claim_2 is None # Blocked by active lease
+
+        # Verify DB still has worker 1's token
+        db_deliv = del_repo.get_delivery(deliv.delivery_id, "tenant_alpha")
+        assert db_deliv.claim_token == claim_1.claim_token
+        assert db_deliv.status == DeliveryStatus.PROCESSING
+
+    def test_82_expired_lease_becomes_recoverable(self, test_setup):
+        """5. An expired lease becomes recoverable."""
+        client, ev_repo, del_repo, ebus, er = test_setup
+        import uuid
+        from datetime import datetime, UTC, timedelta
+        from data.schemas.event_contract import EventCategory
+        from data.schemas.event_delivery_contract import Subscription, EventDelivery, DeliveryStatus
+
+        evt = make_operational_event(tenant_id="tenant_alpha", workspace_id="workspace_prod", plant_id="plant_01")
+        ev_repo.record_event(evt)
+
+        sub = Subscription(
+            subscription_id=f"sub_c82_{uuid.uuid4().hex[:8]}",
+            subscriber_id="expired_lease_sub",
+            tenant_id="tenant_alpha",
+            category=EventCategory.TELEMETRY.value
+        )
+        del_repo.register_subscription(sub)
+
+        # Create delivery with an expired lease in PROCESSING state
+        expired_time = (datetime.now(UTC) - timedelta(seconds=60)).isoformat().replace("+00:00", "Z")
+        deliv = EventDelivery(
+            delivery_id=f"deliv_c82_{uuid.uuid4().hex[:8]}",
+            event_id=evt.event_id,
+            event_fingerprint=evt.event_fingerprint,
+            subscription_id=sub.subscription_id,
+            tenant_id="tenant_alpha",
+            status=DeliveryStatus.PROCESSING,
+            claim_token="claim_stale_123",
+            lease_expires_at=expired_time,
+            attempts=1
+        )
+        del_repo.record_delivery_attempt(deliv)
+
+        # New worker claims the delivery whose lease expired
+        new_claim = del_repo.claim_delivery(deliv.delivery_id, "tenant_alpha", lease_seconds=30)
+        assert new_claim is not None
+        assert new_claim.claim_token != "claim_stale_123"
+        assert new_claim.status == DeliveryStatus.PROCESSING
+        assert new_claim.attempts == 2
+
+        # Verify DB is updated to new worker's claim
+        db_deliv = del_repo.get_delivery(deliv.delivery_id, "tenant_alpha")
+        assert db_deliv.claim_token == new_claim.claim_token
+
+    def test_83_old_claim_token_cannot_finalize_superseded_delivery(self, test_setup):
+        """6. An old claim token cannot finalize a delivery after a newer claim has been acquired."""
+        client, ev_repo, del_repo, ebus, er = test_setup
+        import uuid
+        from datetime import datetime, UTC, timedelta
+        from data.schemas.event_contract import EventCategory
+        from data.schemas.event_delivery_contract import Subscription, EventDelivery, DeliveryStatus
+
+        evt = make_operational_event(tenant_id="tenant_alpha", workspace_id="workspace_prod", plant_id="plant_01")
+        ev_repo.record_event(evt)
+
+        sub = Subscription(
+            subscription_id=f"sub_c83_{uuid.uuid4().hex[:8]}",
+            subscriber_id="stale_final_sub",
+            tenant_id="tenant_alpha",
+            category=EventCategory.TELEMETRY.value
+        )
+        del_repo.register_subscription(sub)
+
+        deliv = EventDelivery(
+            delivery_id=f"deliv_c83_{uuid.uuid4().hex[:8]}",
+            event_id=evt.event_id,
+            event_fingerprint=evt.event_fingerprint,
+            subscription_id=sub.subscription_id,
+            tenant_id="tenant_alpha",
+            status=DeliveryStatus.PENDING
+        )
+        del_repo.record_delivery_attempt(deliv)
+
+        # Worker 1 acquires claim
+        claim_1 = del_repo.claim_delivery(deliv.delivery_id, "tenant_alpha", lease_seconds=30)
+        token_1 = claim_1.claim_token
+
+        # Simulate Worker 1 stalling and lease expiring
+        expired_time = (datetime.now(UTC) - timedelta(seconds=10)).isoformat().replace("+00:00", "Z")
+        with del_repo._get_conn() as conn:
+            conn.execute("UPDATE deliveries SET lease_expires_at = ? WHERE delivery_id = ?", (expired_time, deliv.delivery_id))
+            conn.commit()
+
+        # Worker 2 acquires newer claim
+        claim_2 = del_repo.claim_delivery(deliv.delivery_id, "tenant_alpha", lease_seconds=30)
+        assert claim_2 is not None
+        token_2 = claim_2.claim_token
+        assert token_2 != token_1
+
+        # Worker 1 wakes up and attempts to finalize using OLD token_1
+        fin_1 = del_repo.finalize_delivery(deliv.delivery_id, "tenant_alpha", claim_token=token_1, success=True)
+        assert fin_1 is None # REJECTED!
+
+        # Verify DB state is still PROCESSING under Worker 2
+        db_mid = del_repo.get_delivery(deliv.delivery_id, "tenant_alpha")
+        assert db_mid.status == DeliveryStatus.PROCESSING
+        assert db_mid.claim_token == token_2
+
+        # Worker 2 finalizes with valid current token_2
+        fin_2 = del_repo.finalize_delivery(deliv.delivery_id, "tenant_alpha", claim_token=token_2, success=True)
+        assert fin_2 is not None
+        assert fin_2.status == DeliveryStatus.SUCCESS
+
+    def test_84_failed_attempt_follows_backoff_and_retry_limit(self, test_setup):
+        """7. A failed attempt follows the existing backoff and retry limit."""
+        client, ev_repo, del_repo, ebus, er = test_setup
+        import uuid
+        from datetime import datetime, UTC, timedelta
+        from data.schemas.event_contract import EventCategory
+        from data.schemas.event_delivery_contract import Subscription, EventDelivery, DeliveryStatus
+
+        evt = make_operational_event(tenant_id="tenant_alpha", workspace_id="workspace_prod", plant_id="plant_01")
+        ev_repo.record_event(evt)
+
+        sub = Subscription(
+            subscription_id=f"sub_c84_{uuid.uuid4().hex[:8]}",
+            subscriber_id="backoff_sub",
+            tenant_id="tenant_alpha",
+            category=EventCategory.TELEMETRY.value
+        )
+        del_repo.register_subscription(sub)
+
+        deliv = EventDelivery(
+            delivery_id=f"deliv_c84_{uuid.uuid4().hex[:8]}",
+            event_id=evt.event_id,
+            event_fingerprint=evt.event_fingerprint,
+            subscription_id=sub.subscription_id,
+            tenant_id="tenant_alpha",
+            status=DeliveryStatus.PENDING,
+            attempts=0,
+            max_attempts=3
+        )
+        del_repo.record_delivery_attempt(deliv)
+
+        # Attempt 1 claim and fail
+        c1 = del_repo.claim_delivery(deliv.delivery_id, "tenant_alpha", lease_seconds=30)
+        assert c1.attempts == 1
+        fin_1 = del_repo.finalize_delivery(deliv.delivery_id, "tenant_alpha", c1.claim_token, success=False, error_msg="Transient timeout")
+        assert fin_1.status == DeliveryStatus.PENDING
+        assert fin_1.next_retry_at is not None
+
+        # Immediate claim with respect_backoff=True MUST BE REJECTED
+        immediate_claim = del_repo.claim_delivery(deliv.delivery_id, "tenant_alpha", respect_backoff=True)
+        assert immediate_claim is None # Blocked by unexpired backoff
+
+        # Advance simulated time past next_retry_at
+        future_iso = (datetime.now(UTC) + timedelta(seconds=10)).isoformat().replace("+00:00", "Z")
+        claim_after_backoff = del_repo.claim_delivery(deliv.delivery_id, "tenant_alpha", respect_backoff=True, now_iso=future_iso)
+        assert claim_after_backoff is not None
+        assert claim_after_backoff.attempts == 2
+
+    def test_85_retry_exhaustion_creates_expected_dead_letter(self, test_setup):
+        """8. Retry exhaustion creates the expected dead letter."""
+        client, ev_repo, del_repo, ebus, er = test_setup
+        import uuid
+        from data.schemas.event_contract import EventCategory
+        from data.schemas.event_delivery_contract import Subscription, EventDelivery, DeliveryStatus
+
+        evt = make_operational_event(tenant_id="tenant_alpha", workspace_id="workspace_prod", plant_id="plant_01")
+        ev_repo.record_event(evt)
+
+        sub = Subscription(
+            subscription_id=f"sub_c85_{uuid.uuid4().hex[:8]}",
+            subscriber_id="dead_letter_sub",
+            tenant_id="tenant_alpha",
+            category=EventCategory.TELEMETRY.value
+        )
+        del_repo.register_subscription(sub)
+
+        deliv = EventDelivery(
+            delivery_id=f"deliv_c85_{uuid.uuid4().hex[:8]}",
+            event_id=evt.event_id,
+            event_fingerprint=evt.event_fingerprint,
+            subscription_id=sub.subscription_id,
+            tenant_id="tenant_alpha",
+            status=DeliveryStatus.PENDING,
+            attempts=0,
+            max_attempts=2 # Max 2 attempts
+        )
+        del_repo.record_delivery_attempt(deliv)
+
+        # Attempt 1
+        c1 = del_repo.claim_delivery(deliv.delivery_id, "tenant_alpha", respect_backoff=False)
+        del_repo.finalize_delivery(deliv.delivery_id, "tenant_alpha", c1.claim_token, success=False, error_msg="Error 1")
+        assert len(del_repo.list_dead_letters("tenant_alpha")) == 0
+
+        # Attempt 2 (exhausts retries)
+        c2 = del_repo.claim_delivery(deliv.delivery_id, "tenant_alpha", respect_backoff=False)
+        assert c2.attempts == 2
+        fin_2 = del_repo.finalize_delivery(deliv.delivery_id, "tenant_alpha", c2.claim_token, success=False, error_msg="Terminal Crash")
+        assert fin_2.status == DeliveryStatus.FAILED
+
+        # Dead letter is durably created
+        dls = del_repo.list_dead_letters("tenant_alpha")
+        assert len(dls) == 1
+        assert dls[0].delivery_id == deliv.delivery_id
+        assert dls[0].attempt_count == 2
+        assert "Terminal Crash" in dls[0].failure_reason
+
+        # Dead letter cannot be claimed
+        claim_after_dl = del_repo.claim_delivery(deliv.delivery_id, "tenant_alpha", respect_backoff=False)
+        assert claim_after_dl is None
+
+    def test_86_administrative_redrive_restores_eligibility_with_claim_validation(self, test_setup):
+        """9. Administrative redrive restores eligibility without bypassing claim validation."""
+        client, ev_repo, del_repo, ebus, er = test_setup
+        import uuid
+        from data.schemas.event_contract import EventCategory
+        from data.schemas.event_delivery_contract import Subscription, EventDelivery, DeliveryStatus
+
+        evt = make_operational_event(tenant_id="tenant_alpha", workspace_id="workspace_prod", plant_id="plant_01")
+        ev_repo.record_event(evt)
+
+        sub = Subscription(
+            subscription_id=f"sub_c86_{uuid.uuid4().hex[:8]}",
+            subscriber_id="redrive_sub",
+            tenant_id="tenant_alpha",
+            category=EventCategory.TELEMETRY.value
+        )
+        del_repo.register_subscription(sub)
+
+        # Exhaust delivery into dead letter
+        deliv = EventDelivery(
+            delivery_id=f"deliv_c86_{uuid.uuid4().hex[:8]}",
+            event_id=evt.event_id,
+            event_fingerprint=evt.event_fingerprint,
+            subscription_id=sub.subscription_id,
+            tenant_id="tenant_alpha",
+            status=DeliveryStatus.PENDING,
+            attempts=0,
+            max_attempts=1
+        )
+        del_repo.record_delivery_attempt(deliv)
+        c1 = del_repo.claim_delivery(deliv.delivery_id, "tenant_alpha", respect_backoff=False)
+        del_repo.finalize_delivery(deliv.delivery_id, "tenant_alpha", c1.claim_token, success=False, error_msg="Exhausted")
+
+        dl = del_repo.list_dead_letters("tenant_alpha")[0]
+
+        # Administrative redrive
+        redriven = ebus.redrive_dead_letter(dl.dead_letter_id, "tenant_alpha")
+        assert redriven is not None
+        assert redriven.status == DeliveryStatus.PENDING
+        assert redriven.attempts == 0
+        assert redriven.claim_token is None
+        assert len(del_repo.list_dead_letters("tenant_alpha")) == 0
+
+        # Now worker can acquire claim under normal atomic validation
+        new_claim = del_repo.claim_delivery(deliv.delivery_id, "tenant_alpha", respect_backoff=False)
+        assert new_claim is not None
+        assert new_claim.status == DeliveryStatus.PROCESSING
+        assert new_claim.attempts == 1
+
+        # Finalize as success
+        fin = del_repo.finalize_delivery(deliv.delivery_id, "tenant_alpha", new_claim.claim_token, success=True)
+        assert fin.status == DeliveryStatus.SUCCESS
+
+    def test_87_cross_tenant_claims_and_finalization_rejected(self, test_setup):
+        """10. Cross-tenant claims and finalization attempts are rejected."""
+        client, ev_repo, del_repo, ebus, er = test_setup
+        import uuid
+        import pytest
+        from data.schemas.event_contract import EventCategory
+        from data.schemas.event_delivery_contract import Subscription, EventDelivery, DeliveryStatus
+
+        evt = make_operational_event(tenant_id="tenant_alpha", workspace_id="workspace_prod", plant_id="plant_01")
+        ev_repo.record_event(evt)
+
+        sub = Subscription(
+            subscription_id=f"sub_c87_{uuid.uuid4().hex[:8]}",
+            subscriber_id="tenant_guard_sub",
+            tenant_id="tenant_alpha",
+            category=EventCategory.TELEMETRY.value
+        )
+        del_repo.register_subscription(sub)
+
+        deliv = EventDelivery(
+            delivery_id=f"deliv_c87_{uuid.uuid4().hex[:8]}",
+            event_id=evt.event_id,
+            event_fingerprint=evt.event_fingerprint,
+            subscription_id=sub.subscription_id,
+            tenant_id="tenant_alpha",
+            status=DeliveryStatus.PENDING
+        )
+        del_repo.record_delivery_attempt(deliv)
+
+        # Cross-tenant claim attempt raises ValueError
+        with pytest.raises(ValueError, match="Cross-tenant delivery claim rejected"):
+            del_repo.claim_delivery(deliv.delivery_id, "tenant_beta")
+
+        # Legitimate tenant_alpha claim
+        claim_alpha = del_repo.claim_delivery(deliv.delivery_id, "tenant_alpha")
+        assert claim_alpha is not None
+
+        # Cross-tenant finalization attempt raises ValueError
+        with pytest.raises(ValueError, match="Cross-tenant delivery finalization rejected"):
+            del_repo.finalize_delivery(deliv.delivery_id, "tenant_beta", claim_alpha.claim_token, success=True)
+
+        # Legitimate finalization succeeds
+        fin = del_repo.finalize_delivery(deliv.delivery_id, "tenant_alpha", claim_alpha.claim_token, success=True)
+        assert fin is not None
+        assert fin.status == DeliveryStatus.SUCCESS
+
+    def test_88_callbacks_stable_idempotency_key_unchanged_across_retries(self, test_setup):
+        """11. A callback's stable idempotency key remains unchanged across retries."""
+        client, ev_repo, del_repo, ebus, er = test_setup
+        import asyncio
+        import uuid
+        from data.schemas.event_contract import EventCategory
+        from data.schemas.event_delivery_contract import Subscription, EventDelivery, DeliveryStatus
+
+        evt = make_operational_event(tenant_id="tenant_alpha", workspace_id="workspace_prod", plant_id="plant_01")
+        ev_repo.record_event(evt)
+
+        sub = Subscription(
+            subscription_id=f"sub_c88_{uuid.uuid4().hex[:8]}",
+            subscriber_id="idemp_key_sub",
+            tenant_id="tenant_alpha",
+            category=EventCategory.TELEMETRY.value
+        )
+        del_repo.register_subscription(sub)
+
+        idemp_keys_received = []
+        attempt_count = 0
+        async def retryable_sub(delivery, event):
+            nonlocal attempt_count
+            attempt_count += 1
+            idemp_keys_received.append(delivery.idempotency_key)
+            if attempt_count == 1:
+                return False # Fail first attempt
+            return True # Succeed second attempt
+
+        ebus.subscribe(sub, retryable_sub)
+
+        deliv = EventDelivery(
+            delivery_id=f"deliv_c88_{uuid.uuid4().hex[:8]}",
+            event_id=evt.event_id,
+            event_fingerprint=evt.event_fingerprint,
+            subscription_id=sub.subscription_id,
+            tenant_id="tenant_alpha",
+            status=DeliveryStatus.PENDING,
+            attempts=0,
+            max_attempts=3
+        )
+        del_repo.record_delivery_attempt(deliv)
+
+        async def run():
+            # Attempt 1 (fails)
+            res_1 = await ebus._process_delivery(deliv, evt)
+            assert res_1 is False
+
+            # Attempt 2 (retried, succeeds)
+            s1 = del_repo.get_delivery(deliv.delivery_id, "tenant_alpha")
+            res_2 = await ebus._process_delivery(s1, evt)
+            assert res_2 is True
+
+        asyncio.run(run())
+
+        assert len(idemp_keys_received) == 2
+        # Key must be non-empty and IDENTICAL across all attempts
+        assert idemp_keys_received[0] is not None
+        assert idemp_keys_received[0] == idemp_keys_received[1]
+        assert idemp_keys_received[0] == deliv.delivery_id
+
+

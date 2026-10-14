@@ -9,7 +9,8 @@ from core.config import (
     SAGE_EVENT_BUS_QUEUE_SIZE,
     SAGE_EVENT_BUS_MAX_WORKERS,
     SAGE_EVENT_BUS_MAX_RETRIES,
-    SAGE_EVENT_BUS_SWEEPER_INTERVAL_SECONDS
+    SAGE_EVENT_BUS_SWEEPER_INTERVAL_SECONDS,
+    SAGE_EVENT_DELIVERY_LEASE_SECONDS
 )
 from data.schemas.event_contract import CanonicalEvent
 from data.schemas.event_delivery_contract import (
@@ -30,7 +31,7 @@ class EventBus:
     """
     SageCommand V3 Internal Event Bus Foundation.
     Provides deterministic dispatch, bounded queues, at-least-once delivery semantics
-    with idempotency tracking, retries, and dead-lettering.
+    with atomic database claims, leases, idempotency tracking, retries, and dead-lettering.
     
     CRITICAL RESTRICTION: This bus MUST NOT import the execution gateway or execute physical actions.
     """
@@ -94,7 +95,7 @@ class EventBus:
         logger.info("EventBus gracefully stopped.")
 
     async def _sweeper_loop(self):
-        """Background sweeper periodically recovering pending deliveries."""
+        """Background sweeper periodically recovering pending deliveries and expired leases."""
         while self._running:
             try:
                 await asyncio.sleep(SAGE_EVENT_BUS_SWEEPER_INTERVAL_SECONDS)
@@ -187,7 +188,7 @@ class EventBus:
                 continue
             if self.repository.get_dead_letter_by_delivery_id(delivery_id, event.tenant_id):
                 continue
-            if existing_delivery.status == DeliveryStatus.PENDING:
+            if existing_delivery.status in (DeliveryStatus.PENDING, DeliveryStatus.PROCESSING):
                 return True
             if existing_delivery.status == DeliveryStatus.FAILED and existing_delivery.attempts < existing_delivery.max_attempts:
                 return True
@@ -215,6 +216,12 @@ class EventBus:
             if existing_delivery and self.repository.get_dead_letter_by_delivery_id(delivery_id, event.tenant_id):
                 continue
 
+            # If actively PROCESSING with a valid lease, do not re-enqueue or interrupt active worker
+            if existing_delivery and existing_delivery.status == DeliveryStatus.PROCESSING:
+                now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+                if existing_delivery.lease_expires_at and existing_delivery.lease_expires_at > now_iso:
+                    continue
+
             delivery = existing_delivery or EventDelivery(
                 delivery_id=delivery_id,
                 event_id=event.event_id,
@@ -223,18 +230,20 @@ class EventBus:
                 tenant_id=event.tenant_id,
                 status=DeliveryStatus.PENDING,
                 attempts=0,
-                max_attempts=SAGE_EVENT_BUS_MAX_RETRIES
+                max_attempts=SAGE_EVENT_BUS_MAX_RETRIES,
+                idempotency_key=delivery_id
             )
             
             if delivery.status == DeliveryStatus.FAILED:
                 # Reset status for retry if we are explicitly re-publishing
                 delivery.status = DeliveryStatus.PENDING
+                delivery.next_retry_at = None
 
             delivery = self.repository.record_delivery_attempt(delivery)
             
             try:
                 # We do not block publication if queue is full; we drop the in-memory dispatch trigger.
-                # Since the delivery is persisted as PENDING, a future sweeper/re-publisher could retry it.
+                # Since the delivery is persisted as PENDING, a future sweeper/re-publisher will recover it.
                 self.queue.put_nowait((delivery, event))
             except asyncio.QueueFull:
                 logger.warning(f"EventBus queue is full. Delivery {delivery.delivery_id} deferred.")
@@ -249,75 +258,97 @@ class EventBus:
                     break # Shutdown signal
                     
                 delivery, event = item
-                await self._process_delivery(delivery, event)
+                await self._process_delivery(delivery, event, respect_backoff=True)
                 self.queue.task_done()
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"EventBus Worker {worker_id} encountered unhandled error: {e}")
                 
-    async def _process_delivery(self, delivery: EventDelivery, event: CanonicalEvent):
-        """Attempts to invoke the subscriber callback and records results."""
-        # Tenant boundary check
+    async def _process_delivery(
+        self,
+        delivery: EventDelivery,
+        event: CanonicalEvent,
+        respect_backoff: bool = False,
+        lease_seconds: int = SAGE_EVENT_DELIVERY_LEASE_SECONDS
+    ) -> bool:
+        """
+        Attempts to claim the delivery atomically, invoke the subscriber callback outside DB tx,
+        and finalize the attempt with the acquired claim token.
+        Preserves at-least-once delivery semantics for crash recovery.
+        Returns True if processing succeeded or was already terminal success; False otherwise.
+        """
+        # Strict tenant boundary check
         if delivery.tenant_id != event.tenant_id:
             logger.error(f"Tenant boundary violation in _process_delivery: delivery tenant {delivery.tenant_id} != event tenant {event.tenant_id}")
-            return
+            return False
 
         if delivery.status == DeliveryStatus.SUCCESS:
-            return
+            return True
 
-        # Double check database state to avoid duplicate delivery or overwriting success
-        current = self.repository.get_delivery(delivery.delivery_id, delivery.tenant_id)
-        if current:
-            if current.status == DeliveryStatus.SUCCESS:
-                return
-            if self.repository.get_dead_letter_by_delivery_id(delivery.delivery_id, delivery.tenant_id):
-                return
+        # Acquire atomic database-backed lease claim
+        claimed = self.repository.claim_delivery(
+            delivery_id=delivery.delivery_id,
+            tenant_id=delivery.tenant_id,
+            lease_seconds=lease_seconds,
+            respect_backoff=respect_backoff
+        )
+        if not claimed:
+            # Cannot claim: actively leased, backoff window unexpired, already terminal success, or dead-lettered
+            logger.debug(f"Delivery {delivery.delivery_id} could not be claimed (active lease, backoff, or finalized).")
+            return False
 
-        delivery.attempts += 1
+        claim_token = claimed.claim_token
+        # Ensure stable idempotency_key is present on the delivery passed to subscriber
+        if not claimed.idempotency_key:
+            claimed.idempotency_key = claimed.delivery_id
 
-        callback = self._callbacks.get(delivery.subscription_id)
+        callback = self._callbacks.get(claimed.subscription_id)
         if not callback:
             # Subscriber offline or unregistered - transient failure eligible for bounded retry
-            delivery.status = DeliveryStatus.FAILED
-            delivery.last_error = "Subscriber callback not found in memory"
-        else:
-            try:
-                # Invoke isolated subscriber
-                success = await callback(delivery, event)
-                if success:
-                    delivery.status = DeliveryStatus.SUCCESS
-                    delivery.last_error = None
-                    delivery.next_retry_at = None
-                else:
-                    delivery.status = DeliveryStatus.FAILED
-                    delivery.last_error = "Subscriber returned failure"
-            except Exception as e:
-                delivery.status = DeliveryStatus.FAILED
-                delivery.last_error = f"Subscriber raised exception: {str(e)}"
-            
-        # Handle Retry / DeadLetter
-        if delivery.status == DeliveryStatus.FAILED:
-            if delivery.attempts < delivery.max_attempts:
-                # Calculate bounded exponential backoff
-                backoff_seconds = min(2 ** delivery.attempts, 60)
-                delivery.next_retry_at = (datetime.now(UTC) + timedelta(seconds=backoff_seconds)).isoformat().replace("+00:00", "Z")
-                delivery.status = DeliveryStatus.PENDING # Ready to be swept/retried
-            else:
-                # Exhausted retries -> Dead Letter
-                delivery.next_retry_at = None
-                dl = DeadLetter(
-                    dead_letter_id=f"dl_{uuid.uuid4().hex}",
-                    delivery_id=delivery.delivery_id,
-                    event_id=delivery.event_id,
-                    subscription_id=delivery.subscription_id,
-                    tenant_id=delivery.tenant_id,
-                    failure_reason=delivery.last_error or "Max retries exhausted",
-                    attempt_count=delivery.attempts
+            logger.warning(f"Subscriber callback missing for subscription {claimed.subscription_id} on delivery {claimed.delivery_id}")
+            self.repository.finalize_delivery(
+                delivery_id=claimed.delivery_id,
+                tenant_id=claimed.tenant_id,
+                claim_token=claim_token,
+                success=False,
+                error_msg="Subscriber callback not found in memory"
+            )
+            return False
+
+        # Invoke isolated subscriber callback outside of any database transaction
+        try:
+            success = await callback(claimed, event)
+            if success:
+                fin = self.repository.finalize_delivery(
+                    delivery_id=claimed.delivery_id,
+                    tenant_id=claimed.tenant_id,
+                    claim_token=claim_token,
+                    success=True
                 )
-                self.repository.record_dead_letter(dl)
-                
-        self.repository.record_delivery_attempt(delivery)
+                if not fin:
+                    logger.warning(
+                        f"Delivery {claimed.delivery_id} callback succeeded but claim token {claim_token[:8] if claim_token else ''} was superseded/expired."
+                    )
+                return bool(fin)
+            else:
+                self.repository.finalize_delivery(
+                    delivery_id=claimed.delivery_id,
+                    tenant_id=claimed.tenant_id,
+                    claim_token=claim_token,
+                    success=False,
+                    error_msg="Subscriber returned failure"
+                )
+                return False
+        except Exception as e:
+            self.repository.finalize_delivery(
+                delivery_id=claimed.delivery_id,
+                tenant_id=claimed.tenant_id,
+                claim_token=claim_token,
+                success=False,
+                error_msg=f"Subscriber raised exception: {str(e)}"
+            )
+            return False
 
     async def recover_pending_deliveries(
         self,
@@ -328,8 +359,8 @@ class EventBus:
     ) -> int:
         """
         Recovers and processes pending event deliveries stored in the repository.
-        Fetches pending deliveries, resolves the canonical event from EventRepository,
-        and dispatches them to subscriber callbacks.
+        Fetches pending deliveries and expired leases, resolves canonical events,
+        and dispatches them to subscriber callbacks under atomic claims.
         Returns the number of recovered deliveries processed.
         """
         if not self.enabled:
@@ -345,8 +376,13 @@ class EventBus:
                 logger.warning(f"Cannot recover pending deliveries: failed to load EventRepository: {e}")
                 return 0
                 
-        now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z") if respect_backoff else None
-        pending_deliveries = self.repository.get_pending_deliveries(tenant_id=tenant_id, limit=limit, now_iso=now_iso)
+        now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        pending_deliveries = self.repository.get_pending_deliveries(
+            tenant_id=tenant_id,
+            limit=limit,
+            now_iso=now_iso if respect_backoff else None,
+            include_stale_leases=True
+        )
         processed_count = 0
         
         for delivery in pending_deliveries:
@@ -371,8 +407,9 @@ class EventBus:
                 except asyncio.QueueFull:
                     logger.warning(f"Queue full during recovery for delivery {delivery.delivery_id}")
             else:
-                await self._process_delivery(delivery, event)
-                processed_count += 1
+                res = await self._process_delivery(delivery, event, respect_backoff=respect_backoff)
+                if res:
+                    processed_count += 1
                 
         return processed_count
 

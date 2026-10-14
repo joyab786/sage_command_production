@@ -6,6 +6,7 @@ from datetime import datetime, UTC
 
 class DeliveryStatus(str, Enum):
     PENDING = "PENDING"
+    PROCESSING = "PROCESSING"
     SUCCESS = "SUCCESS"
     FAILED = "FAILED"
 
@@ -39,6 +40,13 @@ class EventDelivery(BaseModel):
     next_retry_at: Optional[str] = Field(None, description="ISO-8601 timestamp for next allowed attempt")
     created_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat().replace("+00:00", "Z"))
     updated_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat().replace("+00:00", "Z"))
+    claim_token: Optional[str] = Field(None, description="Active lease claim token")
+    lease_expires_at: Optional[str] = Field(None, description="Active claim lease expiration ISO timestamp")
+    idempotency_key: Optional[str] = Field(None, description="Stable delivery idempotency key for subscriber deduplication")
+
+    def model_post_init(self, __context: Any) -> None:
+        if not self.idempotency_key:
+            self.idempotency_key = self.delivery_id
 
 class DeadLetter(BaseModel):
     """
