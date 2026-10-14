@@ -1,7 +1,7 @@
 # SageCommand V3 — Closed-Loop Learning Foundation Baseline & Security Audit Report
 
-**Prompt Reference:** Prompt 37, Prompt 37A, Prompt 37B, Prompt 37C & Prompt 37D (Security Corrections)  
-**Starting Baseline Git Commit:** `ac7c98abce18a49c05198cd1a35fe1e71edfc5d0`  
+**Prompt Reference:** Prompt 37, Prompt 37A, Prompt 37B, Prompt 37C, Prompt 37D, Prompt 37E, Prompt 37F & Prompt 37G (Final Lease-Expiry Race Correction)  
+**Starting Baseline Git Commit:** `424c4ffb9d8987e6319bb15867f2d8c8888a91ea`  
 **Branch:** `main`  
 **Repository:** `joyab786/sage_command_production`  
 **Local Workspace:** `E:\js\sage_command_production`  
@@ -33,7 +33,10 @@ As required by Prompt 37A, 37B, 37C, and 37D, the git commit history and audit d
 - **Prompt 37E Dedicated Documentation Commit:** `c4009af982b1674649414bf3f60bdaadf2134de7` (`docs(events): document atomic delivery claims and concurrent recovery safety (Prompt 37E)`) *(Corrected: superseded mismatched pre-push draft SHA `776c4ce3...`)*
 - **Prompt 37F Starting Baseline:** `c4009af982b1674649414bf3f60bdaadf2134de7`
 - **Prompt 37F Dedicated Implementation Commit:** `4944532c620b80db2a644e4252c2343cfdee06ca` (`fix(events): enforce lease expiration on finalization and safe callback renewal (Prompt 37F)`)
-- **Prompt 37F Dedicated Documentation Commit:** Recorded at final remote HEAD (`docs(events): document lease expiration enforcement and callback renewal safety (Prompt 37F)`)
+- **Prompt 37F Dedicated Documentation Commit:** `424c4ffb9d8987e6319bb15867f2d8c8888a91ea` (`docs(events): document lease expiration enforcement and callback renewal safety (Prompt 37F)`)
+- **Prompt 37G Starting Baseline:** `424c4ffb9d8987e6319bb15867f2d8c8888a91ea`
+- **Prompt 37G Dedicated Implementation Commit:** `1d17eb3bf640b376f5a14a4999436867a6a227a1` (`fix(events): correct finalization and renewal timestamp ordering under SQLite lock contention (Prompt 37G)`)
+- **Prompt 37G Dedicated Documentation Commit:** Recorded at final remote HEAD (`docs(events): document SQLite lock contention timestamp ordering correction (Prompt 37G)`)
 
 ---
 
@@ -639,5 +642,147 @@ Implemented in `backend/test_v3_closed_loop_learning.py` under `TestPrompt37FLea
 1. **At-Least-Once Delivery Side-Effect Risk:** If a subscriber callback executes non-idempotent side effects (such as network API calls or file writes) and the worker process is terminated before `finalize_delivery()` commits, the sweeper will recover the expired lease and dispatch the event again. Subscribers MUST deduplicate external actions using the invariant `delivery.idempotency_key`.
 2. **Network Partitions during Heartbeat:** If a database connection is lost during callback execution, lease renewals may fail. When the callback finishes, `finalize_delivery()` will safely reject finalization if the lease has expired, preventing stale writes.
 3. **No Autonomous Rule or Model Mutation:** The closed-loop learning foundation records auditable feedback and continuous verification evidence; it does NOT alter policy rules or model weights.
+
+---
+
+## 12. Final Lease-Expiry Race Correction (Prompt 37G)
+
+### 12.1 Problem Statement & Concurrency Defect Resolved
+In Prompt 37F, `finalize_delivery()` and `renew_delivery_lease()` evaluated the current timestamp (`now_iso`) before obtaining the SQLite write lock. If concurrent write activity or disk I/O in SQLite delayed lock acquisition until after the claim's lease expired, the atomic SQL predicate compared `lease_expires_at >= :now_iso` using the stale pre-lock timestamp. This introduced a time-of-check / time-of-use (TOCTOU) race condition that could accept an expired claim or resurrect a superseded delivery attempt.
+
+Prompt 37G completely resolves this race by strictly enforcing write-lock acquisition before deriving the authoritative UTC timestamp:
+1. **Acquire Write Lock First (`BEGIN IMMEDIATE;`):** When entering the transaction in `finalize_delivery()`, `renew_delivery_lease()`, and `claim_delivery()`, SQLite's reserved write lock is acquired immediately via `conn.execute("BEGIN IMMEDIATE;")`.
+2. **Post-Lock Authoritative Timestamp Evaluation:** Only *after* write authorization is secured does the repository compute `effective_now_iso = datetime.now(timezone.utc).isoformat()`. (Any test-only injected timestamp is explicitly isolated for deterministic clock manipulation and documented as such).
+3. **Atomic Tenant-Scoped Predicate:** The SQL update executes within the acquired lock using the fresh, authoritative timestamp.
+4. **Guaranteed Transaction Rollback:** On predicate failure (0 rows matched) or error, transactions are rolled back and the connection closed cleanly in a `try...finally:` block.
+5. **No Long-Running Transaction in Callbacks:** Database locks are held strictly during short, bounded repository operations; subscriber callback execution never holds an open database transaction or connection.
+
+### 12.2 Implementation Details (`EventDeliveryRepository`)
+
+#### 1. Finalization (`finalize_delivery`)
+```python
+conn = self._get_connection()
+try:
+    conn.execute("BEGIN IMMEDIATE;")
+    effective_now_iso = (
+        now_iso if now_iso is not None else datetime.now(timezone.utc).isoformat()
+    )
+    cursor = conn.execute(
+        """
+        UPDATE deliveries
+        SET status = :new_status,
+            claim_token = NULL,
+            lease_expires_at = NULL,
+            last_error = :error_msg,
+            next_retry_at = :next_retry_at,
+            updated_at = :now_iso
+        WHERE delivery_id = :delivery_id
+          AND tenant_id = :tenant_id
+          AND claim_token = :claim_token
+          AND UPPER(status) = 'PROCESSING'
+          AND lease_expires_at IS NOT NULL
+          AND lease_expires_at >= :now_iso;
+        """,
+        {
+            "delivery_id": delivery_id,
+            "tenant_id": tenant_id,
+            "claim_token": claim_token,
+            "new_status": new_status.value,
+            "error_msg": error_message,
+            "next_retry_at": next_retry_iso,
+            "now_iso": effective_now_iso,
+        },
+    )
+    if cursor.rowcount == 0:
+        conn.rollback()
+        return None
+    conn.commit()
+    # retrieve and return updated delivery...
+finally:
+    conn.close()
+```
+
+#### 2. Lease Renewal (`renew_delivery_lease`)
+```python
+conn = self._get_connection()
+try:
+    conn.execute("BEGIN IMMEDIATE;")
+    effective_now_iso = (
+        now_iso if now_iso is not None else datetime.now(timezone.utc).isoformat()
+    )
+    new_expires_dt = datetime.fromisoformat(effective_now_iso) + timedelta(seconds=extension_seconds)
+    cursor = conn.execute(
+        """
+        UPDATE deliveries
+        SET lease_expires_at = :new_expires_iso,
+            updated_at = :now_iso
+        WHERE delivery_id = :delivery_id
+          AND tenant_id = :tenant_id
+          AND claim_token = :claim_token
+          AND UPPER(status) = 'PROCESSING'
+          AND lease_expires_at IS NOT NULL
+          AND lease_expires_at >= :now_iso
+          AND NOT EXISTS (
+              SELECT 1 FROM dead_letters WHERE delivery_id = :delivery_id AND tenant_id = :tenant_id
+          );
+        """,
+        ...
+    )
+    if cursor.rowcount == 0:
+        conn.rollback()
+        return None
+    conn.commit()
+    # retrieve and return updated delivery...
+finally:
+    conn.close()
+```
+
+#### 3. Preserved Concurrency Guarantees
+- **Stale Claim Token Rejection:** Token mismatch matches 0 rows and returns `None`.
+- **Superseded Claim Protection:** New worker claims cannot be overwritten by earlier workers.
+- **SUCCESS Immutability:** `UPPER(status) = 'PROCESSING'` prevents overwriting or downgrading `SUCCESS`.
+- **Dead-Letter Immunity:** Dead-lettered deliveries cannot be renewed.
+- **Tenant Isolation:** Cross-tenant parameters raise `ValueError` and fail closed.
+- **At-Least-Once Delivery Semantics:** Preserved with stable `idempotency_key` deduplication across retries.
+- **No Claim of Exactly-Once Execution:** SageCommand provides at-least-once delivery; external side effects must be handled idempotently by subscribers.
+
+### 12.3 Real SQLite Lock-Contention Regression Tests (Tests 101–102)
+Implemented in `backend/test_v3_closed_loop_learning.py` under `TestPrompt37GLockContentionAndExpiryRaceCorrection`:
+
+- **Test 101 (`test_101_finalization_after_expiry_while_waiting_for_write_lock`):**
+  1. Creates a processing delivery with valid claim token and a 0.2s lease.
+  2. Spawns a background thread that opens a separate SQLite connection and executes `BEGIN IMMEDIATE;`, holding the write lock. Signals an event when locked.
+  3. Spawns a worker thread that invokes `finalize_delivery(delivery_id, tenant_id, claim_token, EventDeliveryStatus.SUCCESS)`.
+  4. The worker blocks waiting for the SQLite write lock.
+  5. The main test thread sleeps 0.25s until the delivery lease elapses.
+  6. The blocker thread releases the write lock (`conn.commit(); conn.close()`).
+  7. The worker acquires the lock, derives `effective_now_iso` (now > expiry), evaluates the predicate, matches 0 rows, and rolls back.
+  8. Asserts that `finalize_delivery()` returns `None`, the claim was NOT finalized as `SUCCESS`, and the delivery remains uncorrupted in `PROCESSING`.
+
+- **Test 102 (`test_102_renewal_after_expiry_while_waiting_for_write_lock`):**
+  1. Creates a processing delivery with valid claim token and a 0.2s lease.
+  2. Holds a competing SQLite write lock on a separate connection via `BEGIN IMMEDIATE;`.
+  3. Spawns a worker thread that invokes `renew_delivery_lease(delivery_id, tenant_id, claim_token, extension_seconds=5.0)`.
+  4. The worker blocks waiting for the SQLite write lock.
+  5. The main test thread sleeps 0.25s until the delivery lease elapses.
+  6. The blocker releases the lock (`conn.commit(); conn.close()`).
+  7. The worker acquires the lock, derives post-lock `effective_now_iso`, evaluates the predicate, matches 0 rows, and rolls back.
+  8. Asserts that `renew_delivery_lease()` returns `None`, the expired lease is NOT extended, and the claim cannot be resurrected.
+
+### 12.4 Verification & Regression Matrix (Prompt 37G)
+- `backend/test_v3_closed_loop_learning.py`: **102 passed** (18.19s)
+- `backend/test_v3_event_driven_architecture.py`: **5 passed** (1.28s)
+- `backend/test_v3_event_model.py`: **33 passed** (1.76s)
+- `backend/test_v3_continuous_verification.py`: **128 passed** (11.05s)
+- `backend/test_v3_security.py`: **14 passed** (1.49s)
+- `backend/test_v3_security_integration.py`: **16 passed** (2.05s)
+- `backend/test_v3_authorization.py`: **19 passed** (1.96s)
+- **Focused & Subsystem Suites Total: 317 passed, 0 failed.**
+
+### 12.5 Remaining Risks & System Boundaries
+1. **At-Least-Once Delivery Execution Boundary:** If a subscriber callback executes external side effects (e.g., webhook notifications, external database writes) and crashes before `finalize_delivery()` commits to SQLite, the lease will expire and the delivery will be retried. SageCommand preserves at-least-once delivery; subscribers MUST use `delivery.idempotency_key` for idempotent external execution.
+2. **SQLite Write Concurrency Under Extreme Load:** SQLite serializes write transactions. Under extreme multi-threaded write contention exceeding connection timeouts, callers receive operational errors handled cleanly via backoff and retry.
+3. **No Distributed Consensus or Out-of-Scope Dependencies:** In accordance with architectural boundaries, SageCommand operates reliably on SQLite WAL mode without adding distributed lock servers or external messaging queues.
+
 
 
