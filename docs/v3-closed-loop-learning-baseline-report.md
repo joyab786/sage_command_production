@@ -30,7 +30,10 @@ As required by Prompt 37A, 37B, 37C, and 37D, the git commit history and audit d
 - **Prompt 37D Dedicated Documentation Commit:** `7c73940316b89308f266c159abd03a09e17a02af` (`docs(events): document event delivery recovery state and publication error sanitization (Prompt 37D)`)
 - **Prompt 37E Starting Baseline:** `7c73940316b89308f266c159abd03a09e17a02af`
 - **Prompt 37E Dedicated Implementation Commit:** `00473589ca824f4fd8942f10eb217c884af7b164` (`fix(events): implement atomic delivery claims, leases, and concurrency safety (Prompt 37E)`)
-- **Prompt 37E Dedicated Documentation Commit:** `776c4ce3d514db07070743dbe034782655accc31` (`docs(events): document atomic delivery claims and concurrent recovery safety (Prompt 37E)`)
+- **Prompt 37E Dedicated Documentation Commit:** `c4009af982b1674649414bf3f60bdaadf2134de7` (`docs(events): document atomic delivery claims and concurrent recovery safety (Prompt 37E)`) *(Corrected: superseded mismatched pre-push draft SHA `776c4ce3...`)*
+- **Prompt 37F Starting Baseline:** `c4009af982b1674649414bf3f60bdaadf2134de7`
+- **Prompt 37F Dedicated Implementation Commit:** `4944532c620b80db2a644e4252c2343cfdee06ca` (`fix(events): enforce lease expiration on finalization and safe callback renewal (Prompt 37F)`)
+- **Prompt 37F Dedicated Documentation Commit:** Recorded at final remote HEAD (`docs(events): document lease expiration enforcement and callback renewal safety (Prompt 37F)`)
 
 ---
 
@@ -550,4 +553,91 @@ Implemented in `backend/test_v3_closed_loop_learning.py` (`TestPrompt37EAtomicCl
 4. **Model Weight Fine-Tuning:** Dynamic training or weight adjustment is deferred.
 5. **Autonomous Action Approval:** Human-in-the-loop governance remains mandatory for all physical operational actions.
 6. **LangGraph Identity Context Propagation:** Tool registration deferred until request-scoped security context is added to LangGraph `ToolNode`.
+
+---
+
+## 11. Lease Expiration Enforcement & Long-Running Callback Safety (Prompt 37F)
+
+### 11.1 Problem Statement & Concurrency Race Closed
+Under Prompt 37E, `finalize_delivery()` verified matching `claim_token` and `status != SUCCESS`, but lacked an atomic predicate enforcing `lease_expires_at >= now_iso`. Consequently, if a worker's lease expired but no competing worker had yet claimed the delivery, the stale worker could still finalize the delivery as `SUCCESS` or `FAILED`. Furthermore, subscriber callbacks executing longer than the default lease (`SAGE_EVENT_DELIVERY_LEASE_SECONDS = 30`) could experience silent lease expiration while running legitimately, creating a concurrency race where background recovery sweepers would re-dispatch the in-flight delivery to a second worker.
+
+Prompt 37F completely resolves both issues without creating competing event buses or repositories:
+1. **Enforced Lease Expiration on Finalization:** An attempt cannot finalize if its lease has expired, even if no replacement worker has claimed the delivery yet.
+2. **Safe Heartbeat Lease Renewal for Active Callbacks:** A tenant-scoped, claim-token-guarded background heartbeat extends the lease while subscriber code executes, stopping cleanly upon completion or cancellation.
+
+### 11.2 Architectural Invariants & Predicate Hardening
+
+#### 1. Atomic Database Predicate on Finalization (`finalize_delivery`)
+The final state transition is governed by an atomic SQL predicate with rowcount verification:
+```sql
+UPDATE deliveries
+SET status = :new_status,
+    claim_token = NULL,
+    lease_expires_at = NULL,
+    last_error = :error_msg,
+    next_retry_at = :next_retry_at,
+    updated_at = :now_iso
+WHERE delivery_id = :delivery_id
+  AND tenant_id = :tenant_id
+  AND claim_token = :claim_token
+  AND UPPER(status) = 'PROCESSING'
+  AND lease_expires_at IS NOT NULL
+  AND lease_expires_at >= :now_iso
+```
+- **Expired Lease Rejection:** If `lease_expires_at < now_iso`, the update matches 0 rows and returns `None`. The expired attempt cannot mutate the delivery.
+- **Superseded Lease Rejection:** If another worker claimed the delivery, `claim_token` does not match, matching 0 rows and returning `None`.
+- **Non-Downgrade of SUCCESS:** If the delivery reached `SUCCESS`, `UPPER(status) = 'PROCESSING'` fails, guaranteeing that `SUCCESS` cannot be overwritten or downgraded by a late worker.
+- **Race Serialization:** Write serialization guarantees that concurrent finalization and claim takeover resolve deterministically to exactly one valid state transition.
+
+#### 2. Lease Renewal Heartbeat Architecture (`renew_delivery_lease`)
+To protect legitimate long-running callbacks:
+- **Repository Method:** `renew_delivery_lease(delivery_id, tenant_id, claim_token, extension_seconds, now_iso) -> Optional[EventDelivery]`.
+- **Predicate:** Extends `lease_expires_at` only if:
+  - `delivery_id = ? AND tenant_id = ?`
+  - `claim_token = ?`
+  - `UPPER(status) = 'PROCESSING'`
+  - `lease_expires_at IS NOT NULL AND lease_expires_at >= :now_iso` (cannot resurrect expired claim)
+  - `NOT EXISTS (SELECT 1 FROM dead_letters ...)`
+- **Isolated Heartbeat Loop in `EventBus._process_delivery()`:**
+  - Interval: `min(SAGE_EVENT_DELIVERY_HEARTBEAT_INTERVAL_SECONDS, max(0.05, lease_seconds / 3.0))` (default 10s for 30s lease; dynamically scales down for sub-second test leases).
+  - Uses `asyncio.wait_for(stop_event.wait(), timeout)` to allow instantaneous shutdown without delay.
+  - Lifecycle: spawned immediately before `await callback(claimed, event)` and deterministically stopped, cancelled, and awaited in `finally:`.
+  - Subscriber execution never holds a database connection or transaction open.
+
+#### 3. Recovery Sweeper Behavior & Crash Recovery
+- **Sweeper Eligibility:** `get_pending_deliveries()` retrieves only `PENDING` deliveries (respecting backoff) and genuinely expired `PROCESSING` deliveries (`lease_expires_at <= now_iso`).
+- **Live Callback Immunity:** Active callbacks renewing their leases keep `lease_expires_at > now_iso`, preventing sweepers from reclaiming in-flight deliveries.
+- **Worker Crash Handling:** If a worker process or container crashes, the heartbeat terminates immediately. Once `lease_expires_at` elapses, background sweepers or queue workers reclaim the delivery under a new claim token.
+- **At-Least-Once Delivery Truthfulness:** If a subscriber performs non-idempotent external actions before crashing prior to SQLite commit, the delivery will eventually be retried. SageCommand does not claim impossible distributed exactly-once side effects; subscribers rely on `delivery.idempotency_key` for deduplication.
+
+### 11.3 Concurrency & Lifecycle Test Matrix (Tests 89–100)
+Implemented in `backend/test_v3_closed_loop_learning.py` under `TestPrompt37FLeaseExpirationAndCallbackSafety`:
+- **Test 89 (`test_89_expired_claim_cannot_finalize_even_when_no_new_claim_exists`):** Verifies that an expired claim cannot finalize even when no replacement claim exists. Returns `None`; database status remains `PROCESSING`.
+- **Test 90 (`test_90_superseded_claim_cannot_finalize_after_another_worker_claims`):** Verifies that an old claim token cannot finalize after another worker takes over the claim. Success is finalized only by the current worker.
+- **Test 91 (`test_91_live_callback_renews_lease_and_prevents_sweeper_takeover`):** Demonstrates that a live callback running longer than its initial lease renews via heartbeat and is not reclaimed by concurrent sweeps.
+- **Test 92 (`test_92_renewal_fails_for_stale_claim_token`):** Stale claim tokens cannot renew a lease held by another worker.
+- **Test 93 (`test_93_renewal_fails_after_lease_expiration`):** Renewal is rejected if the lease has already expired; expired claims cannot be resurrected.
+- **Test 94 (`test_94_renewal_cannot_modify_success_or_dead_lettered`):** Renewal returns `None` for completed `SUCCESS` and dead-lettered `FAILED` deliveries.
+- **Test 95 (`test_95_worker_crash_or_cancelled_callback_permits_recovery`):** Worker task cancellation terminates heartbeat, allowing the expired lease to be recovered by the sweeper and processed to `SUCCESS`.
+- **Test 96 (`test_96_finalization_racing_with_lease_takeover_produces_one_valid_transition`):** Concurrent finalization and claim takeover race resolves to exactly one valid atomic transition.
+- **Test 97 (`test_97_cross_tenant_renewal_and_finalization_rejected`):** Cross-tenant renewals and finalizations raise `ValueError` and fail closed.
+- **Test 98 (`test_98_successful_delivery_not_invoked_again_by_replay_or_recovery`):** Replays and sweeps on `SUCCESS` deliveries return `True` without re-invoking subscriber callbacks.
+- **Test 99 (`test_99_retry_exhaustion_dead_letter_and_idempotency_key_invariant`):** Bounded retries, backoff, dead-letter recording, redrive, and stable `idempotency_key` are preserved across attempts.
+- **Test 100 (`test_100_all_prompt_37a_to_37f_regressions_verified`):** Multi-tenant end-to-end publishing, matching, claim acquisition, renewal, and finalization regression verified.
+
+### 11.4 Verification & Regression Matrix (Prompt 37F)
+- `backend/test_v3_closed_loop_learning.py`: **100 passed** (18.00s)
+- `backend/test_v3_event_driven_architecture.py`: **5 passed** (1.28s)
+- `backend/test_v3_event_model.py`: **33 passed** (1.76s)
+- `backend/test_v3_continuous_verification.py`: **128 passed** (11.05s)
+- `backend/test_v3_security.py`: **14 passed** (1.49s)
+- `backend/test_v3_security_integration.py`: **16 passed** (2.05s)
+- `backend/test_v3_authorization.py`: **19 passed** (1.96s)
+- **Focused & Subsystem Suites Total: 315 passed, 0 failed.**
+
+### 11.5 Remaining Risks & System Boundaries
+1. **At-Least-Once Delivery Side-Effect Risk:** If a subscriber callback executes non-idempotent side effects (such as network API calls or file writes) and the worker process is terminated before `finalize_delivery()` commits, the sweeper will recover the expired lease and dispatch the event again. Subscribers MUST deduplicate external actions using the invariant `delivery.idempotency_key`.
+2. **Network Partitions during Heartbeat:** If a database connection is lost during callback execution, lease renewals may fail. When the callback finishes, `finalize_delivery()` will safely reject finalization if the lease has expired, preventing stale writes.
+3. **No Autonomous Rule or Model Mutation:** The closed-loop learning foundation records auditable feedback and continuous verification evidence; it does NOT alter policy rules or model weights.
+
 

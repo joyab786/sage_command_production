@@ -427,3 +427,72 @@ Prior to Prompt 37E, `EventBus._process_delivery()` inspected delivery status vi
 5. **Stable Subscriber Idempotency Keys:**
    - `delivery.idempotency_key` is populated deterministically from the cryptographic `delivery_id` and remains invariant across all retry attempts.
    - External subscribers can use `delivery.idempotency_key` for reliable idempotency tracking and external side-effect deduplication.
+
+---
+
+## 16. Lease Expiration Enforcement & Long-Running Callback Safety (Prompt 37F)
+
+### 16.1 Motivation & Lifecycle Defect Closed
+Prompt 37E established atomic database claims and leases for delivery attempts, but left two critical edge cases:
+1. **Unenforced Lease Expiration on Finalization:** `finalize_delivery()` checked that the worker's `claim_token` matched, but did not verify `lease_expires_at >= now_iso`. An expired worker whose delivery was not yet reclaimed by another worker could still finalize the delivery.
+2. **Silent Expiry during Long-Running Callbacks:** Legitimate subscriber callbacks running longer than the default lease (30 seconds) could lose their claim silently, enabling the background sweeper or a competing worker to concurrently re-claim and re-invoke the callback.
+
+Prompt 37F definitively resolves both edge cases while maintaining Prompt 37A–37E invariants, tenant boundaries, and bounded retries.
+
+### 16.2 Enforced Lease Expiration on Finalization
+In `EventDeliveryRepository.finalize_delivery()`, the state transition is guarded by an atomic database predicate:
+```sql
+UPDATE deliveries
+SET status = :new_status,
+    claim_token = NULL,
+    lease_expires_at = NULL,
+    last_error = :error_msg,
+    next_retry_at = :next_retry_at,
+    updated_at = :now_iso
+WHERE delivery_id = :delivery_id
+  AND tenant_id = :tenant_id
+  AND claim_token = :claim_token
+  AND UPPER(status) = 'PROCESSING'
+  AND lease_expires_at IS NOT NULL
+  AND lease_expires_at >= :now_iso
+```
+- **Expired Claims Fail Closed:** If `lease_expires_at < now_iso`, the atomic update matches 0 rows and returns `None`. An expired worker cannot finalize its attempt, even if no other worker has claimed the delivery yet.
+- **Superseded Claims Rejected:** If another worker claimed the delivery, `claim_token` does not match, returning `None`.
+- **Non-Downgrade of SUCCESS:** If the delivery has reached terminal `SUCCESS`, `status = 'PROCESSING'` fails, ensuring `SUCCESS` cannot be downgraded or altered by late replays or sweeps.
+- **Race Serialization:** Because SQLite serializes writes, concurrent finalization and claim takeover resolve deterministically to exactly one valid transition.
+
+### 16.3 Long-Running Callback Safety via Heartbeat Lease Renewal
+To protect legitimate callbacks running longer than the initial lease:
+1. **Atomic Lease Extension (`renew_delivery_lease`):**
+   - Extends `lease_expires_at` only for the active, unexpired claim token:
+   ```sql
+   UPDATE deliveries
+   SET lease_expires_at = :new_lease_expires_at,
+       updated_at = :now_iso
+   WHERE delivery_id = :delivery_id
+     AND tenant_id = :tenant_id
+     AND claim_token = :claim_token
+     AND UPPER(status) = 'PROCESSING'
+     AND lease_expires_at IS NOT NULL
+     AND lease_expires_at >= :now_iso
+     AND NOT EXISTS (
+         SELECT 1 FROM dead_letters dl
+         WHERE dl.delivery_id = deliveries.delivery_id
+           AND dl.tenant_id = deliveries.tenant_id
+     )
+   ```
+   - Rejects stale tokens, expired claims (cannot resurrect), terminal `SUCCESS`, and dead letters.
+   - Raises `ValueError` on cross-tenant renewal attempts.
+
+2. **Heartbeat Lifecycle in `EventBus._process_delivery()`:**
+   - Interval: `min(SAGE_EVENT_DELIVERY_HEARTBEAT_INTERVAL_SECONDS, max(0.05, lease_seconds / 3.0))` (default 10s for 30s lease; dynamically scales down for sub-second test leases).
+   - Spawned immediately prior to `await callback(claimed, event)`.
+   - Cleanly stopped, cancelled, and awaited in the `finally:` block of `_process_delivery()`.
+   - Subscriber execution runs completely outside database transactions; renewals run in brief, non-blocking atomic writes.
+
+### 16.4 Sweeper Behavior & Crash Recovery Semantics
+- **Sweeper Eligibility:** `get_pending_deliveries()` retrieves only `PENDING` deliveries and genuinely expired `PROCESSING` deliveries (`lease_expires_at <= now_iso`).
+- **Live Callback Immunity:** Active callbacks renewing their leases keep `lease_expires_at > now_iso`, preventing sweepers from reclaiming in-flight deliveries.
+- **Crash Recovery:** If a worker crashes or is cancelled, the heartbeat terminates immediately. Once `lease_expires_at` elapses, background sweepers or queue workers reclaim the delivery under a new claim token.
+- **At-Least-Once Delivery Truthfulness:** If a subscriber performs non-idempotent external actions before crashing prior to SQLite commit, the delivery will eventually be retried. SageCommand does not claim impossible distributed exactly-once side effects; subscribers rely on `delivery.idempotency_key` for deduplication.
+
