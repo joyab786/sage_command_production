@@ -1,17 +1,17 @@
 # SageCommand V3 — Closed-Loop Learning Foundation Baseline & Security Audit Report
 
-**Prompt Reference:** Prompt 37, Prompt 37A, Prompt 37B & Prompt 37C (Security Corrections)  
-**Starting Baseline Git Commit:** `dd74214dbc8b4543948e9e17eed8c9cd206ea51a`  
+**Prompt Reference:** Prompt 37, Prompt 37A, Prompt 37B, Prompt 37C & Prompt 37D (Security Corrections)  
+**Starting Baseline Git Commit:** `ac7c98abce18a49c05198cd1a35fe1e71edfc5d0`  
 **Branch:** `main`  
 **Repository:** `joyab786/sage_command_production`  
 **Local Workspace:** `E:\js\sage_command_production`  
-**Date:** October 13, 2026  
+**Date:** October 14, 2026  
 
 ---
 
 ## 1. Commit Audit Trail & Baseline Correction
 
-As required by Prompt 37A, 37B, and 37C, the git commit history and audit documentation have been reconciled against actual git history:
+As required by Prompt 37A, 37B, 37C, and 37D, the git commit history and audit documentation have been reconciled against actual git history:
 
 - **Original Prompt 37 Implementation Commit:** `bad6c5cc5f90f99cde5edb02f73470239a03bd94` (`feat(verification): add governed closed-loop learning foundation (Prompt 37)`)  
   *(Audit Correction Note: In the initial Prompt 37 baseline report, the implementation commit SHA was omitted and only the pre-Prompt 37 baseline `8c18e674...` was referenced. This is now explicitly corrected and recorded above with the exact verified SHA.)*
@@ -24,7 +24,10 @@ As required by Prompt 37A, 37B, and 37C, the git commit history and audit docume
 - **Prompt 37B Dedicated Documentation Commit:** `dd74214dbc8b4543948e9e17eed8c9cd206ea51a` (`docs(security): document event fingerprint isolation and deduplication safety (Prompt 37B)`)
 - **Prompt 37C Starting Baseline:** `dd74214dbc8b4543948e9e17eed8c9cd206ea51a`
 - **Prompt 37C Dedicated Implementation Commit:** `53f63a3819bb0b9f9dd93205dabb56b38cc82f93` (`fix(security): enforce returned event integrity and publication failure recovery (Prompt 37C)`)
-- **Prompt 37C Dedicated Documentation Commit:** `docs(security): document returned event integrity and publication failure recovery (Prompt 37C)`
+- **Prompt 37C Dedicated Documentation Commit:** `ac7c98abce18a49c05198cd1a35fe1e71edfc5d0` (`docs(security): document returned event integrity and publication failure recovery (Prompt 37C)`)
+- **Prompt 37D Starting Baseline:** `ac7c98abce18a49c05198cd1a35fe1e71edfc5d0`
+- **Prompt 37D Dedicated Implementation Commit:** `370603a19834d8bc87c2cbe6cb82f708853f64b2` (`fix(events): ensure missing-subscriber recovery, bounded retries, and sanitized publication errors (Prompt 37D)`)
+- **Prompt 37D Dedicated Documentation Commit:** `544ce38e61e7184a37e5ad0591e807a1299484ba` (`docs(events): document event delivery recovery state and publication error sanitization (Prompt 37D)`)
 
 ---
 
@@ -363,6 +366,86 @@ Implemented in `backend/test_v3_closed_loop_learning.py` (`TestEventReturnIntegr
 - `backend/test_v3_confidence_uncertainty.py` & `backend/test_v3_authorization.py`: 171 passed (7.94s)
 - **Total:** **788 passed, 0 failed.**
 
-### 8.6 Remaining Limitations
+### 8.6 Remaining Limitations (Prompt 37C)
 1. **Historical Legacy Event Backfill:** Pre-Prompt 37B events lacking workspace/plant scope fail closed on deduplication. An explicit migration script is required if replay support for historical events is needed.
 2. **LangGraph Copilot Tool Exposure:** Verification tools remain unregistered pending request-scoped identity propagation in LangGraph subagent `ToolNode`.
+
+---
+
+## 9. Event Delivery Recovery State & Safe Publication Errors (Prompt 37D)
+
+### 9.1 Missing-Subscriber Recovery and Bounded Exponential Backoff
+1. **Transient Missing-Callback Handling:**
+   - In `backend/services/event_bus.py`, `_process_delivery()` previously marked deliveries as `FAILED` and returned immediately when their in-memory callback was absent. Because the sweeper only queries `status = 'PENDING'`, deliveries remained permanently stranded in `FAILED`.
+   - Under Prompt 37D, a missing subscriber callback is treated as a transient failure condition subject to bounded exponential backoff (`backoff_seconds = min(2 ** attempts, 60)`).
+   - If `delivery.attempts < delivery.max_attempts`, the delivery is updated to `status = DeliveryStatus.PENDING` with `next_retry_at` set.
+   - Once the callback is registered (e.g. subscriber restarts or late registration), the recovery sweeper (`recover_pending_deliveries()`) or next publication attempt fulfills the delivery to `SUCCESS`.
+2. **Deterministic Retry Exhaustion & Dead-Lettering:**
+   - When attempts reach `max_attempts` without successful delivery, `delivery.status` transitions to `FAILED`, `next_retry_at` is cleared, and an immutable `DeadLetter` record is recorded in `dead_letters`.
+   - Terminally exhausted deliveries are **never retried indefinitely**. Both `has_unfulfilled_deliveries()` and `publish()` skip deliveries with existing dead letter records.
+   - An administrative redrive path (`EventDeliveryRepository.redrive_dead_letter(dead_letter_id, tenant_id)` and `EventBus.redrive_dead_letter(...)`) allows operators to re-arm dead-lettered deliveries to `PENDING` with attempts reset to 0, strictly within tenant boundaries.
+
+### 9.2 Safe Publication Error Sanitization & Request Correlation
+1. **Sanitizing API Publication Responses (`backend/api/event_routes.py`):**
+   - Raw exception details (`str(pub_err)`) have been eliminated from all client responses in both initial publication and replay-retry paths.
+   - Client responses return stable, safe status messages:
+     - Initial publication failure: `"Event persisted but publication encountered transient error."`
+     - Replay retry failure: `"Event persisted but publication retry encountered transient error."`
+   - Client-facing messages accurately indicate that the event was safely persisted in `EventRepository` and was not rolled back.
+2. **Diagnostic Server-Side Logging & Redaction:**
+   - Detailed exception traces are logged strictly server-side using `governance.redaction.sanitize_log_message()` to ensure passwords, tokens, API keys, and private credentials are never written to logs.
+   - Request correlation is preserved via `X-Correlation-ID` response headers and structured log tags.
+
+### 9.3 Delivery Idempotency & Tenant Boundary Protection
+1. **Non-Downgrade Delivery Protection (`EventDeliveryRepository.record_delivery_attempt`):**
+   - Implemented database-level and application-level guards ensuring that a delivery with `status = 'SUCCESS'` can **never be reset or downgraded** back to `PENDING` or `FAILED` by concurrent workers, sweeper loops, or replay requests.
+   - Cross-tenant updates (`delivery.tenant_id != existing.tenant_id`) are rejected with `ValueError`.
+2. **Cross-Tenant Recovery Resolution Barrier:**
+   - In `EventBus.recover_pending_deliveries()`, tenant scoping is strictly validated. The sweeper retrieves only deliveries matching the target tenant.
+   - `repo.get_event(delivery.tenant_id, delivery.event_id)` resolves the canonical event strictly under the delivery's own `tenant_id`, preventing any cross-tenant resolution.
+
+### 9.4 Focused Recovery Tests Execution Details (Tests 69–77)
+Implemented in `backend/test_v3_closed_loop_learning.py` (`TestPrompt37DRecoveryStateAndSafePublicationErrors`):
+- **Test 69 (`test_69_delivery_becomes_pending_after_transient_subscriber_failure`):**
+  A subscriber callback failure transitions the delivery to `PENDING` with `attempts = 1` and `next_retry_at` set with exponential backoff.
+- **Test 70 (`test_70_missing_callback_transitions_delivery_to_pending_without_stranding`):**
+  When a callback is missing from memory, `_process_delivery()` sets `last_error = "Subscriber callback not found in memory"`, increments `attempts = 1`, and transitions to `PENDING`. Delivery is **never stranded** in `FAILED`.
+- **Test 71 (`test_71_callback_becomes_available_before_retry_exhaustion`):**
+  When a missing callback is registered before retry exhaustion, subsequent processing succeeds, updating status to `SUCCESS` with `attempts = 2` and clearing `next_retry_at`.
+- **Test 72 (`test_72_background_recovery_processes_pending_delivery`):**
+  `recover_pending_deliveries()` sweeps pending deliveries from the SQLite repository, resolves canonical events, and dispatches them to subscriber callbacks to achieve `SUCCESS`.
+- **Test 73 (`test_73_successful_delivery_not_delivered_again_by_subsequent_sweeps`):**
+  A delivery already marked `SUCCESS` is not retrieved by subsequent sweeps (0 swept), and re-publication skips it with 0 duplicate callback executions.
+- **Test 74 (`test_74_retry_exhaustion_follows_max_attempts_and_dead_letter_policy`):**
+  Repeated failures exhaust `max_attempts` (3 attempts), creating an immutable `DeadLetter` record, transitioning to `FAILED`, and stopping automatic retry. Administrative `redrive_dead_letter()` safely re-arms to `PENDING` with attempts reset to 0.
+- **Test 75 (`test_75_raw_internal_exception_absent_from_api_responses`):**
+  Deliberately injected sensitive error messages (`"DatabaseSecretPassword123!"`, `"Bearer_Token_abc_xyz"`, `"InternalReplaySecretCredentials999!"`) are verified absent from client HTTP responses across both initial publication and replay-retry paths. Safe message returned with `X-Correlation-ID` header preserved.
+- **Test 76 (`test_76_event_persisted_before_publication_failure_remains_available_for_idempotent_recovery`):**
+  When initial publication fails with HTTP 500, the event is durably stored in `EventRepository`. Exact replay succeeds with HTTP 201, creates 0 duplicate event records, and recovers delivery to `SUCCESS`.
+- **Test 77 (`test_77_recovery_cannot_resolve_event_across_tenant_boundaries`):**
+  Tenant Beta recovery sweep cannot process Tenant Alpha deliveries (0 swept). Cross-tenant delivery resolution and cross-tenant delivery updates are strictly blocked.
+
+### 9.5 Comprehensive Test Suite Matrix (Prompt 37D)
+- `backend/test_v3_closed_loop_learning.py`: **77 passed** (15.21s)
+- `backend/test_v3_event_driven_architecture.py`: **5 passed** (1.34s)
+- `backend/test_v3_event_model.py`: **33 passed** (1.75s)
+- `backend/test_v3_continuous_verification.py`: **128 passed** (12.04s)
+- `backend/test_v3_security.py`: **14 passed** (1.52s)
+- `backend/test_v3_security_integration.py`: **16 passed** (2.10s)
+- `backend/test_v3_authorization.py`: **19 passed** (1.98s)
+- `backend/test_v3_mission_architecture.py`: **74 passed** (6.49s)
+- `backend/test_v3_evidence_explainability.py`: **140 passed** (6.77s)
+- `backend/test_v3_organizational_memory.py`: **83 passed** (8.66s)
+- `backend/test_v3_rca.py` / `backend/test_v3_root_cause_analysis.py`: **30 passed** (6.19s)
+- `backend/test_v3_incident_management.py`: **56 passed** (11.06s)
+- `backend/test_v3_confidence_uncertainty.py`: **122 passed** (7.94s)
+- **Total:** **797 passed, 0 failed.**
+
+### 9.6 Remaining Limitations
+1. **Dynamic Subscriber Scope Discovery:** Explicit configuration in `SAGE_CLOSED_LOOP_SUBSCRIPTION_SCOPES` remains mandatory; dynamic discovery via tenant registry is deferred.
+2. **Autonomous Policy Mutation:** Self-modifying policy engines remain strictly forbidden.
+3. **Model Weight Fine-Tuning:** Dynamic training of model weights is deferred.
+4. **Autonomous Action Approval:** Human-in-the-loop governance remains mandatory for all physical operational actions.
+5. **LangGraph Identity Context Propagation:** Tool registration deferred until request-scoped security context is added to LangGraph `ToolNode`.
+6. **Historical Legacy Event Backfill:** Pre-Prompt 37B events lacking workspace/plant scope fail closed on deduplication. An explicit migration script is required if replay support for historical events is needed.
+

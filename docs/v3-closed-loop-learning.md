@@ -222,6 +222,27 @@ To guarantee at-least-once delivery without duplicate executions:
    - If all deliveries already succeeded, publication is skipped completely, preserving exact-replay idempotency with zero duplicate deliveries.
 4. **Background Sweeper Recovery:** `EventBus.recover_pending_deliveries()` and background `_sweeper_loop()` sweep `deliveries` where `status = 'PENDING'`, resolve the canonical event from `EventRepository`, and fulfill deliveries directly.
 
+### 6.5 Missing-Subscriber Recovery & Publication Error Sanitization (Prompt 37D)
+1. **Deterministic Missing-Subscriber Recovery:**
+   - When a subscriber callback is temporarily unavailable (e.g. offline service or delayed memory registration), `_process_delivery()` increments `delivery.attempts`, records `"Subscriber callback not found in memory"`, and computes bounded exponential backoff (`min(2 ** attempts, 60)` seconds).
+   - If `attempts < max_attempts`, the delivery transitions to `DeliveryStatus.PENDING` with `next_retry_at` set. It is **never permanently stranded** in `FAILED`.
+   - Once the callback is registered via `EventBus.register_callback()` or `EventBus.subscribe()`, the background sweeper (`recover_pending_deliveries(respect_backoff=True)`) or subsequent publication sweeps fulfill the delivery to `DeliveryStatus.SUCCESS`.
+2. **Terminal Retries & Dead-Letter Isolation:**
+   - If a delivery exceeds `max_attempts`, it transitions to `DeliveryStatus.FAILED`, clears `next_retry_at`, and creates an immutable `DeadLetter` record in `dead_letters`.
+   - Terminally exhausted deliveries are **never retried indefinitely** by subsequent sweeps or event replays.
+   - An administrative redrive path (`EventBus.redrive_dead_letter(dead_letter_id, tenant_id)`) safely re-arms dead-lettered deliveries to `PENDING` within the tenant boundary once subscriber configuration is resolved.
+3. **Idempotency Protection Against Downstream Resets:**
+   - `EventDeliveryRepository.record_delivery_attempt()` enforces that an already `SUCCESS` delivery record is **never downgraded or reset** back to `PENDING` or `FAILED` by concurrent workers, replays, or late sweeps.
+   - Cross-tenant delivery updates are strictly rejected.
+4. **API Publication Error Sanitization (`POST /api/v3/events`):**
+   - Raw exception details (`str(pub_err)`) are completely stripped from client-facing responses across both initial publication and replay-retry paths.
+   - Client responses return stable, safe error descriptions:
+     - Initial: `"Event persisted but publication encountered transient error."`
+     - Replay retry: `"Event persisted but publication retry encountered transient error."`
+   - Client responses accurately communicate that the event was safely recorded in `EventRepository` and not rolled back.
+   - Diagnostic trace details are kept strictly in server-side logs, sanitized via `sanitize_log_message()` to prevent leaking credentials, connection URIs, or tokens.
+   - Request correlation is preserved via `X-Correlation-ID` HTTP response headers and structured log attributes.
+
 ---
 
 ## 7. Feedback Event Contract & Schema
@@ -343,19 +364,22 @@ Configured in `backend/core/config.py`:
 ## 13. Test Coverage Summary
 
 - **Focused Closed-Loop Test Suite:** `backend/test_v3_closed_loop_learning.py`
-  - 68 tests covering eligibility, identity boundary, scope isolation, idempotency, loop guards, AST checks, producer authorization, coordinator independent scope verification, feature flag defaults, fingerprint integrity, workspace/plant fingerprint isolation, exact replay, conflicting duplicate rejection, repository-return tampering rejection, and publication failure recovery.
-  - **Result: 68 passed (100%)**.
+  - 77 tests covering eligibility, identity boundary, scope isolation, idempotency, loop guards, AST checks, producer authorization, coordinator independent scope verification, feature flag defaults, fingerprint integrity, workspace/plant fingerprint isolation, exact replay, conflicting duplicate rejection, repository-return tampering rejection, publication failure recovery, missing-subscriber recovery state, bounded exponential backoff, dead-letter policy, administrative redrive, API publication error sanitization, and cross-tenant recovery isolation.
+  - **Result: 77 passed (100%)**.
 - **All Core Regression Suites:**
-  - Canonical Event Model: 33 passed
-  - Event Driven Architecture: 5 passed
-  - Continuous Verification: 128 passed
-  - Mission Architecture: 74 passed
-  - Evidence Explainability: 140 passed
-  - Organizational Memory: 83 passed
-  - Root Cause Analysis: 30 passed
-  - Incident Management: 56 passed
-  - Confidence Uncertainty & Authorization: 171 passed
-  - **Total: 788 passed, 0 failed.**
+  - Canonical Event Model (`test_v3_event_model.py`): 33 passed
+  - Event Driven Architecture (`test_v3_event_driven_architecture.py`): 5 passed
+  - Continuous Verification (`test_v3_continuous_verification.py`): 128 passed
+  - Security Core (`test_v3_security.py`): 14 passed
+  - Security Integration (`test_v3_security_integration.py`): 16 passed
+  - Authorization Engine (`test_v3_authorization.py`): 19 passed
+  - Mission Architecture (`test_v3_mission_architecture.py`): 74 passed
+  - Evidence Explainability (`test_v3_evidence_explainability.py`): 140 passed
+  - Organizational Memory (`test_v3_organizational_memory.py`): 83 passed
+  - Root Cause Analysis (`test_v3_rca.py` / `test_v3_root_cause_analysis.py`): 30 passed
+  - Incident Management (`test_v3_incident_management.py`): 56 passed
+  - Confidence & Uncertainty (`test_v3_confidence_uncertainty.py`): 122 passed
+  - **Total: 797 passed, 0 failed.**
 
 ---
 
@@ -366,3 +390,4 @@ Configured in `backend/core/config.py`:
 3. **Model Weight Fine-Tuning:** Dynamic training of model weights is deferred.
 4. **Autonomous Action Approval:** Human-in-the-loop governance remains mandatory for all operational actions.
 5. **LangGraph Identity Context Propagation:** Tool registration deferred until request-scoped security context is added to LangGraph `ToolNode`.
+6. **Historical Legacy Event Backfill:** Pre-Prompt 37B events lacking workspace/plant scope fail closed on deduplication. An explicit migration script is required if replay support for historical events is needed.
