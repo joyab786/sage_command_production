@@ -4312,4 +4312,236 @@ class TestPrompt37FLeaseExpirationAndCallbackSafety:
         assert final_d.lease_expires_at is None
 
 
+class TestPrompt37GLockContentionAndExpiryRaceCorrection:
+    """
+    Prompt 37G: Final Lease-Expiry Race Correction.
+    Validates that acquiring the SQLite write lock (BEGIN IMMEDIATE) occurs BEFORE determining
+    the authoritative timestamp used for lease-expiry decisions in finalize_delivery() and renew_delivery_lease().
+    Tests reproduce real lock contention where a lease expires while waiting for the database write lock.
+    """
+
+    @pytest.fixture
+    def test_setup(self, tmp_path):
+        import uuid
+        from fastapi.testclient import TestClient
+        from server import app
+        from services.event_repository import EventRepository
+        from services.event_delivery_repository import EventDeliveryRepository
+        from services.event_bus import EventBus
+        try:
+            import api.event_routes as er
+        except (ImportError, ModuleNotFoundError):
+            import backend.api.event_routes as er
+
+        db_path = str(tmp_path / f"ev_37g_{uuid.uuid4().hex[:8]}.sqlite")
+        del_db_path = str(tmp_path / f"del_37g_{uuid.uuid4().hex[:8]}.sqlite")
+        
+        ev_repo = EventRepository(db_path=db_path)
+        del_repo = EventDeliveryRepository(db_path=del_db_path)
+        ebus = EventBus(repository=del_repo, event_repository=ev_repo)
+        ebus.enabled = True
+        
+        client = TestClient(app)
+        app.dependency_overrides[er.get_event_repo] = lambda: ev_repo
+        app.dependency_overrides[er.get_event_bus] = lambda: ebus
+        
+        yield client, ev_repo, del_repo, ebus, er
+        app.dependency_overrides.clear()
+
+    def test_101_finalization_after_expiry_while_waiting_for_write_lock(self, test_setup):
+        """Test A — Finalization after expiry while waiting for a write lock."""
+        client, ev_repo, del_repo, ebus, er = test_setup
+        import sqlite3
+        import threading
+        import time
+        import uuid
+        from datetime import datetime, UTC, timedelta
+        from data.schemas.event_delivery_contract import Subscription, EventDelivery, DeliveryStatus
+
+        evt = make_operational_event(tenant_id="tenant_alpha", workspace_id="workspace_prod", plant_id="plant_01")
+        ev_repo.record_event(evt)
+
+        sub = Subscription(
+            subscription_id=f"sub_c101_{uuid.uuid4().hex[:8]}",
+            subscriber_id="lock_fin_sub",
+            tenant_id="tenant_alpha",
+            category="TELEMETRY"
+        )
+        del_repo.register_subscription(sub)
+
+        # 1. Create a processing delivery with a valid claim and short lease
+        deliv = EventDelivery(
+            delivery_id=f"deliv_c101_{uuid.uuid4().hex[:8]}",
+            event_id=evt.event_id,
+            event_fingerprint=evt.event_fingerprint,
+            subscription_id=sub.subscription_id,
+            tenant_id="tenant_alpha",
+            status=DeliveryStatus.PENDING,
+            attempts=0,
+            max_attempts=3
+        )
+        del_repo.record_delivery_attempt(deliv)
+
+        claim = del_repo.claim_delivery(deliv.delivery_id, "tenant_alpha", lease_seconds=1)
+        assert claim is not None
+        assert claim.status == DeliveryStatus.PROCESSING
+
+        # Fast-forward / tighten lease in DB so it expires in exactly 0.25 seconds
+        short_expiry = (datetime.now(UTC) + timedelta(milliseconds=250)).isoformat().replace("+00:00", "Z")
+        with del_repo._get_conn() as conn:
+            conn.execute("UPDATE deliveries SET lease_expires_at = ? WHERE delivery_id = ?", (short_expiry, deliv.delivery_id))
+            conn.commit()
+
+        # 2. Acquire a competing SQLite write lock using a separate connection
+        blocker_acquired = threading.Event()
+        release_blocker = threading.Event()
+        blocker_released = threading.Event()
+
+        def blocker_thread():
+            conn_blocker = sqlite3.connect(del_repo.db_path, timeout=5.0)
+            conn_blocker.execute("BEGIN IMMEDIATE;")
+            blocker_acquired.set()
+            release_blocker.wait(timeout=5.0)
+            conn_blocker.commit()
+            conn_blocker.close()
+            blocker_released.set()
+
+        t_blocker = threading.Thread(target=blocker_thread)
+        t_blocker.start()
+        assert blocker_acquired.wait(timeout=3.0) is True
+
+        # 3. Start finalization while the lock is held
+        finalization_result = []
+        finalization_done = threading.Event()
+
+        def worker_finalize():
+            res = del_repo.finalize_delivery(
+                delivery_id=deliv.delivery_id,
+                tenant_id="tenant_alpha",
+                claim_token=claim.claim_token,
+                success=True
+            )
+            finalization_result.append(res)
+            finalization_done.set()
+
+        t_worker = threading.Thread(target=worker_finalize)
+        t_worker.start()
+
+        # 4. Allow the lease to expire before releasing the lock (sleep 0.35s > 0.25s)
+        time.sleep(0.35)
+
+        # 5. Release the lock and allow finalization to continue
+        release_blocker.set()
+        assert blocker_released.wait(timeout=3.0) is True
+        assert finalization_done.wait(timeout=3.0) is True
+        t_blocker.join(timeout=3.0)
+        t_worker.join(timeout=3.0)
+
+        # 6. Assert that the expired claim cannot finalize as SUCCESS or mutate the delivery
+        assert len(finalization_result) == 1
+        assert finalization_result[0] is None # REJECTED!
+
+        db_check = del_repo.get_delivery(deliv.delivery_id, "tenant_alpha")
+        assert db_check.status == DeliveryStatus.PROCESSING # Status was NOT mutated to SUCCESS
+        assert db_check.claim_token == claim.claim_token
+
+    def test_102_renewal_after_expiry_while_waiting_for_write_lock(self, test_setup):
+        """Test B — Renewal after expiry while waiting for a write lock."""
+        client, ev_repo, del_repo, ebus, er = test_setup
+        import sqlite3
+        import threading
+        import time
+        import uuid
+        from datetime import datetime, UTC, timedelta
+        from data.schemas.event_delivery_contract import Subscription, EventDelivery, DeliveryStatus
+
+        evt = make_operational_event(tenant_id="tenant_alpha", workspace_id="workspace_prod", plant_id="plant_01")
+        ev_repo.record_event(evt)
+
+        sub = Subscription(
+            subscription_id=f"sub_c102_{uuid.uuid4().hex[:8]}",
+            subscriber_id="lock_ren_sub",
+            tenant_id="tenant_alpha",
+            category="TELEMETRY"
+        )
+        del_repo.register_subscription(sub)
+
+        # 1. Create a processing delivery with a valid claim and short lease
+        deliv = EventDelivery(
+            delivery_id=f"deliv_c102_{uuid.uuid4().hex[:8]}",
+            event_id=evt.event_id,
+            event_fingerprint=evt.event_fingerprint,
+            subscription_id=sub.subscription_id,
+            tenant_id="tenant_alpha",
+            status=DeliveryStatus.PENDING,
+            attempts=0,
+            max_attempts=3
+        )
+        del_repo.record_delivery_attempt(deliv)
+
+        claim = del_repo.claim_delivery(deliv.delivery_id, "tenant_alpha", lease_seconds=1)
+        assert claim is not None
+        assert claim.status == DeliveryStatus.PROCESSING
+
+        # Fast-forward / tighten lease in DB so it expires in exactly 0.25 seconds
+        short_expiry = (datetime.now(UTC) + timedelta(milliseconds=250)).isoformat().replace("+00:00", "Z")
+        with del_repo._get_conn() as conn:
+            conn.execute("UPDATE deliveries SET lease_expires_at = ? WHERE delivery_id = ?", (short_expiry, deliv.delivery_id))
+            conn.commit()
+
+        # 2. Hold a competing SQLite write lock
+        blocker_acquired = threading.Event()
+        release_blocker = threading.Event()
+        blocker_released = threading.Event()
+
+        def blocker_thread():
+            conn_blocker = sqlite3.connect(del_repo.db_path, timeout=5.0)
+            conn_blocker.execute("BEGIN IMMEDIATE;")
+            blocker_acquired.set()
+            release_blocker.wait(timeout=5.0)
+            conn_blocker.commit()
+            conn_blocker.close()
+            blocker_released.set()
+
+        t_blocker = threading.Thread(target=blocker_thread)
+        t_blocker.start()
+        assert blocker_acquired.wait(timeout=3.0) is True
+
+        # 3. Start lease renewal while lock is held
+        renewal_result = []
+        renewal_done = threading.Event()
+
+        def worker_renew():
+            res = del_repo.renew_delivery_lease(
+                delivery_id=deliv.delivery_id,
+                tenant_id="tenant_alpha",
+                claim_token=claim.claim_token,
+                extension_seconds=30
+            )
+            renewal_result.append(res)
+            renewal_done.set()
+
+        t_worker = threading.Thread(target=worker_renew)
+        t_worker.start()
+
+        # 4. Allow the lease to expire before releasing the lock (sleep 0.35s > 0.25s)
+        time.sleep(0.35)
+
+        # 5. Release the lock and await renewal
+        release_blocker.set()
+        assert blocker_released.wait(timeout=3.0) is True
+        assert renewal_done.wait(timeout=3.0) is True
+        t_blocker.join(timeout=3.0)
+        t_worker.join(timeout=3.0)
+
+        # 6. Assert that renewal is rejected and the expired lease is not extended
+        assert len(renewal_result) == 1
+        assert renewal_result[0] is None # REJECTED!
+
+        db_check = del_repo.get_delivery(deliv.delivery_id, "tenant_alpha")
+        assert db_check.status == DeliveryStatus.PROCESSING
+        assert db_check.lease_expires_at == short_expiry # NOT extended!
+
+
+
 
