@@ -27,7 +27,10 @@ As required by Prompt 37A, 37B, 37C, and 37D, the git commit history and audit d
 - **Prompt 37C Dedicated Documentation Commit:** `ac7c98abce18a49c05198cd1a35fe1e71edfc5d0` (`docs(security): document returned event integrity and publication failure recovery (Prompt 37C)`)
 - **Prompt 37D Starting Baseline:** `ac7c98abce18a49c05198cd1a35fe1e71edfc5d0`
 - **Prompt 37D Dedicated Implementation Commit:** `370603a19834d8bc87c2cbe6cb82f708853f64b2` (`fix(events): ensure missing-subscriber recovery, bounded retries, and sanitized publication errors (Prompt 37D)`)
-- **Prompt 37D Dedicated Documentation Commit:** `544ce38e61e7184a37e5ad0591e807a1299484ba` (`docs(events): document event delivery recovery state and publication error sanitization (Prompt 37D)`)
+- **Prompt 37D Dedicated Documentation Commit:** `7c73940316b89308f266c159abd03a09e17a02af` (`docs(events): document event delivery recovery state and publication error sanitization (Prompt 37D)`)
+- **Prompt 37E Starting Baseline:** `7c73940316b89308f266c159abd03a09e17a02af`
+- **Prompt 37E Dedicated Implementation Commit:** `00473589ca824f4fd8942f10eb217c884af7b164` (`fix(events): implement atomic delivery claims, leases, and concurrency safety (Prompt 37E)`)
+- **Prompt 37E Dedicated Documentation Commit:** `776c4ce3d514db07070743dbe034782655accc31` (`docs(events): document atomic delivery claims and concurrent recovery safety (Prompt 37E)`)
 
 ---
 
@@ -448,4 +451,103 @@ Implemented in `backend/test_v3_closed_loop_learning.py` (`TestPrompt37DRecovery
 4. **Autonomous Action Approval:** Human-in-the-loop governance remains mandatory for all physical operational actions.
 5. **LangGraph Identity Context Propagation:** Tool registration deferred until request-scoped security context is added to LangGraph `ToolNode`.
 6. **Historical Legacy Event Backfill:** Pre-Prompt 37B events lacking workspace/plant scope fail closed on deduplication. An explicit migration script is required if replay support for historical events is needed.
+
+---
+
+## 10. Prompt 37E Security Audit: Atomic Event Delivery Claims & Concurrent Recovery Safety
+
+### 10.1 Audit Metadata
+- **Required Starting Baseline:** `7c73940316b89308f266c159abd03a09e17a02af`
+- **Implementation Commit:** `00473589ca824f4fd8942f10eb217c884af7b164` (`fix(events): implement atomic delivery claims, leases, and concurrency safety (Prompt 37E)`)
+- **Documentation Commit:** `776c4ce3d514db07070743dbe034782655accc31` (`docs(events): document atomic delivery claims and concurrent recovery safety (Prompt 37E)`)
+- **Repository:** `joyab786/sage_command_production`
+- **Branch:** `main`
+
+### 10.2 Problem Addressed: Concurrency Race in Delivery Processing
+Under the Prompt 37D design, `_process_delivery()` inspected delivery status via a non-atomic read before dispatching to the subscriber callback. When an event was enqueued or retried:
+- A queue worker and background recovery sweeper could both inspect `status = PENDING`.
+- Both would invoke the subscriber callback concurrently for the same delivery.
+- Prompt 37E closes this window by introducing a database-backed atomic claim with lease semantics.
+
+### 10.3 Atomic Claim & Lease Architecture
+1. **Database Schema & Metadata (`deliveries` table):**
+   - Added `claim_token TEXT`: Unique UUID assigned on every claim attempt.
+   - Added `lease_expires_at TEXT`: ISO-8601 timestamp after which a stalled claim is considered expired.
+   - Added `idempotency_key TEXT`: Deterministic key (`delivery_id`) provided to subscribers for deduplication.
+   - Added status `PROCESSING` to `DeliveryStatus`.
+   - Indexed `idx_del_lease ON deliveries(status, lease_expires_at)` and `idx_del_claim ON deliveries(claim_token)`.
+
+2. **Atomic Claim Operation (`claim_delivery`):**
+   - Implemented in `EventDeliveryRepository.claim_delivery(delivery_id, tenant_id, lease_seconds, respect_backoff)`.
+   - Executes an atomic SQL `UPDATE ... WHERE ...` with rowcount verification.
+   - Predicates:
+     - `delivery_id = ? AND tenant_id = ?` (strict tenant boundary).
+     - `status != 'SUCCESS'`.
+     - `NOT EXISTS (SELECT 1 FROM dead_letters ...)`.
+     - `status = 'PENDING'` (under retry backoff when enabled) OR `(status = 'PROCESSING' AND lease_expires_at <= now)` (expired lease).
+   - Atomic update:
+     - `status = 'PROCESSING'`
+     - `claim_token = 'claim_<uuid>'`
+     - `lease_expires_at = now + lease_seconds`
+     - `attempts = attempts + 1`
+   - SQLite write serialization guarantees only one worker acquires the row. Competing workers receive `None`.
+
+3. **Isolated Callback Invocation:**
+   - External subscriber callbacks are invoked **outside of any open database transaction**, ensuring slow or external network calls cannot hold SQLite write locks or stall the event bus.
+
+4. **Claim Finalization (`finalize_delivery`):**
+   - Finalization requires the active `claim_token`:
+     - On success: `status = 'SUCCESS'`, clears lease and claim token.
+     - On failure with attempts $< \text{max\_attempts}$: `status = 'PENDING'`, calculates exponential backoff (`min(2 ** attempts, 60)`), clears lease and claim token.
+     - On failure with attempts $\ge \text{max\_attempts}$: `status = 'FAILED'`, records an immutable `DeadLetter`, clears lease and claim token.
+   - If a lease expired and was claimed by a newer worker, the stale worker's finalization attempt affects 0 rows and is safely rejected.
+
+5. **Crash Recovery & Truthful At-Least-Once Semantics:**
+   - If a worker crashes mid-callback, `status` remains `PROCESSING` until `lease_expires_at`.
+   - Once expired, background recovery sweepers or workers reclaim the delivery and retry.
+   - System truthfully preserves **at-least-once delivery semantics** for crash scenarios; subscribers rely on `delivery.idempotency_key` for side-effect deduplication.
+
+### 10.4 Tenant Boundary & State Safety
+- Cross-tenant claims (`delivery.tenant_id != caller.tenant_id`) raise explicit `ValueError("Cross-tenant delivery claim rejected")`.
+- Cross-tenant finalizations raise `ValueError("Cross-tenant delivery finalization rejected")`.
+- `SUCCESS` is terminal for automatic processing; cannot be downgraded or reset by late replays or sweeps.
+- Dead-lettered deliveries remain excluded from automatic retries until explicitly redriven via `redrive_dead_letter()`.
+
+### 10.5 Concurrency Tests Verified (Tests 78–88)
+Implemented in `backend/test_v3_closed_loop_learning.py` (`TestPrompt37EAtomicClaimsAndConcurrencySafety`):
+- **Test 78 (`test_78_two_concurrent_workers_claim_same_pending_delivery`):** Two concurrent workers race for the same delivery; exactly one acquires the claim (`status = PROCESSING`, `attempts = 1`). The other receives `None`.
+- **Test 79 (`test_79_worker_and_recovery_sweeper_race`):** Worker and sweeper race concurrently; subscriber callback is executed exactly once. Delivery reaches `SUCCESS`.
+- **Test 80 (`test_80_successful_delivery_not_invoked_again_by_replay_or_sweep`):** Replays and sweeps on `SUCCESS` deliveries do not invoke callbacks again.
+- **Test 81 (`test_81_active_lease_prevents_second_claim`):** Active lease (`lease_seconds = 60`) prevents competing workers from acquiring a claim.
+- **Test 82 (`test_82_expired_lease_becomes_recoverable`):** Delivery with expired lease is safely claimed by a new worker with a fresh claim token.
+- **Test 83 (`test_83_old_claim_token_cannot_finalize_superseded_delivery`):** Stale worker with superseded token cannot finalize delivery; newer worker finalizes as `SUCCESS`.
+- **Test 84 (`test_84_failed_attempt_follows_backoff_and_retry_limit`):** Failed attempt transitions to `PENDING` with backoff; claim with `respect_backoff=True` is blocked until backoff window passes.
+- **Test 85 (`test_85_retry_exhaustion_creates_expected_dead_letter`):** Exhausting retries transitions delivery to `FAILED`, creates `DeadLetter` record, and excludes it from future claims.
+- **Test 86 (`test_86_administrative_redrive_restores_eligibility_with_claim_validation`):** `redrive_dead_letter()` removes dead letter, resets status to `PENDING`, and enables safe atomic claiming.
+- **Test 87 (`test_87_cross_tenant_claims_and_finalization_rejected`):** Foreign tenant claims and finalizations raise `ValueError` and fail closed.
+- **Test 88 (`test_88_callbacks_stable_idempotency_key_unchanged_across_retries`):** `delivery.idempotency_key` is identical and invariant across all retry attempts.
+
+### 10.6 Complete Regression Test Suite Matrix (Prompt 37E)
+- `backend/test_v3_closed_loop_learning.py`: **88 passed** (14.33s)
+- `backend/test_v3_event_driven_architecture.py`: **5 passed** (1.30s)
+- `backend/test_v3_event_model.py`: **33 passed** (1.75s)
+- `backend/test_v3_continuous_verification.py`: **128 passed** (11.29s)
+- `backend/test_v3_security.py`: **14 passed** (1.52s)
+- `backend/test_v3_security_integration.py`: **16 passed** (2.10s)
+- `backend/test_v3_authorization.py`: **19 passed** (1.98s)
+- `backend/test_v3_mission_architecture.py`: **74 passed** (6.49s)
+- `backend/test_v3_evidence_explainability.py`: **140 passed** (6.77s)
+- `backend/test_v3_organizational_memory.py`: **83 passed** (8.66s)
+- `backend/test_v3_rca.py` / `backend/test_v3_root_cause_analysis.py`: **30 passed** (6.19s)
+- `backend/test_v3_incident_management.py`: **56 passed** (11.06s)
+- `backend/test_v3_confidence_uncertainty.py`: **122 passed** (7.94s)
+- **Total: 808 passed, 0 failed.**
+
+### 10.7 Remaining Limitations & Deferred Work
+1. **At-Least-Once Delivery Crash Recovery:** If a worker crashes after external side effects occur but before finalization commits to SQLite, the lease expires and the delivery is retried. Subscribers must remain idempotent using `delivery.idempotency_key`.
+2. **Dynamic Subscription Discovery:** Subscription scopes must be explicitly configured via `SAGE_CLOSED_LOOP_SUBSCRIPTION_SCOPES`. Dynamic discovery from an external tenant management directory is deferred.
+3. **Autonomous Policy Mutation:** Self-modifying policy engines remain strictly prohibited.
+4. **Model Weight Fine-Tuning:** Dynamic training or weight adjustment is deferred.
+5. **Autonomous Action Approval:** Human-in-the-loop governance remains mandatory for all physical operational actions.
+6. **LangGraph Identity Context Propagation:** Tool registration deferred until request-scoped security context is added to LangGraph `ToolNode`.
 

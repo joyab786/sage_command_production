@@ -364,8 +364,8 @@ Configured in `backend/core/config.py`:
 ## 13. Test Coverage Summary
 
 - **Focused Closed-Loop Test Suite:** `backend/test_v3_closed_loop_learning.py`
-  - 77 tests covering eligibility, identity boundary, scope isolation, idempotency, loop guards, AST checks, producer authorization, coordinator independent scope verification, feature flag defaults, fingerprint integrity, workspace/plant fingerprint isolation, exact replay, conflicting duplicate rejection, repository-return tampering rejection, publication failure recovery, missing-subscriber recovery state, bounded exponential backoff, dead-letter policy, administrative redrive, API publication error sanitization, and cross-tenant recovery isolation.
-  - **Result: 77 passed (100%)**.
+  - 88 tests covering eligibility, identity boundary, scope isolation, idempotency, loop guards, AST checks, producer authorization, coordinator independent scope verification, feature flag defaults, fingerprint integrity, workspace/plant fingerprint isolation, exact replay, conflicting duplicate rejection, repository-return tampering rejection, publication failure recovery, missing-subscriber recovery state, bounded exponential backoff, dead-letter policy, administrative redrive, API publication error sanitization, cross-tenant recovery isolation, atomic claims, concurrent race elimination, lease expiration, stale claim token rejection, and callback idempotency keys.
+  - **Result: 88 passed (100%)**.
 - **All Core Regression Suites:**
   - Canonical Event Model (`test_v3_event_model.py`): 33 passed
   - Event Driven Architecture (`test_v3_event_driven_architecture.py`): 5 passed
@@ -379,15 +379,51 @@ Configured in `backend/core/config.py`:
   - Root Cause Analysis (`test_v3_rca.py` / `test_v3_root_cause_analysis.py`): 30 passed
   - Incident Management (`test_v3_incident_management.py`): 56 passed
   - Confidence & Uncertainty (`test_v3_confidence_uncertainty.py`): 122 passed
-  - **Total: 797 passed, 0 failed.**
+  - **Total: 808 passed, 0 failed.**
 
 ---
 
 ## 14. Remaining Limitations and Deferred Work
 
-1. **Dynamic Subscriber Scope Discovery:** The server requires explicit configuration in `SAGE_CLOSED_LOOP_SUBSCRIPTION_SCOPES`; dynamic subscription authorization from a tenant directory is deferred until an external tenant registry is introduced.
-2. **Autonomous Policy Mutation:** Self-modifying policy engines remain strictly forbidden.
-3. **Model Weight Fine-Tuning:** Dynamic training of model weights is deferred.
-4. **Autonomous Action Approval:** Human-in-the-loop governance remains mandatory for all operational actions.
-5. **LangGraph Identity Context Propagation:** Tool registration deferred until request-scoped security context is added to LangGraph `ToolNode`.
-6. **Historical Legacy Event Backfill:** Pre-Prompt 37B events lacking workspace/plant scope fail closed on deduplication. An explicit migration script is required if replay support for historical events is needed.
+1. **At-Least-Once Delivery Semantics for Crash Recovery:** While atomic claims prevent concurrent worker execution of the same active delivery, a crash occurring after a subscriber executes external side effects but before `finalize_delivery()` durably commits will allow a later retry upon lease expiry. Subscribers must use the stable `delivery.idempotency_key` for deduplication.
+2. **Dynamic Subscriber Scope Discovery:** The server requires explicit configuration in `SAGE_CLOSED_LOOP_SUBSCRIPTION_SCOPES`; dynamic subscription authorization from a tenant directory is deferred until an external tenant registry is introduced.
+3. **Autonomous Policy Mutation:** Self-modifying policy engines remain strictly forbidden.
+4. **Model Weight Fine-Tuning:** Dynamic training of model weights is deferred.
+5. **Autonomous Action Approval:** Human-in-the-loop governance remains mandatory for all operational actions.
+6. **LangGraph Identity Context Propagation:** Tool registration deferred until request-scoped security context is added to LangGraph `ToolNode`.
+7. **Historical Legacy Event Backfill:** Pre-Prompt 37B events lacking workspace/plant scope fail closed on deduplication. An explicit migration script is required if replay support for historical events is needed.
+
+---
+
+## 15. Atomic Delivery Claims & Concurrency Safety (Prompt 37E)
+
+### 15.1 Motivation & Concurrency Defect Closed
+Prior to Prompt 37E, `EventBus._process_delivery()` inspected delivery status via a read-only query before invoking the subscriber callback. When an event was enqueued or retried, a worker and the recovery sweeper (or two concurrent workers) could execute concurrent checks, observe `status = PENDING`, and both invoke the subscriber callback.
+
+### 15.2 Database-Backed Atomic Claim & Lease Architecture
+1. **Atomic State Transition (`claim_delivery`):**
+   - Implemented in `EventDeliveryRepository.claim_delivery(delivery_id, tenant_id, lease_seconds, respect_backoff)`.
+   - Executes an atomic SQL `UPDATE ... WHERE ...` with rowcount verification:
+     - Delivery must match `delivery_id` and authoritative `tenant_id`.
+     - Status must not be `SUCCESS`.
+     - Must not be terminally exhausted in `dead_letters`.
+     - Eligible only if `status = 'PENDING'` (and `next_retry_at <= now` when backoff is respected) OR `status = 'PROCESSING'` with `lease_expires_at <= now` (expired lease recovery).
+   - Atomically transitions status to `PROCESSING`, increments `attempts = attempts + 1`, and assigns a cryptographically unique `claim_token` and `lease_expires_at` (`now + lease_seconds`).
+   - If two workers attempt to claim the same delivery simultaneously, SQLite write serialization guarantees exactly one update succeeds (`rowcount == 1`). The competing worker receives `None` and drops the duplicate dispatch.
+
+2. **Isolated Callback Invocation:**
+   - The subscriber callback is invoked **completely outside of any database transaction**, preventing long-running subscriber logic from locking the database or stalling other workers.
+
+3. **Claim Token Finalization (`finalize_delivery`):**
+   - Only the holder of the active `claim_token` can finalize the attempt.
+   - On success: transitions to `SUCCESS`, clearing `claim_token`, `lease_expires_at`, and `next_retry_at`.
+   - On failure: if attempts $< \text{max\_attempts}$, transitions to `PENDING` with exponential backoff (`min(2 ** attempts, 60)`). If attempts $\ge \text{max\_attempts}$, transitions to `FAILED` and records an immutable `DeadLetter`.
+   - If a worker's lease expired and a newer worker claimed the delivery, the stale worker's finalization attempt matches 0 rows and is safely rejected.
+
+4. **Stale Lease Recovery:**
+   - If a worker crashes or encounters an unhandled exception before finalization, the lease expires.
+   - Background sweepers and queue workers retrieve expired leases (`status = 'PROCESSING'` and `lease_expires_at <= now`) and safely redrive them under a fresh claim token.
+
+5. **Stable Subscriber Idempotency Keys:**
+   - `delivery.idempotency_key` is populated deterministically from the cryptographic `delivery_id` and remains invariant across all retry attempts.
+   - External subscribers can use `delivery.idempotency_key` for reliable idempotency tracking and external side-effect deduplication.
