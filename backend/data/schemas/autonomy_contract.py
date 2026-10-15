@@ -902,6 +902,9 @@ class AutonomyEvaluationRequest(BaseModel):
     cost_estimate_usd: Optional[float] = None
     action_type: Optional[str] = None
     target_resource_id: Optional[str] = None
+    action_id: Optional[str] = None
+    parameters: Optional[Dict[str, Any]] = None
+    model_estimated_risk: Optional[str] = None
     request_id: Optional[str] = None
 
     @model_validator(mode="after")

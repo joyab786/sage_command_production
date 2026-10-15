@@ -185,6 +185,9 @@ def evaluate_capability(
         "action_type": payload.action_type,
         "target_resource_id": payload.target_resource_id,
         "proposer_id": identity.user_id,
+        "action_id": getattr(payload, "action_id", None),
+        "parameters": getattr(payload, "parameters", None) or {},
+        "model_estimated_risk": getattr(payload, "model_estimated_risk", None),
     }
 
     decision = autonomy_service.evaluate_autonomy(
@@ -223,7 +226,9 @@ def create_autonomy_grant(
     try:
         grant = autonomy_service.create_grant(identity=identity, request=payload)
         return grant
-    except (ValueError, AutonomyIdempotencyConflictError) as e:
+    except AutonomyIdempotencyConflictError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except AutonomyRepositoryError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))

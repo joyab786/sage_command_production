@@ -17,10 +17,12 @@ Validates:
 """
 
 import unittest
+from unittest.mock import patch, MagicMock
 import uuid
 import time
 import os
 import tempfile
+import sqlite3
 from fastapi.testclient import TestClient
 
 from server import app
@@ -524,7 +526,7 @@ class TestV3AutonomyFoundation(unittest.TestCase):
             "subject_id": f"agent_anti_spoof_{uuid.uuid4().hex[:6]}",
             "autonomy_level": "RECOMMEND",
             "tenant_id": "tenant_super_admin",  # Client spoof attempt
-            "workspace_id": "workspace_root",
+            "workspace_id": "workspace_default",
             "plant_id": "plant_01",
             "permitted_capabilities": ["GENERATE_RECOMMENDATION"],
         }
@@ -835,6 +837,673 @@ class TestV3AutonomyFoundation(unittest.TestCase):
         caps = resp.json()
         self.assertIsInstance(caps, list)
         self.assertGreater(len(caps), 5)
+
+
+class TestV3AutonomyPrompt38ACorrections(unittest.TestCase):
+    """
+    Prompt 38A Autonomy Governance Security Corrections Test Suite.
+    Exhaustively tests all 13 security requirements:
+    1. Client-supplied low risk cannot downgrade authoritative high risk.
+    2. Missing authoritative risk fails closed (unknown action fails to REQUIRES_REVIEW or safe DENY).
+    3. Cross-workspace grant creation is rejected.
+    4. Cross-workspace grant retrieval and lifecycle changes are rejected.
+    5. Cross-workspace listing cannot expose records.
+    6. Missing session identity cannot use a session-bound grant.
+    7. A session-bound grant cannot authorize a different session.
+    8. Audit persistence failure cannot yield ALLOW (fails closed).
+    9. Idempotency conflict detection includes every security-relevant field.
+    10. A denied canonical permission prevents ALLOW (both autonomy and authz must pass).
+    11. Capability updates reject unknown capability identifiers.
+    12. Levels 4 and 5 remain disabled on create and update.
+    13. No new execution endpoint or operational side effect is introduced.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client = TestClient(app)
+        cls.service = autonomy_service
+        cls.repo = autonomy_repository
+
+    def _auth_headers(
+        self,
+        token="manager_token",
+        session_id="session_autonomy_corr",
+        tenant_id="tenant_default",
+        idempotency_key=None,
+    ):
+        h = {
+            "Authorization": f"Bearer {token}",
+            "X-Session-ID": session_id,
+            "X-Tenant-ID": tenant_id,
+            "X-Request-ID": f"req_{uuid.uuid4().hex[:8]}",
+        }
+        if idempotency_key:
+            h["Idempotency-Key"] = idempotency_key
+        return h
+
+    # -------------------------------------------------------------------------
+    # 1. Client-supplied low risk cannot downgrade authoritative high risk
+    # -------------------------------------------------------------------------
+    def test_client_supplied_low_risk_cannot_downgrade_authoritative_high_risk(self):
+        """Caller submits LOW for a high-risk action: system risk prevails, review required."""
+        subject_id = f"agent_risk_test_{uuid.uuid4().hex[:6]}"
+        grant = AutonomyGrant(
+            grant_id=f"grant_{uuid.uuid4().hex[:8]}",
+            subject_type=SubjectType.AGENT,
+            subject_id=subject_id,
+            autonomy_level=AutonomyLevel.PREPARE_FOR_APPROVAL,
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            plant_id="plant_01",
+            data_mode="REAL",
+            permitted_capabilities=["PROPOSE_ACTION"],
+            constraints=AutonomyConstraints(approval_required_for_risk_levels=["HIGH", "CRITICAL"]),
+            created_by="admin_01",
+        )
+        self.repo.save_grant(grant)
+
+        identity = Identity(
+            user_id="mgr_456",
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            roles=["operator", "manager"],
+            assigned_plants=["plant_01"],
+            clearance_level=2,
+        )
+
+        # Client submits risk_level="LOW" for RESCHEDULE_PRODUCTION (classified as HIGH)
+        decision = self.service.evaluate_autonomy(
+            identity=identity,
+            subject_id=subject_id,
+            requested_capability="PROPOSE_ACTION",
+            resource_scope=grant.scope,
+            data_mode="REAL",
+            risk_context={
+                "action_type": "RESCHEDULE_PRODUCTION",
+                "risk_level": "LOW",  # Client downgrade attempt
+            },
+        )
+        # Authoritative system risk must NOT be downgraded to LOW
+        self.assertIn(decision.risk_status, ["HIGH", "CRITICAL"])
+        self.assertNotEqual(decision.risk_status, "LOW")
+        # Mandatory approval must be required
+        self.assertTrue(decision.approval_requirement)
+
+    # -------------------------------------------------------------------------
+    # 2. Missing authoritative risk fails closed
+    # -------------------------------------------------------------------------
+    def test_missing_authoritative_risk_fails_closed(self):
+        """If authoritative risk cannot be established, evaluation fails closed to review-required or denial."""
+        subject_id = f"agent_unknown_risk_{uuid.uuid4().hex[:6]}"
+        grant = AutonomyGrant(
+            grant_id=f"grant_{uuid.uuid4().hex[:8]}",
+            subject_type=SubjectType.AGENT,
+            subject_id=subject_id,
+            autonomy_level=AutonomyLevel.PREPARE_FOR_APPROVAL,
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            plant_id="plant_01",
+            data_mode="SIMULATION",
+            permitted_capabilities=["PROPOSE_ACTION"],
+            created_by="admin_01",
+        )
+        self.repo.save_grant(grant)
+
+        identity = Identity(
+            user_id="mgr_456",
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            roles=["operator", "manager"],
+            assigned_plants=["plant_01"],
+            clearance_level=2,
+        )
+
+        # 1. Unregistered action type -> fails closed to REQUIRES_REVIEW (RISK_UNKNOWN)
+        decision = self.service.evaluate_autonomy(
+            identity=identity,
+            subject_id=subject_id,
+            requested_capability="PROPOSE_ACTION",
+            resource_scope=grant.scope,
+            data_mode="SIMULATION",
+            risk_context={
+                "action_type": "TOTALLY_UNKNOWN_ACTION_999",
+                "risk_level": "LOW",
+            },
+        )
+        self.assertEqual(decision.decision, AutonomyDecisionEffect.REQUIRES_REVIEW)
+        self.assertEqual(decision.reason_code, AutonomyReasonCode.RISK_UNKNOWN)
+
+        # 2. Missing action record reference -> fails closed to DENY (AUTHORIZATION_DENIED)
+        decision2 = self.service.evaluate_autonomy(
+            identity=identity,
+            subject_id=subject_id,
+            requested_capability="PROPOSE_ACTION",
+            resource_scope=grant.scope,
+            data_mode="SIMULATION",
+            risk_context={
+                "action_id": "act_nonexistent_reference_xyz",
+            },
+        )
+        self.assertEqual(decision2.decision, AutonomyDecisionEffect.DENY)
+        self.assertEqual(decision2.reason_code, AutonomyReasonCode.AUTHORIZATION_DENIED)
+
+    # -------------------------------------------------------------------------
+    # 3. Cross-workspace grant creation is rejected
+    # -------------------------------------------------------------------------
+    def test_cross_workspace_grant_creation_rejected(self):
+        """Non-admin caller cannot create an autonomy grant outside their authoritative workspace."""
+        payload = {
+            "subject_type": "AGENT",
+            "subject_id": f"agent_cross_ws_{uuid.uuid4().hex[:6]}",
+            "autonomy_level": "RECOMMEND",
+            "workspace_id": "workspace_finance",  # Cross-workspace creation attempt
+            "plant_id": "plant_01",
+            "permitted_capabilities": ["GENERATE_RECOMMENDATION"],
+        }
+        resp = self.client.post(
+            "/api/v3/autonomy/grants",
+            json=payload,
+            headers=self._auth_headers(token="manager_token"),  # manager is confined to workspace_default
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertIn("Cross-workspace access denied", resp.json()["detail"])
+
+        # Wildcard workspace by non-admin must also be rejected
+        payload["workspace_id"] = "*"
+        resp_wildcard = self.client.post(
+            "/api/v3/autonomy/grants",
+            json=payload,
+            headers=self._auth_headers(token="manager_token"),
+        )
+        self.assertEqual(resp_wildcard.status_code, 403)
+
+    # -------------------------------------------------------------------------
+    # 4. Cross-workspace grant retrieval and lifecycle changes are rejected
+    # -------------------------------------------------------------------------
+    def test_cross_workspace_grant_retrieval_and_lifecycle_changes_rejected(self):
+        """Non-admin caller cannot read, update, suspend, or revoke grants from another workspace."""
+        grant_id = f"grant_ws_eng_{uuid.uuid4().hex[:8]}"
+        grant = AutonomyGrant(
+            grant_id=grant_id,
+            subject_type=SubjectType.AGENT,
+            subject_id=f"agent_eng_{uuid.uuid4().hex[:6]}",
+            autonomy_level=AutonomyLevel.ANALYZE,
+            tenant_id="tenant_default",
+            workspace_id="workspace_engineering",  # Distinct workspace
+            plant_id="plant_01",
+            data_mode="SIMULATION",
+            created_by="admin_01",
+        )
+        self.repo.save_grant(grant)
+
+        # Manager from workspace_default attempts direct access
+        headers = self._auth_headers(token="manager_token")
+
+        # GET: not found in caller's authorized scope
+        resp_get = self.client.get(f"/api/v3/autonomy/grants/{grant_id}", headers=headers)
+        self.assertIn(resp_get.status_code, [403, 404])
+
+        # PUT: update rejected
+        resp_put = self.client.put(
+            f"/api/v3/autonomy/grants/{grant_id}",
+            json={"expected_revision": 1, "update_reason": "Malicious edit"},
+            headers=headers,
+        )
+        self.assertIn(resp_put.status_code, [403, 404])
+
+        # POST suspend: rejected
+        resp_suspend = self.client.post(
+            f"/api/v3/autonomy/grants/{grant_id}/suspend?expected_revision=1",
+            headers=headers,
+        )
+        self.assertIn(resp_suspend.status_code, [403, 404])
+
+        # DELETE revoke: rejected
+        resp_revoke = self.client.delete(
+            f"/api/v3/autonomy/grants/{grant_id}?expected_revision=1",
+            headers=headers,
+        )
+        self.assertIn(resp_revoke.status_code, [403, 404])
+
+        # Verify grant in workspace_engineering was not modified
+        g_check = self.repo.get_grant(grant_id, tenant_id="tenant_default", workspace_id="workspace_engineering")
+        self.assertIsNotNone(g_check)
+        self.assertEqual(g_check.status, AutonomyGrantStatus.ACTIVE)
+        self.assertEqual(g_check.revision, 1)
+
+    # -------------------------------------------------------------------------
+    # 5. Cross-workspace listing cannot expose records
+    # -------------------------------------------------------------------------
+    def test_cross_workspace_listing_cannot_expose_records(self):
+        """Listing grants with an unauthorized workspace filter is rejected; default list excludes other workspaces."""
+        # Querying an unauthorized workspace returns 403
+        resp = self.client.get(
+            "/api/v3/autonomy/grants?workspace_id=workspace_engineering",
+            headers=self._auth_headers(token="manager_token"),
+        )
+        self.assertEqual(resp.status_code, 403)
+
+        # Querying decisions with unauthorized workspace returns 403
+        resp_dec = self.client.get(
+            "/api/v3/autonomy/decisions?workspace_id=workspace_engineering",
+            headers=self._auth_headers(token="manager_token"),
+        )
+        self.assertEqual(resp_dec.status_code, 403)
+
+        # Default listing strictly isolates to caller's workspace
+        resp_list = self.client.get(
+            "/api/v3/autonomy/grants",
+            headers=self._auth_headers(token="manager_token"),
+        )
+        self.assertEqual(resp_list.status_code, 200)
+        grants = resp_list.json().get("grants", [])
+        for g in grants:
+            self.assertIn(g["workspace_id"], ["workspace_default", "*"])
+
+    # -------------------------------------------------------------------------
+    # 6. Missing session identity cannot use a session-bound grant
+    # -------------------------------------------------------------------------
+    def test_missing_session_identity_cannot_use_session_bound_grant(self):
+        """A session-bound grant must strictly deny callers that provide no session context."""
+        subject_id = f"agent_sess_bound_{uuid.uuid4().hex[:6]}"
+        grant = AutonomyGrant(
+            grant_id=f"grant_{uuid.uuid4().hex[:8]}",
+            subject_type=SubjectType.AGENT,
+            subject_id=subject_id,
+            autonomy_level=AutonomyLevel.RECOMMEND,
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            session_id="session_mission_alpha_99",  # Strictly bound to session
+            plant_id="plant_01",
+            data_mode="SIMULATION",
+            permitted_capabilities=["GENERATE_RECOMMENDATION"],
+            created_by="admin_01",
+        )
+        self.repo.save_grant(grant)
+
+        # Caller provides NO session context
+        identity_no_session = Identity(
+            user_id="mgr_456",
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            session_id=None,
+            roles=["operator", "manager"],
+            assigned_plants=["plant_01"],
+            clearance_level=2,
+        )
+        scope_no_session = AutonomyScope(
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            plant_id="plant_01",
+            session_id=None,
+        )
+
+        decision = self.service.evaluate_autonomy(
+            identity=identity_no_session,
+            subject_id=subject_id,
+            requested_capability="GENERATE_RECOMMENDATION",
+            resource_scope=scope_no_session,
+            data_mode="SIMULATION",
+        )
+        self.assertEqual(decision.decision, AutonomyDecisionEffect.DENY)
+        self.assertEqual(decision.reason_code, AutonomyReasonCode.SESSION_MISMATCH)
+
+    # -------------------------------------------------------------------------
+    # 7. A session-bound grant cannot authorize a different session
+    # -------------------------------------------------------------------------
+    def test_session_bound_grant_cannot_authorize_different_session(self):
+        """A grant bound to session A must reject requests from session B and only allow session A."""
+        subject_id = f"agent_sess_cross_{uuid.uuid4().hex[:6]}"
+        grant = AutonomyGrant(
+            grant_id=f"grant_{uuid.uuid4().hex[:8]}",
+            subject_type=SubjectType.AGENT,
+            subject_id=subject_id,
+            autonomy_level=AutonomyLevel.RECOMMEND,
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            session_id="session_alpha_only",
+            plant_id="plant_01",
+            data_mode="SIMULATION",
+            permitted_capabilities=["GENERATE_RECOMMENDATION"],
+            created_by="admin_01",
+        )
+        self.repo.save_grant(grant)
+
+        # Session mismatch: caller provides session_beta
+        identity_beta = Identity(
+            user_id="mgr_456",
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            session_id="session_beta_wrong",
+            roles=["operator", "manager"],
+            assigned_plants=["plant_01"],
+            clearance_level=2,
+        )
+        scope_beta = AutonomyScope(
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            plant_id="plant_01",
+            session_id="session_beta_wrong",
+        )
+        decision_mismatch = self.service.evaluate_autonomy(
+            identity=identity_beta,
+            subject_id=subject_id,
+            requested_capability="GENERATE_RECOMMENDATION",
+            resource_scope=scope_beta,
+            data_mode="SIMULATION",
+        )
+        self.assertEqual(decision_mismatch.decision, AutonomyDecisionEffect.DENY)
+        self.assertEqual(decision_mismatch.reason_code, AutonomyReasonCode.SESSION_MISMATCH)
+
+        # Matching session: caller provides session_alpha_only -> ALLOW
+        identity_alpha = Identity(
+            user_id="mgr_456",
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            session_id="session_alpha_only",
+            roles=["operator", "manager"],
+            assigned_plants=["plant_01"],
+            clearance_level=2,
+        )
+        scope_alpha = AutonomyScope(
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            plant_id="plant_01",
+            session_id="session_alpha_only",
+        )
+        decision_match = self.service.evaluate_autonomy(
+            identity=identity_alpha,
+            subject_id=subject_id,
+            requested_capability="GENERATE_RECOMMENDATION",
+            resource_scope=scope_alpha,
+            data_mode="SIMULATION",
+        )
+        self.assertEqual(decision_match.decision, AutonomyDecisionEffect.ALLOW)
+
+    # -------------------------------------------------------------------------
+    # 8. Audit persistence failure cannot yield ALLOW
+    # -------------------------------------------------------------------------
+    def test_audit_persistence_failure_cannot_yield_allow(self):
+        """When ledger database persistence fails during an ALLOW evaluation, it must fail closed to DENY."""
+        subject_id = f"agent_audit_fail_{uuid.uuid4().hex[:6]}"
+        grant = AutonomyGrant(
+            grant_id=f"grant_{uuid.uuid4().hex[:8]}",
+            subject_type=SubjectType.AGENT,
+            subject_id=subject_id,
+            autonomy_level=AutonomyLevel.RECOMMEND,
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            plant_id="plant_01",
+            data_mode="SIMULATION",
+            permitted_capabilities=["GENERATE_RECOMMENDATION"],
+            created_by="admin_01",
+        )
+        self.repo.save_grant(grant)
+
+        identity = Identity(
+            user_id="mgr_456",
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            roles=["operator", "manager"],
+            assigned_plants=["plant_01"],
+            clearance_level=2,
+        )
+
+        # Force database persistence to fail with an OperationalError
+        with patch.object(self.repo, "record_decision", side_effect=sqlite3.OperationalError("database disk image is malformed")):
+            decision = self.service.evaluate_autonomy(
+                identity=identity,
+                subject_id=subject_id,
+                requested_capability="GENERATE_RECOMMENDATION",
+                resource_scope=grant.scope,
+                data_mode="SIMULATION",
+            )
+            # Must strictly fail closed: ALLOW without audit persistence is forbidden
+            self.assertEqual(decision.decision, AutonomyDecisionEffect.DENY)
+            self.assertEqual(decision.reason_code, AutonomyReasonCode.EVALUATION_ERROR)
+            self.assertIn("Mandatory audit persistence failed", decision.reason)
+
+    # -------------------------------------------------------------------------
+    # 9. Idempotency conflict detection includes every security-relevant field
+    # -------------------------------------------------------------------------
+    def test_idempotency_conflict_detection_includes_all_security_fields(self):
+        """Altering any security-relevant field with a reused idempotency key raises a 409 conflict."""
+        idem_key = f"idem_sec_{uuid.uuid4().hex[:12]}"
+        base_payload = {
+            "subject_type": "AGENT",
+            "subject_id": f"agent_idem_sec_{uuid.uuid4().hex[:6]}",
+            "autonomy_level": "RECOMMEND",
+            "workspace_id": "workspace_default",
+            "plant_id": "plant_01",
+            "data_mode": "SIMULATION",
+            "permitted_capabilities": ["GENERATE_RECOMMENDATION"],
+            "constraints": {"max_cost_limit_usd": 100.0},
+        }
+
+        # 1. Initial creation -> 201 Created
+        resp1 = self.client.post(
+            "/api/v3/autonomy/grants",
+            json=base_payload,
+            headers=self._auth_headers(token="manager_token", idempotency_key=idem_key),
+        )
+        self.assertEqual(resp1.status_code, 201)
+        original_grant_id = resp1.json()["grant_id"]
+
+        # 2. Exact retry -> 200/201 returns existing grant
+        resp_retry = self.client.post(
+            "/api/v3/autonomy/grants",
+            json=base_payload,
+            headers=self._auth_headers(token="manager_token", idempotency_key=idem_key),
+        )
+        self.assertIn(resp_retry.status_code, [200, 201])
+        self.assertEqual(resp_retry.json()["grant_id"], original_grant_id)
+
+        # 3. Conflict on data_mode -> 409 Conflict
+        conflicting_data_mode = dict(base_payload)
+        conflicting_data_mode["data_mode"] = "REAL"
+        resp_cm = self.client.post(
+            "/api/v3/autonomy/grants",
+            json=conflicting_data_mode,
+            headers=self._auth_headers(token="manager_token", idempotency_key=idem_key),
+        )
+        self.assertEqual(resp_cm.status_code, 409)
+
+        # 4. Conflict on level -> 409 Conflict
+        conflicting_level = dict(base_payload)
+        conflicting_level["autonomy_level"] = "ANALYZE"
+        resp_cl = self.client.post(
+            "/api/v3/autonomy/grants",
+            json=conflicting_level,
+            headers=self._auth_headers(token="manager_token", idempotency_key=idem_key),
+        )
+        self.assertEqual(resp_cl.status_code, 409)
+
+        # 5. Conflict on constraints -> 409 Conflict
+        conflicting_constraints = dict(base_payload)
+        conflicting_constraints["constraints"] = {"max_cost_limit_usd": 9999.0}
+        resp_cc = self.client.post(
+            "/api/v3/autonomy/grants",
+            json=conflicting_constraints,
+            headers=self._auth_headers(token="manager_token", idempotency_key=idem_key),
+        )
+        self.assertEqual(resp_cc.status_code, 409)
+
+    # -------------------------------------------------------------------------
+    # 10. A denied canonical permission prevents ALLOW
+    # -------------------------------------------------------------------------
+    def test_denied_canonical_permission_prevents_allow(self):
+        """Underlying RBAC permission denial must prevent autonomy ALLOW (both must pass)."""
+        subject_id = f"agent_perm_check_{uuid.uuid4().hex[:6]}"
+        grant = AutonomyGrant(
+            grant_id=f"grant_{uuid.uuid4().hex[:8]}",
+            subject_type=SubjectType.AGENT,
+            subject_id=subject_id,
+            autonomy_level=AutonomyLevel.RECOMMEND,
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            plant_id="plant_01",
+            data_mode="SIMULATION",
+            permitted_capabilities=["PROPOSE_ACTION"],  # Maps to action.create
+            created_by="admin_01",
+        )
+        self.repo.save_grant(grant)
+
+        # Viewer role identity does NOT hold action.create permission
+        viewer_identity = Identity(
+            user_id="view_01",
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            roles=["viewer"],
+            assigned_plants=["plant_01"],
+            clearance_level=1,
+        )
+
+        decision = self.service.evaluate_autonomy(
+            identity=viewer_identity,
+            subject_id=subject_id,
+            requested_capability="PROPOSE_ACTION",
+            resource_scope=grant.scope,
+            data_mode="SIMULATION",
+        )
+        self.assertEqual(decision.decision, AutonomyDecisionEffect.DENY)
+        self.assertEqual(decision.reason_code, AutonomyReasonCode.AUTHORIZATION_DENIED)
+        self.assertIn("Underlying authorization denied", decision.reason)
+
+    # -------------------------------------------------------------------------
+    # 11. Capability updates reject unknown capability identifiers
+    # -------------------------------------------------------------------------
+    def test_capability_updates_reject_unknown_capability_identifiers(self):
+        """Updating an existing grant with unknown capability IDs must be strictly rejected."""
+        create_resp = self.client.post(
+            "/api/v3/autonomy/grants",
+            json={
+                "subject_type": "AGENT",
+                "subject_id": f"agent_cap_upd_{uuid.uuid4().hex[:6]}",
+                "autonomy_level": "ANALYZE",
+                "workspace_id": "workspace_default",
+                "plant_id": "plant_01",
+                "data_mode": "SIMULATION",
+                "permitted_capabilities": ["ANALYZE_EVIDENCE"],
+            },
+            headers=self._auth_headers(token="manager_token"),
+        )
+        self.assertEqual(create_resp.status_code, 201)
+        grant_id = create_resp.json()["grant_id"]
+
+        # Update with unknown permitted capability
+        resp_perm = self.client.put(
+            f"/api/v3/autonomy/grants/{grant_id}",
+            json={
+                "expected_revision": 1,
+                "permitted_capabilities": ["BOGUS_NONEXISTENT_CAP_999"],
+            },
+            headers=self._auth_headers(token="manager_token"),
+        )
+        self.assertEqual(resp_perm.status_code, 400)
+        self.assertIn("Unknown capability", resp_perm.json()["detail"])
+
+        # Update with unknown restricted capability
+        resp_restr = self.client.put(
+            f"/api/v3/autonomy/grants/{grant_id}",
+            json={
+                "expected_revision": 1,
+                "restricted_capabilities": ["ANOTHER_BOGUS_CAP"],
+            },
+            headers=self._auth_headers(token="manager_token"),
+        )
+        self.assertEqual(resp_restr.status_code, 400)
+        self.assertIn("Unknown capability", resp_restr.json()["detail"])
+
+    # -------------------------------------------------------------------------
+    # 12. Levels 4 and 5 remain disabled
+    # -------------------------------------------------------------------------
+    def test_levels_4_and_5_remain_disabled(self):
+        """Levels 4 & 5 cannot be granted or updated in SageCommand V3."""
+        # Level 4 on create
+        resp_l4_create = self.client.post(
+            "/api/v3/autonomy/grants",
+            json={
+                "subject_type": "AGENT",
+                "subject_id": f"agent_l4_{uuid.uuid4().hex[:6]}",
+                "autonomy_level": "SUPERVISED_EXECUTION",
+                "workspace_id": "workspace_default",
+                "plant_id": "plant_01",
+                "data_mode": "SIMULATION",
+            },
+            headers=self._auth_headers(token="manager_token"),
+        )
+        self.assertEqual(resp_l4_create.status_code, 400)
+        self.assertIn("DISABLED and NOT_IMPLEMENTED", resp_l4_create.json()["detail"])
+
+        # Level 5 on create
+        resp_l5_create = self.client.post(
+            "/api/v3/autonomy/grants",
+            json={
+                "subject_type": "AGENT",
+                "subject_id": f"agent_l5_{uuid.uuid4().hex[:6]}",
+                "autonomy_level": "BOUNDED_AUTONOMY",
+                "workspace_id": "workspace_default",
+                "plant_id": "plant_01",
+                "data_mode": "SIMULATION",
+            },
+            headers=self._auth_headers(token="manager_token"),
+        )
+        self.assertEqual(resp_l5_create.status_code, 400)
+        self.assertIn("DISABLED and NOT_IMPLEMENTED", resp_l5_create.json()["detail"])
+
+        # Valid grant update to Level 4
+        create_resp = self.client.post(
+            "/api/v3/autonomy/grants",
+            json={
+                "subject_type": "AGENT",
+                "subject_id": f"agent_l1_{uuid.uuid4().hex[:6]}",
+                "autonomy_level": "OBSERVE",
+                "workspace_id": "workspace_default",
+                "plant_id": "plant_01",
+                "data_mode": "SIMULATION",
+            },
+            headers=self._auth_headers(token="manager_token"),
+        )
+        grant_id = create_resp.json()["grant_id"]
+
+        resp_l4_upd = self.client.put(
+            f"/api/v3/autonomy/grants/{grant_id}",
+            json={
+                "expected_revision": 1,
+                "autonomy_level": "SUPERVISED_EXECUTION",
+            },
+            headers=self._auth_headers(token="manager_token"),
+        )
+        self.assertEqual(resp_l4_upd.status_code, 400)
+        self.assertIn("DISABLED and NOT_IMPLEMENTED", resp_l4_upd.json()["detail"])
+
+    # -------------------------------------------------------------------------
+    # 13. No new execution endpoint or operational side effect
+    # -------------------------------------------------------------------------
+    def test_no_new_execution_endpoint_or_operational_side_effect(self):
+        """Operational execution endpoints do not exist; execution capabilities evaluate to EXECUTION_DISABLED."""
+        for path in ["/api/v3/autonomy/execute", "/api/v3/autonomy/run", "/api/v3/autonomy/dispatch"]:
+            resp = self.client.post(path, json={}, headers=self._auth_headers())
+            self.assertIn(resp.status_code, [404, 405])
+
+        # Execution capabilities permanently evaluate to EXECUTION_DISABLED
+        identity = Identity(
+            user_id="mgr_456",
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            roles=["administrator"],
+            clearance_level=3,
+        )
+        for exec_cap in ["EXECUTE_SQL", "EXECUTE_COMMAND", "CONTROL_PLC"]:
+            dec = self.service.evaluate_autonomy(
+                identity=identity,
+                subject_id="agent_exec_test",
+                requested_capability=exec_cap,
+                resource_scope=AutonomyScope(tenant_id="tenant_default", workspace_id="workspace_default"),
+                data_mode="REAL",
+            )
+            self.assertEqual(dec.decision, AutonomyDecisionEffect.DENY)
+            self.assertEqual(dec.reason_code, AutonomyReasonCode.EXECUTION_DISABLED)
 
 
 if __name__ == "__main__":

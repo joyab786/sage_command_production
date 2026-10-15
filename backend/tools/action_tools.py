@@ -129,7 +129,7 @@ def propose_action(
         if active_ident:
             effective_tenant = active_ident.tenant_id
             effective_workspace = active_ident.workspace_id
-            effective_session = active_ident.session_id
+            effective_session = active_ident.session_id or session_id or "session_default"
             auth_ident = active_ident
         else:
             effective_tenant = tenant_id

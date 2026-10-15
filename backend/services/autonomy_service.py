@@ -57,6 +57,9 @@ try:
         AutonomyInvalidTransitionError,
         AutonomyIdempotencyConflictError,
     )
+    from services.action_registry import action_registry
+    from services.action_store import action_store
+    from data.schemas.action_contract import ActionType, RiskLevel
 except (ImportError, ModuleNotFoundError):
     from backend.core.auth import Identity
     from backend.governance.audit import log_security_event
@@ -94,6 +97,9 @@ except (ImportError, ModuleNotFoundError):
         AutonomyInvalidTransitionError,
         AutonomyIdempotencyConflictError,
     )
+    from backend.services.action_registry import action_registry
+    from backend.services.action_store import action_store
+    from backend.data.schemas.action_contract import ActionType, RiskLevel
 
 logger = logging.getLogger("autonomy_service")
 
@@ -112,6 +118,35 @@ class AutonomyService:
     ):
         self.repository = repository or autonomy_repository
         self.capability_registry = capability_registry or default_capability_registry
+
+    def _resolve_caller_workspace(self, identity: Identity, requested_workspace: Optional[str] = None) -> Optional[str]:
+        """
+        Enforces workspace isolation across all autonomy operations.
+        Derives caller's authoritative workspace from identity.
+        Non-administrators are strictly confined to their authoritative workspace.
+        """
+        caller_ws = getattr(identity, "workspace_id", None) or "workspace_default"
+        user_roles = [r.upper() for r in getattr(identity, "roles", [])]
+        is_admin = bool({"ADMINISTRATOR", "ADMIN", "SECURITY_ADMIN"} & set(user_roles))
+
+        if requested_workspace is not None and requested_workspace.strip() != "":
+            clean_req = requested_workspace.strip()
+            if clean_req == "*":
+                if not is_admin:
+                    raise AutonomyRepositoryError(
+                        f"Cross-workspace violation: identity '{identity.user_id}' lacks administrator authority for wildcard workspace '*'. "
+                        f"Confined to workspace '{caller_ws}'."
+                    )
+                return "*"
+            if clean_req != caller_ws and not is_admin:
+                raise AutonomyRepositoryError(
+                    f"Cross-workspace access denied: identity '{identity.user_id}' is confined to workspace '{caller_ws}' "
+                    f"and cannot access or manage workspace '{clean_req}'."
+                )
+            return clean_req
+        if not is_admin:
+            return caller_ws
+        return None
 
     # =========================================================================
     # 1. DETERMINISTIC CAPABILITY EVALUATION ENGINE
@@ -164,6 +199,8 @@ class AutonomyService:
         norm_data_mode = data_mode.strip().upper() if isinstance(data_mode, str) else "SIMULATION"
         risk_ctx = risk_context or {}
 
+        caller_session = resource_scope.session_id or getattr(identity, "session_id", None)
+
         # Step 1: Caller Identity Active Status Check
         if identity.status.upper() != "ACTIVE":
             dec = AutonomyDecision.create(
@@ -179,8 +216,7 @@ class AutonomyService:
                 risk_status="UNKNOWN",
                 request_id=request_id,
             )
-            self._audit_and_persist_decision(dec, identity)
-            return dec
+            return self._audit_and_persist_decision(dec, identity)
 
         # Step 2: Tenant Isolation Check
         if identity.tenant_id != resource_scope.tenant_id:
@@ -197,12 +233,13 @@ class AutonomyService:
                 risk_status="UNKNOWN",
                 request_id=request_id,
             )
-            self._audit_and_persist_decision(dec, identity)
-            return dec
+            return self._audit_and_persist_decision(dec, identity)
 
         # Step 3: Workspace Scope Check
         if resource_scope.workspace_id and resource_scope.workspace_id != "*":
-            if identity.workspace_id != "*" and identity.workspace_id != resource_scope.workspace_id:
+            user_roles = [r.upper() for r in getattr(identity, "roles", [])]
+            is_admin = bool({"ADMINISTRATOR", "ADMIN", "SECURITY_ADMIN"} & set(user_roles))
+            if identity.workspace_id != "*" and identity.workspace_id != resource_scope.workspace_id and not is_admin:
                 dec = AutonomyDecision.create(
                     decision=AutonomyDecisionEffect.DENY,
                     reason_code=AutonomyReasonCode.WORKSPACE_MISMATCH,
@@ -216,8 +253,7 @@ class AutonomyService:
                     risk_status="UNKNOWN",
                     request_id=request_id,
                 )
-                self._audit_and_persist_decision(dec, identity)
-                return dec
+                return self._audit_and_persist_decision(dec, identity)
 
         # Step 4: Plant Scope Check
         if resource_scope.plant_id and resource_scope.plant_id != "*":
@@ -236,27 +272,24 @@ class AutonomyService:
                     risk_status="UNKNOWN",
                     request_id=request_id,
                 )
-                self._audit_and_persist_decision(dec, identity)
-                return dec
+                return self._audit_and_persist_decision(dec, identity)
 
         # Step 5: Session Scope Check
-        if resource_scope.session_id:
-            if identity.session_id and identity.session_id != resource_scope.session_id:
-                dec = AutonomyDecision.create(
-                    decision=AutonomyDecisionEffect.DENY,
-                    reason_code=AutonomyReasonCode.SESSION_MISMATCH,
-                    reason=f"Session mismatch: request session '{resource_scope.session_id}' does not match caller session '{identity.session_id}'.",
-                    subject_type=subject_type,
-                    subject_id=clean_subject_id,
-                    requested_capability=req_cap,
-                    effective_autonomy_level=AutonomyLevel.LEVEL_0_OBSERVE,
-                    scope=resource_scope,
-                    data_mode=norm_data_mode,
-                    risk_status="UNKNOWN",
-                    request_id=request_id,
-                )
-                self._audit_and_persist_decision(dec, identity)
-                return dec
+        if resource_scope.session_id and identity.session_id and identity.session_id != resource_scope.session_id:
+            dec = AutonomyDecision.create(
+                decision=AutonomyDecisionEffect.DENY,
+                reason_code=AutonomyReasonCode.SESSION_MISMATCH,
+                reason=f"Session mismatch: request session '{resource_scope.session_id}' does not match caller session '{identity.session_id}'.",
+                subject_type=subject_type,
+                subject_id=clean_subject_id,
+                requested_capability=req_cap,
+                effective_autonomy_level=AutonomyLevel.LEVEL_0_OBSERVE,
+                scope=resource_scope,
+                data_mode=norm_data_mode,
+                risk_status="UNKNOWN",
+                request_id=request_id,
+            )
+            return self._audit_and_persist_decision(dec, identity)
 
         # Step 6: Capability Registry Allowlist Check
         cap_def = self.capability_registry.get(req_cap)
@@ -274,8 +307,7 @@ class AutonomyService:
                 risk_status="UNKNOWN",
                 request_id=request_id,
             )
-            self._audit_and_persist_decision(dec, identity)
-            return dec
+            return self._audit_and_persist_decision(dec, identity)
 
         # Step 7: Execution Boundary Guard (Non-negotiable)
         if cap_def.is_execution or cap_def.minimum_level >= AutonomyLevel.LEVEL_4_SUPERVISED_EXECUTION:
@@ -292,8 +324,7 @@ class AutonomyService:
                 risk_status="UNKNOWN",
                 request_id=request_id,
             )
-            self._audit_and_persist_decision(dec, identity)
-            return dec
+            return self._audit_and_persist_decision(dec, identity)
 
         # Step 8: Implementation Availability
         if not cap_def.is_implemented:
@@ -310,10 +341,9 @@ class AutonomyService:
                 risk_status="UNKNOWN",
                 request_id=request_id,
             )
-            self._audit_and_persist_decision(dec, identity)
-            return dec
+            return self._audit_and_persist_decision(dec, identity)
 
-        # Step 9: Active Autonomy Grant Lookup
+        # Step 9: Active Autonomy Grant Lookup (Session-aware)
         active_grant = self.repository.get_active_grant_for_subject(
             subject_type=subject_type,
             subject_id=clean_subject_id,
@@ -321,6 +351,7 @@ class AutonomyService:
             workspace_id=resource_scope.workspace_id,
             plant_id=resource_scope.plant_id,
             data_mode=norm_data_mode,
+            session_id=caller_session,
         )
 
         if not active_grant:
@@ -346,6 +377,12 @@ class AutonomyService:
                 elif g.is_expired():
                     r_code = AutonomyReasonCode.AUTONOMY_GRANT_EXPIRED
                     msg = f"Autonomy grant '{g.grant_id}' for subject '{clean_subject_id}' expired at timestamp {g.expires_at}."
+                elif g.session_id and not caller_session:
+                    r_code = AutonomyReasonCode.SESSION_MISMATCH
+                    msg = f"Session context missing: subject '{clean_subject_id}' has a session-bound grant '{g.grant_id}' for session '{g.session_id}', but caller provided no session context."
+                elif g.session_id and caller_session and g.session_id != caller_session:
+                    r_code = AutonomyReasonCode.SESSION_MISMATCH
+                    msg = f"Session mismatch: subject '{clean_subject_id}' grant '{g.grant_id}' is bound to session '{g.session_id}', but request session is '{caller_session}'."
                 else:
                     r_code = AutonomyReasonCode.AUTONOMY_GRANT_NOT_FOUND
                     msg = f"No active autonomy grant found for subject '{clean_subject_id}' matching target scope."
@@ -366,10 +403,9 @@ class AutonomyService:
                 risk_status="UNKNOWN",
                 request_id=request_id,
             )
-            self._audit_and_persist_decision(dec, identity)
-            return dec
+            return self._audit_and_persist_decision(dec, identity)
 
-        # Step 9: Grant Level Sufficiency Check
+        # Step 10: Grant Level Sufficiency Check
         if active_grant.autonomy_level < cap_def.minimum_level:
             dec = AutonomyDecision.create(
                 decision=AutonomyDecisionEffect.DENY,
@@ -388,10 +424,9 @@ class AutonomyService:
                 request_id=request_id,
                 grant_id=active_grant.grant_id,
             )
-            self._audit_and_persist_decision(dec, identity)
-            return dec
+            return self._audit_and_persist_decision(dec, identity)
 
-        # Step 10: Capability Restrictions and Permitted Allowlist in Grant
+        # Step 11: Capability Restrictions and Permitted Allowlist in Grant
         if req_cap in active_grant.restricted_capabilities:
             dec = AutonomyDecision.create(
                 decision=AutonomyDecisionEffect.DENY,
@@ -407,8 +442,7 @@ class AutonomyService:
                 request_id=request_id,
                 grant_id=active_grant.grant_id,
             )
-            self._audit_and_persist_decision(dec, identity)
-            return dec
+            return self._audit_and_persist_decision(dec, identity)
 
         if active_grant.permitted_capabilities and req_cap not in active_grant.permitted_capabilities:
             dec = AutonomyDecision.create(
@@ -425,10 +459,9 @@ class AutonomyService:
                 request_id=request_id,
                 grant_id=active_grant.grant_id,
             )
-            self._audit_and_persist_decision(dec, identity)
-            return dec
+            return self._audit_and_persist_decision(dec, identity)
 
-        # Step 11: Data Mode Isolation Check
+        # Step 12: Data Mode Isolation Check
         if active_grant.data_mode == "SIMULATION" and norm_data_mode == "REAL":
             dec = AutonomyDecision.create(
                 decision=AutonomyDecisionEffect.DENY,
@@ -444,10 +477,9 @@ class AutonomyService:
                 request_id=request_id,
                 grant_id=active_grant.grant_id,
             )
-            self._audit_and_persist_decision(dec, identity)
-            return dec
+            return self._audit_and_persist_decision(dec, identity)
 
-        # Step 12: Scope Intersection Validation (Grant Scope vs Requested Resource Scope)
+        # Step 13: Scope Intersection Validation (Grant Scope vs Requested Resource Scope)
         if active_grant.workspace_id and active_grant.workspace_id != "*":
             if resource_scope.workspace_id and resource_scope.workspace_id != active_grant.workspace_id:
                 dec = AutonomyDecision.create(
@@ -464,8 +496,7 @@ class AutonomyService:
                     request_id=request_id,
                     grant_id=active_grant.grant_id,
                 )
-                self._audit_and_persist_decision(dec, identity)
-                return dec
+                return self._audit_and_persist_decision(dec, identity)
 
         if active_grant.plant_id and active_grant.plant_id != "*":
             if resource_scope.plant_id and resource_scope.plant_id != active_grant.plant_id:
@@ -483,15 +514,15 @@ class AutonomyService:
                     request_id=request_id,
                     grant_id=active_grant.grant_id,
                 )
-                self._audit_and_persist_decision(dec, identity)
-                return dec
+                return self._audit_and_persist_decision(dec, identity)
 
+        # Strict Session-Bound Check
         if active_grant.session_id:
-            if resource_scope.session_id and resource_scope.session_id != active_grant.session_id:
+            if not caller_session:
                 dec = AutonomyDecision.create(
                     decision=AutonomyDecisionEffect.DENY,
                     reason_code=AutonomyReasonCode.SESSION_MISMATCH,
-                    reason=f"Scope violation: grant is bound to session '{active_grant.session_id}', but resource targets session '{resource_scope.session_id}'.",
+                    reason=f"Session context missing: grant '{active_grant.grant_id}' is strictly bound to session '{active_grant.session_id}', but caller provided no session identifier.",
                     subject_type=subject_type,
                     subject_id=clean_subject_id,
                     requested_capability=req_cap,
@@ -502,15 +533,30 @@ class AutonomyService:
                     request_id=request_id,
                     grant_id=active_grant.grant_id,
                 )
-                self._audit_and_persist_decision(dec, identity)
-                return dec
+                return self._audit_and_persist_decision(dec, identity)
+            if caller_session != active_grant.session_id:
+                dec = AutonomyDecision.create(
+                    decision=AutonomyDecisionEffect.DENY,
+                    reason_code=AutonomyReasonCode.SESSION_MISMATCH,
+                    reason=f"Scope violation: grant is bound to session '{active_grant.session_id}', but request session is '{caller_session}'.",
+                    subject_type=subject_type,
+                    subject_id=clean_subject_id,
+                    requested_capability=req_cap,
+                    effective_autonomy_level=active_grant.autonomy_level,
+                    scope=resource_scope,
+                    data_mode=norm_data_mode,
+                    risk_status="UNKNOWN",
+                    request_id=request_id,
+                    grant_id=active_grant.grant_id,
+                )
+                return self._audit_and_persist_decision(dec, identity)
 
-        # Step 13: Underlying Authorization Integration
+        # Step 14: Underlying Authorization Integration
         if cap_def.canonical_permission:
             authz_scope = AuthorizationScope(
                 tenant_id=resource_scope.tenant_id,
                 workspace_id=resource_scope.workspace_id,
-                session_id=resource_scope.session_id,
+                session_id=caller_session,
                 plant_id=resource_scope.plant_id,
                 line_id=resource_scope.line_id,
                 machine_id=resource_scope.equipment_id,
@@ -522,7 +568,7 @@ class AutonomyService:
                 data_mode=norm_data_mode,
             )
             authz_dec = authorization_service.evaluate(authz_ctx)
-            if authz_dec.effect == AuthzDecisionEffect.DENY:
+            if authz_dec.effect != AuthzDecisionEffect.ALLOW:
                 dec = AutonomyDecision.create(
                     decision=AutonomyDecisionEffect.DENY,
                     reason_code=AutonomyReasonCode.AUTHORIZATION_DENIED,
@@ -537,18 +583,132 @@ class AutonomyService:
                     request_id=request_id,
                     grant_id=active_grant.grant_id,
                 )
-                self._audit_and_persist_decision(dec, identity)
-                return dec
+                return self._audit_and_persist_decision(dec, identity)
 
-        # Step 14: Risk and Human Approval Constraints
-        risk_level = str(risk_ctx.get("risk_level", "UNKNOWN")).strip().upper()
-        if risk_level not in ("LOW", "MEDIUM", "HIGH", "CRITICAL", "UNKNOWN"):
-            risk_level = "UNKNOWN"
+        # Step 15: Authoritative Deterministic Risk & Approval Evaluation
+        client_claimed_risk = str(risk_ctx.get("risk_level", "")).strip().upper()
+        action_id = risk_ctx.get("action_id")
+        action_type_str = risk_ctx.get("action_type")
+        target_res_id = risk_ctx.get("target_resource_id") or resource_scope.equipment_id
+
+        system_risk = None
+        system_requires_approval = False
+
+        # 1. Authoritative check via action_id against action_store
+        if action_id:
+            try:
+                stored_action = action_store.get_action(str(action_id).strip(), tenant_id=resource_scope.tenant_id)
+                if stored_action:
+                    # Validate action plant against evaluation plant scope
+                    if stored_action.target and resource_scope.plant_id and resource_scope.plant_id != "*":
+                        act_plant = getattr(stored_action.target, "plant_id", None)
+                        if act_plant and act_plant != resource_scope.plant_id:
+                            dec = AutonomyDecision.create(
+                                decision=AutonomyDecisionEffect.DENY,
+                                reason_code=AutonomyReasonCode.PLANT_SCOPE_DENIED,
+                                reason=f"Authoritative action plant '{act_plant}' does not match evaluation plant scope '{resource_scope.plant_id}'.",
+                                subject_type=subject_type,
+                                subject_id=clean_subject_id,
+                                requested_capability=req_cap,
+                                effective_autonomy_level=active_grant.autonomy_level,
+                                scope=resource_scope,
+                                data_mode=norm_data_mode,
+                                risk_status="UNKNOWN",
+                                request_id=request_id,
+                                grant_id=active_grant.grant_id,
+                            )
+                            return self._audit_and_persist_decision(dec, identity)
+                    system_risk = stored_action.system_risk_level.value if hasattr(stored_action.system_risk_level, "value") else str(stored_action.system_risk_level)
+                    system_requires_approval = bool(stored_action.requires_approval)
+                else:
+                    dec = AutonomyDecision.create(
+                        decision=AutonomyDecisionEffect.DENY,
+                        reason_code=AutonomyReasonCode.AUTHORIZATION_DENIED,
+                        reason=f"Authoritative action record '{action_id}' not found in tenant '{resource_scope.tenant_id}'.",
+                        subject_type=subject_type,
+                        subject_id=clean_subject_id,
+                        requested_capability=req_cap,
+                        effective_autonomy_level=active_grant.autonomy_level,
+                        scope=resource_scope,
+                        data_mode=norm_data_mode,
+                        risk_status="UNKNOWN",
+                        request_id=request_id,
+                        grant_id=active_grant.grant_id,
+                    )
+                    return self._audit_and_persist_decision(dec, identity)
+            except Exception as e:
+                logger.warning(f"Error resolving stored action: {e}")
+                dec = AutonomyDecision.create(
+                    decision=AutonomyDecisionEffect.DENY,
+                    reason_code=AutonomyReasonCode.AUTHORIZATION_DENIED,
+                    reason=f"Authoritative action record '{action_id}' could not be verified.",
+                    subject_type=subject_type,
+                    subject_id=clean_subject_id,
+                    requested_capability=req_cap,
+                    effective_autonomy_level=active_grant.autonomy_level,
+                    scope=resource_scope,
+                    data_mode=norm_data_mode,
+                    risk_status="UNKNOWN",
+                    request_id=request_id,
+                    grant_id=active_grant.grant_id,
+                )
+                return self._audit_and_persist_decision(dec, identity)
+
+        # 2. Authoritative check via action_registry
+        if system_risk is None and action_type_str:
+            clean_act_name = str(action_type_str).strip().upper()
+            try:
+                act_type_enum = ActionType(clean_act_name)
+                classified_risk = action_registry.classify_risk(
+                    action_type=act_type_enum,
+                    target={"resource_id": target_res_id, "plant_id": resource_scope.plant_id},
+                    parameters=risk_ctx.get("parameters") or {},
+                    cost_estimate=risk_ctx.get("cost_estimate_usd"),
+                    data_mode=norm_data_mode
+                )
+                system_risk = classified_risk.value if hasattr(classified_risk, "value") else str(classified_risk)
+            except (ValueError, KeyError):
+                system_risk = "UNKNOWN"
+
+        # 3. For action proposal and validation capabilities, risk must be authoritative if action context is present
+        has_action_context = bool(action_id or action_type_str or client_claimed_risk)
+        if system_risk is None:
+            if has_action_context and req_cap in ("PROPOSE_ACTION", "VALIDATE_ACTION", "PREPARE_APPROVAL_PACKAGE", "REQUEST_HUMAN_REVIEW"):
+                system_risk = "UNKNOWN"
+            else:
+                system_risk = "LOW"
+
+        # INVARIANT: Client-supplied risk cannot downgrade system-computed risk!
+        # If client claims LOW but system computed HIGH or CRITICAL, system_risk prevails.
+        risk_rank = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4, "UNKNOWN": 5}
+        authoritative_risk = system_risk
+        if client_claimed_risk in risk_rank and authoritative_risk in risk_rank:
+            # Client can only claim higher risk (conservative escalation), never downgrade!
+            if risk_rank[client_claimed_risk] > risk_rank[authoritative_risk]:
+                authoritative_risk = client_claimed_risk
+
+        # If authoritative risk is UNKNOWN for an action capability: fail closed to review required
+        if authoritative_risk == "UNKNOWN" and req_cap in ("PROPOSE_ACTION", "VALIDATE_ACTION", "PREPARE_APPROVAL_PACKAGE", "REQUEST_HUMAN_REVIEW"):
+            dec = AutonomyDecision.create(
+                decision=AutonomyDecisionEffect.REQUIRES_REVIEW,
+                reason_code=AutonomyReasonCode.RISK_UNKNOWN,
+                reason=f"Authoritative risk cannot be established for capability '{req_cap}'. Human review required.",
+                subject_type=subject_type,
+                subject_id=clean_subject_id,
+                requested_capability=req_cap,
+                effective_autonomy_level=active_grant.autonomy_level,
+                scope=resource_scope,
+                data_mode=norm_data_mode,
+                risk_status="UNKNOWN",
+                approval_requirement=True,
+                request_id=request_id,
+                grant_id=active_grant.grant_id,
+            )
+            return self._audit_and_persist_decision(dec, identity)
 
         # Action Type Restriction Check
-        action_type = risk_ctx.get("action_type")
-        if action_type and active_grant.constraints.restricted_action_types:
-            clean_act_type = str(action_type).strip().upper()
+        if action_type_str and active_grant.constraints.restricted_action_types:
+            clean_act_type = str(action_type_str).strip().upper()
             if clean_act_type in active_grant.constraints.restricted_action_types:
                 dec = AutonomyDecision.create(
                     decision=AutonomyDecisionEffect.DENY,
@@ -560,13 +720,12 @@ class AutonomyService:
                     effective_autonomy_level=active_grant.autonomy_level,
                     scope=resource_scope,
                     data_mode=norm_data_mode,
-                    risk_status=risk_level,
+                    risk_status=authoritative_risk,
                     approval_requirement=True,
                     request_id=request_id,
                     grant_id=active_grant.grant_id,
                 )
-                self._audit_and_persist_decision(dec, identity)
-                return dec
+                return self._audit_and_persist_decision(dec, identity)
 
         # Cost Limit Constraint Check
         cost_usd = risk_ctx.get("cost_estimate_usd")
@@ -587,19 +746,19 @@ class AutonomyService:
                         effective_autonomy_level=active_grant.autonomy_level,
                         scope=resource_scope,
                         data_mode=norm_data_mode,
-                        risk_status=risk_level,
+                        risk_status=authoritative_risk,
                         approval_requirement=True,
                         request_id=request_id,
                         grant_id=active_grant.grant_id,
                     )
-                    self._audit_and_persist_decision(dec, identity)
-                    return dec
+                    return self._audit_and_persist_decision(dec, identity)
             except (ValueError, TypeError):
                 pass
 
         # Risk Classification & Approval Evaluation
-        requires_approval = cap_def.requires_human_approval
-        if risk_level in active_grant.constraints.approval_required_for_risk_levels:
+        # An autonomy grant NEVER suppresses a mandatory approval requirement!
+        requires_approval = cap_def.requires_human_approval or system_requires_approval
+        if authoritative_risk in active_grant.constraints.approval_required_for_risk_levels:
             requires_approval = True
 
         # Separation of Duties Check
@@ -616,15 +775,14 @@ class AutonomyService:
                     effective_autonomy_level=active_grant.autonomy_level,
                     scope=resource_scope,
                     data_mode=norm_data_mode,
-                    risk_status=risk_level,
+                    risk_status=authoritative_risk,
                     approval_requirement=True,
                     request_id=request_id,
                     grant_id=active_grant.grant_id,
                 )
-                self._audit_and_persist_decision(dec, identity)
-                return dec
+                return self._audit_and_persist_decision(dec, identity)
 
-        # Step 15: ALLOW Capability
+        # Step 16: ALLOW Capability
         matched_constraints = [
             f"Autonomy level {active_grant.autonomy_level.title} >= {cap_def.minimum_level.title}",
             "Allowlist and restricted capabilities satisfied",
@@ -642,7 +800,7 @@ class AutonomyService:
             effective_autonomy_level=active_grant.autonomy_level,
             scope=resource_scope,
             data_mode=norm_data_mode,
-            risk_status=risk_level,
+            risk_status=authoritative_risk,
             approval_requirement=requires_approval,
             matched_constraints=matched_constraints,
             failed_constraints=[],
@@ -650,49 +808,94 @@ class AutonomyService:
             request_id=request_id,
             grant_id=active_grant.grant_id,
         )
-        self._audit_and_persist_decision(dec, identity)
-        return dec
+        return self._audit_and_persist_decision(dec, identity)
 
-    def _audit_and_persist_decision(self, decision: AutonomyDecision, identity: Identity) -> None:
-        """Persists decision and logs a safe security audit event."""
+    def _audit_and_persist_decision(self, decision: AutonomyDecision, identity: Identity) -> AutonomyDecision:
+        """
+        Persists decision to SQLite ledger and logs a safe security audit event.
+        FAIL-CLOSED INVARIANT: If mandatory persistence of an ALLOW decision fails,
+        the decision is converted to DENY with reason EVALUATION_ERROR to prevent
+        unrecorded / unaudited actions.
+        """
         try:
             self.repository.record_decision(decision)
         except Exception as e:
-            logger.error(f"Failed to persist autonomy decision: {e}")
+            logger.error(
+                f"Mandatory autonomy decision persistence failed for decision_id={decision.decision_id}, "
+                f"request_id={decision.request_id}, subject={decision.subject_id}: {type(e).__name__}"
+            )
+            if decision.decision == AutonomyDecisionEffect.ALLOW:
+                # Strictly fail closed: ALLOW without audit persistence is forbidden
+                denial = AutonomyDecision.create(
+                    decision=AutonomyDecisionEffect.DENY,
+                    reason_code=AutonomyReasonCode.EVALUATION_ERROR,
+                    reason="Mandatory audit persistence failed; operation denied for safety.",
+                    subject_type=decision.subject_type,
+                    subject_id=decision.subject_id,
+                    requested_capability=decision.requested_capability,
+                    effective_autonomy_level=decision.effective_autonomy_level,
+                    scope=decision.scope,
+                    data_mode=decision.data_mode,
+                    risk_status=decision.risk_status,
+                    approval_requirement=True,
+                    request_id=decision.request_id,
+                    grant_id=decision.grant_id,
+                )
+                try:
+                    log_security_event(
+                        event_name="AUTONOMY_AUDIT_PERSISTENCE_FAILURE",
+                        details={
+                            "original_decision_id": decision.decision_id,
+                            "denial_decision_id": denial.decision_id,
+                            "subject_id": decision.subject_id,
+                            "requested_capability": decision.requested_capability,
+                        },
+                        severity="CRITICAL",
+                        user_id=identity.user_id,
+                        tenant_id=decision.scope.tenant_id,
+                        session_id=decision.scope.session_id,
+                    )
+                except Exception:
+                    pass
+                return denial
 
-        # Map to audit event name
-        evt_map = {
-            AutonomyDecisionEffect.ALLOW: "AUTONOMY_CAPABILITY_ALLOWED",
-            AutonomyDecisionEffect.DENY: "AUTONOMY_CAPABILITY_DENIED",
-            AutonomyDecisionEffect.REQUIRES_REVIEW: "AUTONOMY_REVIEW_REQUIRED",
-            AutonomyDecisionEffect.NOT_IMPLEMENTED: "AUTONOMY_UNIMPLEMENTED_CAPABILITY_REQUESTED",
-        }
-        event_name = evt_map.get(decision.decision, "AUTONOMY_CAPABILITY_DENIED")
+        # Best-effort operational logging to security event audit log
+        try:
+            evt_map = {
+                AutonomyDecisionEffect.ALLOW: "AUTONOMY_CAPABILITY_ALLOWED",
+                AutonomyDecisionEffect.DENY: "AUTONOMY_CAPABILITY_DENIED",
+                AutonomyDecisionEffect.REQUIRES_REVIEW: "AUTONOMY_REVIEW_REQUIRED",
+                AutonomyDecisionEffect.NOT_IMPLEMENTED: "AUTONOMY_UNIMPLEMENTED_CAPABILITY_REQUESTED",
+            }
+            event_name = evt_map.get(decision.decision, "AUTONOMY_CAPABILITY_DENIED")
+            log_security_event(
+                event_name=event_name,
+                details={
+                    "decision_id": decision.decision_id,
+                    "subject_type": decision.subject_type.value,
+                    "subject_id": decision.subject_id,
+                    "requested_capability": decision.requested_capability,
+                    "effective_level": int(decision.effective_autonomy_level),
+                    "decision": decision.decision.value,
+                    "reason_code": decision.reason_code.value,
+                    "tenant_id": decision.scope.tenant_id,
+                    "workspace_id": decision.scope.workspace_id,
+                    "plant_id": decision.scope.plant_id,
+                    "data_mode": decision.data_mode,
+                    "risk_status": decision.risk_status,
+                    "approval_requirement": decision.approval_requirement,
+                    "decision_hash": decision.decision_hash,
+                    "grant_id": decision.grant_id,
+                },
+                user_id=identity.user_id,
+                severity="INFO" if decision.decision == AutonomyDecisionEffect.ALLOW else "WARNING",
+                tenant_id=decision.scope.tenant_id,
+                session_id=decision.scope.session_id,
+            )
+        except Exception as e:
+            logger.warning(f"Operational audit logging error: {type(e).__name__}")
 
-        log_security_event(
-            event_name=event_name,
-            details={
-                "decision_id": decision.decision_id,
-                "subject_type": decision.subject_type.value,
-                "subject_id": decision.subject_id,
-                "requested_capability": decision.requested_capability,
-                "effective_level": int(decision.effective_autonomy_level),
-                "decision": decision.decision.value,
-                "reason_code": decision.reason_code.value,
-                "tenant_id": decision.scope.tenant_id,
-                "workspace_id": decision.scope.workspace_id,
-                "plant_id": decision.scope.plant_id,
-                "data_mode": decision.data_mode,
-                "risk_status": decision.risk_status,
-                "approval_requirement": decision.approval_requirement,
-                "decision_hash": decision.decision_hash,
-                "grant_id": decision.grant_id,
-            },
-            user_id=identity.user_id,
-            severity="INFO" if decision.decision == AutonomyDecisionEffect.ALLOW else "WARNING",
-            tenant_id=decision.scope.tenant_id,
-            session_id=decision.scope.session_id,
-        )
+        return decision
 
     # =========================================================================
     # 2. GRANT LIFECYCLE MANAGEMENT
@@ -744,6 +947,7 @@ class AutonomyService:
         """
         Creates and persists a new autonomy grant under caller's authoritative identity and scope.
         Client-supplied created_by or tenant_id are ignored.
+        Enforces workspace isolation so callers cannot create grants for unauthorized workspaces.
         """
         self._require_grant_permission(identity, "grant")
 
@@ -770,8 +974,8 @@ class AutonomyService:
                     raise ValueError(f"Unknown capability '{clean_cap}' in restricted_capabilities.")
                 restricted.append(clean_cap)
 
-        # Build authoritative scope
-        target_ws = request.workspace_id or identity.workspace_id or "workspace_default"
+        # Build authoritative scope with workspace isolation enforcement
+        target_ws = self._resolve_caller_workspace(identity, request.workspace_id) or getattr(identity, "workspace_id", None) or "workspace_default"
         target_plant = request.plant_id
         if target_plant and target_plant != "*":
             user_plants = identity.assigned_plants or []
@@ -836,21 +1040,48 @@ class AutonomyService:
         grant_id: str,
         request: AutonomyGrantUpdateRequest
     ) -> AutonomyGrant:
-        """Updates an existing grant under revision control."""
+        """
+        Updates an existing grant under revision control and workspace isolation.
+        Validates capabilities strictly and enforces lifecycle rules.
+        """
         self._require_grant_permission(identity, "grant")
+        effective_ws = self._resolve_caller_workspace(identity, None)
 
         if request.autonomy_level is not None and request.autonomy_level >= AutonomyLevel.LEVEL_4_SUPERVISED_EXECUTION:
             raise ValueError(
                 f"Autonomy {request.autonomy_level.name} is DISABLED and NOT_IMPLEMENTED in SageCommand V3."
             )
 
+        permitted = None
+        if request.permitted_capabilities is not None:
+            permitted = []
+            for cap_id in request.permitted_capabilities:
+                clean_cap = cap_id.strip().upper()
+                if not self.capability_registry.is_known(clean_cap):
+                    raise ValueError(f"Unknown capability '{clean_cap}' in permitted_capabilities.")
+                permitted.append(clean_cap)
+
+        restricted = None
+        if request.restricted_capabilities is not None:
+            restricted = []
+            for cap_id in request.restricted_capabilities:
+                clean_cap = cap_id.strip().upper()
+                if not self.capability_registry.is_known(clean_cap):
+                    raise ValueError(f"Unknown capability '{clean_cap}' in restricted_capabilities.")
+                restricted.append(clean_cap)
+
+        if request.status == AutonomyGrantStatus.REVOKED:
+            raise AutonomyInvalidTransitionError(
+                "Direct update to REVOKED status is prohibited. Use revoke_grant to maintain audit invariants."
+            )
+
         def _apply_update(g: AutonomyGrant) -> AutonomyGrant:
             if request.autonomy_level is not None:
                 g.autonomy_level = request.autonomy_level
-            if request.permitted_capabilities is not None:
-                g.permitted_capabilities = [c.strip().upper() for c in request.permitted_capabilities]
-            if request.restricted_capabilities is not None:
-                g.restricted_capabilities = [c.strip().upper() for c in request.restricted_capabilities]
+            if permitted is not None:
+                g.permitted_capabilities = permitted
+            if restricted is not None:
+                g.restricted_capabilities = restricted
             if request.constraints is not None:
                 g.constraints = request.constraints
             if request.status is not None:
@@ -866,6 +1097,7 @@ class AutonomyService:
             changed_by=identity.user_id,
             change_reason=request.update_reason,
             update_fn=_apply_update,
+            workspace_id=effective_ws,
         )
 
         log_security_event(
@@ -888,14 +1120,16 @@ class AutonomyService:
         expected_revision: int,
         reason: str
     ) -> AutonomyGrant:
-        """Suspends an active grant."""
+        """Suspends an active grant with workspace isolation."""
         self._require_grant_permission(identity, "grant")
+        effective_ws = self._resolve_caller_workspace(identity, None)
         suspended = self.repository.suspend_grant(
             grant_id=grant_id,
             tenant_id=identity.tenant_id,
             expected_revision=expected_revision,
             changed_by=identity.user_id,
             reason=reason,
+            workspace_id=effective_ws,
         )
         log_security_event(
             event_name="AUTONOMY_GRANT_SUSPENDED",
@@ -916,14 +1150,16 @@ class AutonomyService:
         expected_revision: int,
         reason: str
     ) -> AutonomyGrant:
-        """Permanently revokes an autonomy grant."""
+        """Permanently revokes an autonomy grant with workspace isolation."""
         self._require_grant_permission(identity, "grant")
+        effective_ws = self._resolve_caller_workspace(identity, None)
         revoked = self.repository.revoke_grant(
             grant_id=grant_id,
             tenant_id=identity.tenant_id,
             expected_revision=expected_revision,
             changed_by=identity.user_id,
             reason=reason,
+            workspace_id=effective_ws,
         )
         log_security_event(
             event_name="AUTONOMY_GRANT_REVOKED",
@@ -943,12 +1179,13 @@ class AutonomyService:
         grant_id: str,
         workspace_id: Optional[str] = None
     ) -> Optional[AutonomyGrant]:
-        """Retrieves an authorized autonomy grant within caller's tenant."""
+        """Retrieves an authorized autonomy grant within caller's tenant and workspace."""
         self._require_grant_permission(identity, "read")
+        effective_ws = self._resolve_caller_workspace(identity, workspace_id)
         return self.repository.get_grant(
             grant_id=grant_id,
             tenant_id=identity.tenant_id,
-            workspace_id=workspace_id,
+            workspace_id=effective_ws,
         )
 
     def list_grants(
@@ -961,11 +1198,12 @@ class AutonomyService:
         limit: int = 50,
         offset: int = 0
     ) -> Tuple[List[AutonomyGrant], int]:
-        """Lists grants within caller's authorized tenant."""
+        """Lists grants within caller's authorized tenant and workspace."""
         self._require_grant_permission(identity, "read")
+        effective_ws = self._resolve_caller_workspace(identity, workspace_id)
         return self.repository.list_grants(
             tenant_id=identity.tenant_id,
-            workspace_id=workspace_id,
+            workspace_id=effective_ws,
             subject_type=subject_type,
             subject_id=subject_id,
             status=status,
@@ -980,11 +1218,12 @@ class AutonomyService:
         subject_id: Optional[str] = None,
         limit: int = 50
     ) -> List[AutonomyDecision]:
-        """Lists recent autonomy decisions within caller's authorized tenant."""
+        """Lists recent autonomy decisions within caller's authorized tenant and workspace."""
         self._require_grant_permission(identity, "read")
+        effective_ws = self._resolve_caller_workspace(identity, workspace_id)
         return self.repository.list_decisions(
             tenant_id=identity.tenant_id,
-            workspace_id=workspace_id,
+            workspace_id=effective_ws,
             subject_id=subject_id,
             limit=limit,
         )

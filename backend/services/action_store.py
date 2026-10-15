@@ -183,6 +183,8 @@ class ActionStore:
             return act
         return None
 
+    get_action = get_by_id
+
     def get(self, action_id: str, tenant_id: Optional[str] = None) -> Optional[Action]:
         """Convenience accessor to retrieve action by ID with optional tenant isolation."""
         if tenant_id:

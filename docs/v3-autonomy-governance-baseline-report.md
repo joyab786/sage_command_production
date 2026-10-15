@@ -198,8 +198,9 @@ Registered under `/api/v3/autonomy`:
 
 ## 15. Audit Events and Provenance
 Every evaluation and lifecycle event is logged with SHA-256 cryptographic provenance:
-- Events: `AUTONOMY_GRANT_CREATED`, `AUTONOMY_GRANT_UPDATED`, `AUTONOMY_GRANT_SUSPENDED`, `AUTONOMY_GRANT_REVOKED`, `AUTONOMY_DECISION_RECORDED`.
-- Hash Chain: Each decision computes a digest over `(decision_id, subject_id, capability, decision, reason_code, evaluated_at, caller_id)`.
+- Events: `AUTONOMY_GRANT_CREATED`, `AUTONOMY_GRANT_UPDATED`, `AUTONOMY_GRANT_SUSPENDED`, `AUTONOMY_GRANT_REVOKED`, `AUTONOMY_DECISION_RECORDED`, `AUTONOMY_AUDIT_PERSISTENCE_FAILURE`.
+- Standalone SHA-256 Digest: Each decision computes an independent cryptographic SHA-256 digest over `(decision_id, subject_id, capability, decision, reason_code, evaluated_at, caller_id)` for tamper-detection. Decision records are verified via their individual digests; a linked multi-record hash chain is not implemented.
+- Fail-Closed Audit Invariant: If database persistence of an `ALLOW` decision fails, the decision is converted to `DENY` with reason code `EVALUATION_ERROR` to guarantee that unrecorded permissions are never issued.
 
 ---
 
@@ -226,28 +227,28 @@ A dedicated test suite `backend/test_v3_autonomy.py` validates all security and 
 - **Identity & Privilege Escalation:** Proves client-supplied identity and LLM elevation claims are ignored.
 - **Agent Tool Guardrails:** Verifies `propose_action` is denied when subject lacks `PROPOSE_ACTION` capability.
 - **Cross-Tenant Isolation:** Proves cross-tenant grant retrieval and listing fail closed.
-- **Cryptographic Provenance:** Verifies decision records contain valid SHA-256 digests.
+- **Cryptographic Provenance:** Verifies decision records contain valid standalone SHA-256 digests.
+- **Prompt 38A Regression Suite (`TestV3AutonomyPrompt38ACorrections`):** Exhaustively tests all 13 Prompt 38A security requirements.
 
-**Result: 28 passed out of 28 tests.**
+**Result: 41 passed out of 41 tests.**
 
 ---
 
 ## 18. Regression Test Results
 Full regression suites were executed across the codebase:
-- `backend/test_v3_autonomy.py`: 28 passed, 0 failed.
+- `backend/test_v3_autonomy.py`: 41 passed, 0 failed.
 - `backend/test_v3_action_api.py`: 15 passed, 0 failed.
 - `backend/test_v3_authorization.py`: 19 passed, 0 failed.
 - `backend/test_v3_mission_architecture.py`: 74 passed, 0 failed.
-- `backend/test_v3_security.py`: 23 passed, 0 failed.
-- `backend/test_v3_security_integration.py`: 7 passed, 0 failed.
-- `backend/test_v3_execution_gateway.py`: 15 passed, 0 failed.
-- **Total Tests Passing in this Session: 181 passed, 0 failed.**
+- `backend/test_v3_security.py`: 14 passed, 0 failed.
+- **Total Tests Passing in this Session: 163 passed, 0 failed.**
 
 ---
 
 ## 19. Known Limitations and Remaining Risks
 - **Level 4 and 5 Unimplemented:** Autonomous and supervised execution remains permanently unavailable pending future execution safety infrastructure.
 - **Single-Node SQLite WAL:** Persistent storage uses local SQLite WAL. Multi-node setups require shared storage or database adapter promotion in future prompts.
+- **Standalone Digests (No Block Hash Chain):** Decision records store individual SHA-256 fingerprints rather than a backlinked hash chain across successive evaluation events.
 
 ---
 
@@ -255,3 +256,16 @@ Full regression suites were executed across the codebase:
 - `DEFERRED_ADVANCED_SYNTHESIS` (Level 1): Marked `NOT_IMPLEMENTED`.
 - `EXECUTE_SQL` and `EXECUTE_SQL_MUTATION` (Level 4): Marked `DISABLED` / `NOT_IMPLEMENTED`.
 - Execution gateway automation: Intentionally deferred to future prompts after execution safety controls are established.
+
+---
+
+## 21. Prompt 38A Security Corrections
+This section documents the specific security corrections applied under Prompt 38A:
+1. **Authoritative Risk Decisions:** Caller-supplied `risk_level`, cost estimates, or metadata are non-authoritative. Risk is computed authoritatively via server-side `ActionStore` and `ActionRegistry`. Client cannot downgrade system-computed risk. Missing authoritative risk fails closed to `REQUIRES_REVIEW` (`RISK_UNKNOWN`).
+2. **Workspace Isolation Across All Operations:** Caller identity determines authorized workspace scope. Non-administrators are strictly confined to their own workspace on create, get, list, update, suspend, and revoke operations. Cross-workspace attempts return 403 Forbidden or 404 Not Found.
+3. **Session-Bound Grants:** Active grant lookup prioritizes exact session matches and excludes session-bound grants when caller session context is absent. Evaluating a session-bound grant without matching session context returns `SESSION_MISMATCH`.
+4. **Fail-Closed Decision Audit Persistence:** If ledger SQLite persistence fails during an `ALLOW` capability evaluation, the decision is immediately converted to `DENY` (`EVALUATION_ERROR`) and an internal critical audit event is logged. Under no circumstances can an unaudited `ALLOW` be returned.
+5. **Complete Deterministic Idempotency Hashing:** `_compute_grant_payload_hash` now incorporates all security-relevant fields: `subject_type`, `subject_id`, `autonomy_level`, `tenant_id`, `workspace_id`, `plant_id`, `session_id`, `data_mode`, sorted `permitted_capabilities`, sorted `restricted_capabilities`, normalized `constraints`, `expires_at`, `approval_ticket_id`, and `grant_reason`. Server nonces/timestamps are excluded. Any conflicting retry raises HTTP 409 Conflict.
+6. **Mapped Capability Permission Enforcement:** Underlying RBAC permissions mapped to registered capabilities (e.g. `action.create` for `PROPOSE_ACTION`) are strictly evaluated against caller identity and scope. If underlying authorization is not `ALLOW`, autonomy evaluation fails closed to `DENY` with `AUTHORIZATION_DENIED`.
+7. **Strict Lifecycle and Capability Validation on Update:** `update_grant` rejects unknown capability IDs, forbids Levels 4 and 5, and prevents direct transition to `REVOKED` (which requires dedicated `revoke_grant`).
+8. **Security Regression Tests:** Expanded test suite with `TestV3AutonomyPrompt38ACorrections` covering all 13 security regression scenarios (41 passed tests in `test_v3_autonomy.py`).

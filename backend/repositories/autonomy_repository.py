@@ -377,17 +377,37 @@ class AutonomyRepository:
     save_grant = create_grant
 
     def _compute_grant_payload_hash(self, grant: AutonomyGrant) -> str:
-        """Deterministic hash of substantive grant creation fields."""
+        """
+        Deterministic SHA-256 hash of all security-relevant grant creation fields.
+        Excludes server-generated nonces/timestamps (grant_id, created_at, updated_at,
+        effective_from, created_by, revision) so idempotent retries match consistently.
+        """
+        constraints_dict = {
+            "approval_required_for_risk_levels": sorted(
+                r.strip().upper() for r in (grant.constraints.approval_required_for_risk_levels or [])
+            ),
+            "max_cost_limit_usd": grant.constraints.max_cost_limit_usd,
+            "max_estimated_duration_minutes": grant.constraints.max_estimated_duration_minutes,
+            "restricted_action_types": sorted(
+                a.strip().upper() for a in (grant.constraints.restricted_action_types or [])
+            ),
+            "custom_rules": grant.constraints.custom_rules or {},
+        }
         data = {
             "subject_type": grant.subject_type.value,
-            "subject_id": grant.subject_id,
+            "subject_id": grant.subject_id.strip(),
             "autonomy_level": int(grant.autonomy_level),
-            "tenant_id": grant.tenant_id,
-            "workspace_id": grant.workspace_id,
-            "plant_id": grant.plant_id,
-            "data_mode": grant.data_mode,
-            "permitted": sorted(grant.permitted_capabilities),
-            "restricted": sorted(grant.restricted_capabilities),
+            "tenant_id": grant.tenant_id.strip(),
+            "workspace_id": (grant.workspace_id or "").strip(),
+            "plant_id": (grant.plant_id or "").strip() if grant.plant_id else None,
+            "session_id": (grant.session_id or "").strip() if grant.session_id else None,
+            "data_mode": grant.data_mode.strip().upper(),
+            "permitted": sorted(c.strip().upper() for c in (grant.permitted_capabilities or [])),
+            "restricted": sorted(c.strip().upper() for c in (grant.restricted_capabilities or [])),
+            "constraints": constraints_dict,
+            "expires_at": round(grant.expires_at, 3) if grant.expires_at is not None else None,
+            "approval_ticket_id": (grant.provenance.approval_ticket_id or "").strip() if grant.provenance.approval_ticket_id else None,
+            "grant_reason": (grant.provenance.grant_reason or "").strip(),
         }
         return hashlib.sha256(json.dumps(data, sort_keys=True).encode("utf-8")).hexdigest()
 
@@ -401,7 +421,7 @@ class AutonomyRepository:
         query = "SELECT * FROM autonomy_grants WHERE grant_id = ? AND tenant_id = ?"
         params: List[Any] = [grant_id.strip(), tenant_id.strip()]
         if workspace_id and workspace_id != "*":
-            query += " AND workspace_id = ?"
+            query += " AND (workspace_id = ? OR workspace_id = '*')"
             params.append(workspace_id.strip())
 
         row = conn.execute(query, params).fetchone()
@@ -420,7 +440,12 @@ class AutonomyRepository:
             with self._get_connection() as conn:
                 if tenant_id:
                     return self._get_grant_in_conn(conn, grant_id, tenant_id, workspace_id)
-                row = conn.execute("SELECT * FROM autonomy_grants WHERE grant_id = ?", (grant_id.strip(),)).fetchone()
+                query = "SELECT * FROM autonomy_grants WHERE grant_id = ?"
+                params = [grant_id.strip()]
+                if workspace_id and workspace_id != "*":
+                    query += " AND (workspace_id = ? OR workspace_id = '*')"
+                    params.append(workspace_id.strip())
+                row = conn.execute(query, params).fetchone()
                 if not row:
                     return None
                 return self._row_to_grant(row)
@@ -432,11 +457,14 @@ class AutonomyRepository:
         tenant_id: str,
         workspace_id: Optional[str] = None,
         plant_id: Optional[str] = None,
-        data_mode: Optional[str] = None
+        data_mode: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> Optional[AutonomyGrant]:
         """
         Finds the active, unexpired autonomy grant for a subject within authoritative scope.
-        Prioritizes narrower scope matches (e.g., matching plant_id over unrestricted).
+        Prioritizes narrower scope matches (e.g., exact session_id match, exact plant_id match).
+        If caller provides a session_id, matches grants with that session_id or non-session grants.
+        If caller provides NO session_id, only grants without a session_id are eligible.
         """
         with self._lock:
             with self._get_connection() as conn:
@@ -461,7 +489,16 @@ class AutonomyRepository:
                     query += " AND (data_mode = ? OR (data_mode = 'REAL' AND ? = 'SIMULATION'))"
                     params.extend([data_mode.strip().upper(), data_mode.strip().upper()])
 
-                query += " ORDER BY revision DESC, created_at DESC"
+                clean_sess = session_id.strip() if session_id else None
+                if clean_sess:
+                    query += " AND (session_id = ? OR session_id IS NULL)"
+                    params.append(clean_sess)
+                    query += " ORDER BY (CASE WHEN session_id = ? THEN 0 ELSE 1 END), (CASE WHEN plant_id = ? THEN 0 ELSE 1 END), revision DESC, created_at DESC"
+                    params.extend([clean_sess, plant_id.strip() if plant_id and plant_id != "*" else ""])
+                else:
+                    query += " AND (session_id IS NULL OR session_id = '')"
+                    query += " ORDER BY revision DESC, created_at DESC"
+
                 rows = conn.execute(query, params).fetchall()
 
                 now = time.time()
@@ -534,15 +571,16 @@ class AutonomyRepository:
         expected_revision: int,
         changed_by: str,
         change_reason: str,
-        update_fn: Callable[[AutonomyGrant], AutonomyGrant]
+        update_fn: Callable[[AutonomyGrant], AutonomyGrant],
+        workspace_id: Optional[str] = None,
     ) -> AutonomyGrant:
         """
         Updates an existing autonomy grant using optimistic concurrency revision control.
-        Rejects stale revisions and prevents updating revoked grants.
+        Rejects stale revisions, cross-workspace edits, and prevents updating revoked grants.
         """
         with self._lock:
             with self._get_connection() as conn:
-                existing = self._get_grant_in_conn(conn, grant_id, tenant_id)
+                existing = self._get_grant_in_conn(conn, grant_id, tenant_id, workspace_id)
                 if not existing:
                     raise AutonomyNotFoundError(
                         f"Autonomy grant '{grant_id}' not found for tenant '{tenant_id}'."
@@ -627,7 +665,8 @@ class AutonomyRepository:
         tenant_id: str,
         expected_revision: int,
         changed_by: str,
-        reason: str
+        reason: str,
+        workspace_id: Optional[str] = None,
     ) -> AutonomyGrant:
         """Transitions an active grant to SUSPENDED status."""
         def _suspend(g: AutonomyGrant) -> AutonomyGrant:
@@ -638,7 +677,15 @@ class AutonomyRepository:
             g.status = AutonomyGrantStatus.SUSPENDED
             return g
 
-        return self.update_grant(grant_id, tenant_id, expected_revision, changed_by, f"SUSPEND: {reason}", _suspend)
+        return self.update_grant(
+            grant_id=grant_id,
+            tenant_id=tenant_id,
+            expected_revision=expected_revision,
+            changed_by=changed_by,
+            change_reason=f"SUSPEND: {reason}",
+            update_fn=_suspend,
+            workspace_id=workspace_id,
+        )
 
     def revoke_grant(
         self,
@@ -647,6 +694,7 @@ class AutonomyRepository:
         expected_revision: Optional[int] = None,
         changed_by: str = "admin",
         reason: str = "Revocation",
+        workspace_id: Optional[str] = None,
         **kwargs: Any
     ) -> AutonomyGrant:
         """
@@ -662,7 +710,7 @@ class AutonomyRepository:
             expected_revision = None
 
         if expected_revision is None:
-            g = self.get_grant(grant_id, tenant_id=tenant_id)
+            g = self.get_grant(grant_id, tenant_id=tenant_id, workspace_id=workspace_id)
             if not g:
                 raise AutonomyNotFoundError(f"Grant '{grant_id}' not found.")
             expected_revision = g.revision
@@ -671,7 +719,15 @@ class AutonomyRepository:
             g.status = AutonomyGrantStatus.REVOKED
             return g
 
-        return self.update_grant(grant_id, tenant_id, expected_revision, changed_by, f"REVOKE: {reason}", _revoke)
+        return self.update_grant(
+            grant_id=grant_id,
+            tenant_id=tenant_id,
+            expected_revision=expected_revision,
+            changed_by=changed_by,
+            change_reason=f"REVOKE: {reason}",
+            update_fn=_revoke,
+            workspace_id=workspace_id,
+        )
 
     def record_decision(self, decision: AutonomyDecision) -> AutonomyDecision:
         """Records an auditable capability evaluation decision."""

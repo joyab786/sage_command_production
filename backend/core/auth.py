@@ -65,7 +65,7 @@ class Identity(BaseModel):
     workspace_id: str = Field(default="workspace_default")
     roles: List[str] = Field(default_factory=lambda: ["operator", "manager"])
     permissions: List[str] = Field(default_factory=lambda: ["read", "write", "execute"])
-    session_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    session_id: Optional[str] = Field(default=None)
     authentication_method: str = Field(default="dev_auth")
     status: str = Field(default="ACTIVE")
     assigned_plants: List[str] = Field(default_factory=lambda: ["*"])
@@ -375,8 +375,8 @@ def get_current_identity(
     session_hdr = request.headers.get("X-Session-ID") or request.headers.get("x-session-id")
     if session_hdr:
         identity.session_id = session_hdr
-    elif not IS_PRODUCTION:
-        identity.session_id = f"session_{identity.user_id}"
+    else:
+        identity.session_id = None
 
     tenant_hdr = request.headers.get("X-Tenant-ID") or request.headers.get("x-tenant-id")
     if tenant_hdr:
