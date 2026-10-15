@@ -59,7 +59,7 @@ try:
     )
     from services.action_registry import action_registry
     from services.action_store import action_store
-    from data.schemas.action_contract import ActionType, RiskLevel
+    from data.schemas.action_contract import ActionType, RiskLevel, ACTION_PARAMETER_SCHEMAS
 except (ImportError, ModuleNotFoundError):
     from backend.core.auth import Identity
     from backend.governance.audit import log_security_event
@@ -99,9 +99,30 @@ except (ImportError, ModuleNotFoundError):
     )
     from backend.services.action_registry import action_registry
     from backend.services.action_store import action_store
-    from backend.data.schemas.action_contract import ActionType, RiskLevel
+    from backend.data.schemas.action_contract import ActionType, RiskLevel, ACTION_PARAMETER_SCHEMAS
 
 logger = logging.getLogger("autonomy_service")
+
+# Server-authoritative capability categorization
+ACTION_CAPABILITIES: Set[str] = {
+    "PROPOSE_ACTION",
+    "VALIDATE_ACTION",
+    "PREPARE_APPROVAL_PACKAGE",
+    "REQUEST_HUMAN_REVIEW",
+    "VALIDATE_MISSION_DAG",
+}
+
+NON_ACTION_CAPABILITIES: Set[str] = {
+    "OBSERVE_TELEMETRY",
+    "READ_SENSOR_DATA",
+    "READ_MISSION",
+    "READ_ACTION",
+    "ANALYZE_EVIDENCE",
+    "CORRELATE_ANOMALIES",
+    "ANALYZE_ROOT_CAUSE",
+    "ESTIMATE_UNCERTAINTY",
+    "GENERATE_RECOMMENDATION",
+}
 
 
 class AutonomyService:
@@ -199,7 +220,8 @@ class AutonomyService:
         norm_data_mode = data_mode.strip().upper() if isinstance(data_mode, str) else "SIMULATION"
         risk_ctx = risk_context or {}
 
-        caller_session = resource_scope.session_id or getattr(identity, "session_id", None)
+        # The authenticated Identity.session_id is authoritative and exclusive
+        caller_session = getattr(identity, "session_id", None)
 
         # Step 1: Caller Identity Active Status Check
         if identity.status.upper() != "ACTIVE":
@@ -275,21 +297,37 @@ class AutonomyService:
                 return self._audit_and_persist_decision(dec, identity)
 
         # Step 5: Session Scope Check
-        if resource_scope.session_id and identity.session_id and identity.session_id != resource_scope.session_id:
-            dec = AutonomyDecision.create(
-                decision=AutonomyDecisionEffect.DENY,
-                reason_code=AutonomyReasonCode.SESSION_MISMATCH,
-                reason=f"Session mismatch: request session '{resource_scope.session_id}' does not match caller session '{identity.session_id}'.",
-                subject_type=subject_type,
-                subject_id=clean_subject_id,
-                requested_capability=req_cap,
-                effective_autonomy_level=AutonomyLevel.LEVEL_0_OBSERVE,
-                scope=resource_scope,
-                data_mode=norm_data_mode,
-                risk_status="UNKNOWN",
-                request_id=request_id,
-            )
-            return self._audit_and_persist_decision(dec, identity)
+        if resource_scope.session_id:
+            if not caller_session:
+                dec = AutonomyDecision.create(
+                    decision=AutonomyDecisionEffect.DENY,
+                    reason_code=AutonomyReasonCode.SESSION_MISMATCH,
+                    reason=f"Session scope '{resource_scope.session_id}' requested, but caller has no trusted session context.",
+                    subject_type=subject_type,
+                    subject_id=clean_subject_id,
+                    requested_capability=req_cap,
+                    effective_autonomy_level=AutonomyLevel.LEVEL_0_OBSERVE,
+                    scope=resource_scope,
+                    data_mode=norm_data_mode,
+                    risk_status="UNKNOWN",
+                    request_id=request_id,
+                )
+                return self._audit_and_persist_decision(dec, identity)
+            if caller_session != resource_scope.session_id:
+                dec = AutonomyDecision.create(
+                    decision=AutonomyDecisionEffect.DENY,
+                    reason_code=AutonomyReasonCode.SESSION_MISMATCH,
+                    reason=f"Session mismatch: request session '{resource_scope.session_id}' does not match trusted caller session '{caller_session}'.",
+                    subject_type=subject_type,
+                    subject_id=clean_subject_id,
+                    requested_capability=req_cap,
+                    effective_autonomy_level=AutonomyLevel.LEVEL_0_OBSERVE,
+                    scope=resource_scope,
+                    data_mode=norm_data_mode,
+                    risk_status="UNKNOWN",
+                    request_id=request_id,
+                )
+                return self._audit_and_persist_decision(dec, identity)
 
         # Step 6: Capability Registry Allowlist Check
         cap_def = self.capability_registry.get(req_cap)
@@ -567,64 +605,14 @@ class AutonomyService:
                 scope=authz_scope,
                 data_mode=norm_data_mode,
             )
-            authz_dec = authorization_service.evaluate(authz_ctx)
-            if authz_dec.effect != AuthzDecisionEffect.ALLOW:
-                dec = AutonomyDecision.create(
-                    decision=AutonomyDecisionEffect.DENY,
-                    reason_code=AutonomyReasonCode.AUTHORIZATION_DENIED,
-                    reason=f"Underlying authorization denied permission '{cap_def.canonical_permission}': {authz_dec.reason}",
-                    subject_type=subject_type,
-                    subject_id=clean_subject_id,
-                    requested_capability=req_cap,
-                    effective_autonomy_level=active_grant.autonomy_level,
-                    scope=resource_scope,
-                    data_mode=norm_data_mode,
-                    risk_status="UNKNOWN",
-                    request_id=request_id,
-                    grant_id=active_grant.grant_id,
-                )
-                return self._audit_and_persist_decision(dec, identity)
-
-        # Step 15: Authoritative Deterministic Risk & Approval Evaluation
-        client_claimed_risk = str(risk_ctx.get("risk_level", "")).strip().upper()
-        action_id = risk_ctx.get("action_id")
-        action_type_str = risk_ctx.get("action_type")
-        target_res_id = risk_ctx.get("target_resource_id") or resource_scope.equipment_id
-
-        system_risk = None
-        system_requires_approval = False
-
-        # 1. Authoritative check via action_id against action_store
-        if action_id:
             try:
-                stored_action = action_store.get_action(str(action_id).strip(), tenant_id=resource_scope.tenant_id)
-                if stored_action:
-                    # Validate action plant against evaluation plant scope
-                    if stored_action.target and resource_scope.plant_id and resource_scope.plant_id != "*":
-                        act_plant = getattr(stored_action.target, "plant_id", None)
-                        if act_plant and act_plant != resource_scope.plant_id:
-                            dec = AutonomyDecision.create(
-                                decision=AutonomyDecisionEffect.DENY,
-                                reason_code=AutonomyReasonCode.PLANT_SCOPE_DENIED,
-                                reason=f"Authoritative action plant '{act_plant}' does not match evaluation plant scope '{resource_scope.plant_id}'.",
-                                subject_type=subject_type,
-                                subject_id=clean_subject_id,
-                                requested_capability=req_cap,
-                                effective_autonomy_level=active_grant.autonomy_level,
-                                scope=resource_scope,
-                                data_mode=norm_data_mode,
-                                risk_status="UNKNOWN",
-                                request_id=request_id,
-                                grant_id=active_grant.grant_id,
-                            )
-                            return self._audit_and_persist_decision(dec, identity)
-                    system_risk = stored_action.system_risk_level.value if hasattr(stored_action.system_risk_level, "value") else str(stored_action.system_risk_level)
-                    system_requires_approval = bool(stored_action.requires_approval)
-                else:
+                authz_dec = authorization_service.evaluate(authz_ctx)
+                if not authz_dec or authz_dec.effect != AuthzDecisionEffect.ALLOW:
+                    reason_msg = authz_dec.reason if authz_dec else "Authorization returned no ALLOW decision"
                     dec = AutonomyDecision.create(
                         decision=AutonomyDecisionEffect.DENY,
                         reason_code=AutonomyReasonCode.AUTHORIZATION_DENIED,
-                        reason=f"Authoritative action record '{action_id}' not found in tenant '{resource_scope.tenant_id}'.",
+                        reason=f"Underlying authorization denied permission '{cap_def.canonical_permission}': {reason_msg}",
                         subject_type=subject_type,
                         subject_id=clean_subject_id,
                         requested_capability=req_cap,
@@ -637,11 +625,11 @@ class AutonomyService:
                     )
                     return self._audit_and_persist_decision(dec, identity)
             except Exception as e:
-                logger.warning(f"Error resolving stored action: {e}")
+                logger.warning(f"Underlying authorization evaluation failed: {e}")
                 dec = AutonomyDecision.create(
                     decision=AutonomyDecisionEffect.DENY,
                     reason_code=AutonomyReasonCode.AUTHORIZATION_DENIED,
-                    reason=f"Authoritative action record '{action_id}' could not be verified.",
+                    reason=f"Underlying authorization evaluation failed for permission '{cap_def.canonical_permission}': {e}",
                     subject_type=subject_type,
                     subject_id=clean_subject_id,
                     requested_capability=req_cap,
@@ -654,41 +642,329 @@ class AutonomyService:
                 )
                 return self._audit_and_persist_decision(dec, identity)
 
-        # 2. Authoritative check via action_registry
-        if system_risk is None and action_type_str:
-            clean_act_name = str(action_type_str).strip().upper()
-            try:
-                act_type_enum = ActionType(clean_act_name)
-                classified_risk = action_registry.classify_risk(
-                    action_type=act_type_enum,
-                    target={"resource_id": target_res_id, "plant_id": resource_scope.plant_id},
-                    parameters=risk_ctx.get("parameters") or {},
-                    cost_estimate=risk_ctx.get("cost_estimate_usd"),
-                    data_mode=norm_data_mode
-                )
-                system_risk = classified_risk.value if hasattr(classified_risk, "value") else str(classified_risk)
-            except (ValueError, KeyError):
-                system_risk = "UNKNOWN"
+        # Step 15: Authoritative Deterministic Risk & Action Evaluation
+        client_claimed_risk = str(risk_ctx.get("risk_level", "")).strip().upper()
+        action_id = risk_ctx.get("action_id")
+        action_type_str = risk_ctx.get("action_type")
+        target_res_id = risk_ctx.get("target_resource_id") or resource_scope.equipment_id
 
-        # 3. For action proposal and validation capabilities, risk must be authoritative if action context is present
-        has_action_context = bool(action_id or action_type_str or client_claimed_risk)
-        if system_risk is None:
-            if has_action_context and req_cap in ("PROPOSE_ACTION", "VALIDATE_ACTION", "PREPARE_APPROVAL_PACKAGE", "REQUEST_HUMAN_REVIEW"):
-                system_risk = "UNKNOWN"
+        system_risk = None
+        system_requires_approval = False
+        authoritative_cost = None
+
+        if req_cap in NON_ACTION_CAPABILITIES:
+            # Observation and analysis capabilities do not alter state or require action risk.
+            # Explicit rule: read-only analytical operations default to LOW system risk.
+            system_risk = "LOW"
+            system_requires_approval = False
+        elif req_cap in ACTION_CAPABILITIES:
+            # Action capabilities require authoritative action risk evaluation.
+            if action_id:
+                # 1. Authoritative check via persisted action_id against action_store
+                try:
+                    stored_action = action_store.get_action(str(action_id).strip(), tenant_id=resource_scope.tenant_id)
+                except Exception as e:
+                    logger.warning(f"Error accessing stored action: {e}")
+                    stored_action = None
+
+                if not stored_action:
+                    existing_anywhere = action_store.find_existing_by_id(str(action_id).strip())
+                    reason_c = AutonomyReasonCode.WORKSPACE_MISMATCH if existing_anywhere else AutonomyReasonCode.AUTHORIZATION_DENIED
+                    dec = AutonomyDecision.create(
+                        decision=AutonomyDecisionEffect.DENY,
+                        reason_code=reason_c,
+                        reason=f"Authoritative action record '{action_id}' not accessible or not found in tenant '{resource_scope.tenant_id}'.",
+                        subject_type=subject_type,
+                        subject_id=clean_subject_id,
+                        requested_capability=req_cap,
+                        effective_autonomy_level=active_grant.autonomy_level,
+                        scope=resource_scope,
+                        data_mode=norm_data_mode,
+                        risk_status="UNKNOWN",
+                        request_id=request_id,
+                        grant_id=active_grant.grant_id,
+                    )
+                    return self._audit_and_persist_decision(dec, identity)
+
+                # Workspace scope check on stored action
+                user_roles = [r.upper() for r in getattr(identity, "roles", [])]
+                is_admin = bool({"ADMINISTRATOR", "ADMIN", "SECURITY_ADMIN", "SYSTEM_ADMIN"} & set(user_roles))
+                if resource_scope.workspace_id and resource_scope.workspace_id != "*":
+                    if stored_action.workspace_id and stored_action.workspace_id != resource_scope.workspace_id:
+                        dec = AutonomyDecision.create(
+                            decision=AutonomyDecisionEffect.DENY,
+                            reason_code=AutonomyReasonCode.WORKSPACE_MISMATCH,
+                            reason=f"Cross-workspace action access: action '{action_id}' belongs to workspace '{stored_action.workspace_id}', but evaluation scope is '{resource_scope.workspace_id}'.",
+                            subject_type=subject_type,
+                            subject_id=clean_subject_id,
+                            requested_capability=req_cap,
+                            effective_autonomy_level=active_grant.autonomy_level,
+                            scope=resource_scope,
+                            data_mode=norm_data_mode,
+                            risk_status="UNKNOWN",
+                            request_id=request_id,
+                            grant_id=active_grant.grant_id,
+                        )
+                        return self._audit_and_persist_decision(dec, identity)
+
+                if not is_admin and identity.workspace_id != "*":
+                    if stored_action.workspace_id and stored_action.workspace_id != identity.workspace_id:
+                        dec = AutonomyDecision.create(
+                            decision=AutonomyDecisionEffect.DENY,
+                            reason_code=AutonomyReasonCode.WORKSPACE_MISMATCH,
+                            reason=f"Cross-workspace action reference: action '{action_id}' belongs to workspace '{stored_action.workspace_id}', caller workspace is '{identity.workspace_id}'.",
+                            subject_type=subject_type,
+                            subject_id=clean_subject_id,
+                            requested_capability=req_cap,
+                            effective_autonomy_level=active_grant.autonomy_level,
+                            scope=resource_scope,
+                            data_mode=norm_data_mode,
+                            risk_status="UNKNOWN",
+                            request_id=request_id,
+                            grant_id=active_grant.grant_id,
+                        )
+                        return self._audit_and_persist_decision(dec, identity)
+
+                # Data mode isolation check on stored action
+                stored_mode = str(stored_action.data_mode).strip().upper() if hasattr(stored_action, "data_mode") else "SIMULATION"
+                if stored_mode != norm_data_mode:
+                    dec = AutonomyDecision.create(
+                        decision=AutonomyDecisionEffect.DENY,
+                        reason_code=AutonomyReasonCode.DATA_MODE_MISMATCH,
+                        reason=f"Data-mode mismatch: stored action is in '{stored_mode}' mode, but evaluation requested '{norm_data_mode}'.",
+                        subject_type=subject_type,
+                        subject_id=clean_subject_id,
+                        requested_capability=req_cap,
+                        effective_autonomy_level=active_grant.autonomy_level,
+                        scope=resource_scope,
+                        data_mode=norm_data_mode,
+                        risk_status="UNKNOWN",
+                        request_id=request_id,
+                        grant_id=active_grant.grant_id,
+                    )
+                    return self._audit_and_persist_decision(dec, identity)
+
+                # Plant scope check on stored action
+                if stored_action.target and resource_scope.plant_id and resource_scope.plant_id != "*":
+                    act_plant = getattr(stored_action.target, "plant_id", None)
+                    if act_plant and act_plant != resource_scope.plant_id:
+                        dec = AutonomyDecision.create(
+                            decision=AutonomyDecisionEffect.DENY,
+                            reason_code=AutonomyReasonCode.PLANT_SCOPE_DENIED,
+                            reason=f"Authoritative action plant '{act_plant}' does not match evaluation plant scope '{resource_scope.plant_id}'.",
+                            subject_type=subject_type,
+                            subject_id=clean_subject_id,
+                            requested_capability=req_cap,
+                            effective_autonomy_level=active_grant.autonomy_level,
+                            scope=resource_scope,
+                            data_mode=norm_data_mode,
+                            risk_status="UNKNOWN",
+                            request_id=request_id,
+                            grant_id=active_grant.grant_id,
+                        )
+                        return self._audit_and_persist_decision(dec, identity)
+
+                # Session scope check on stored action
+                if caller_session and getattr(stored_action, "session_id", None):
+                    if stored_action.session_id and stored_action.session_id != caller_session:
+                        dec = AutonomyDecision.create(
+                            decision=AutonomyDecisionEffect.DENY,
+                            reason_code=AutonomyReasonCode.SESSION_MISMATCH,
+                            reason=f"Session mismatch: stored action is bound to session '{stored_action.session_id}', but caller session is '{caller_session}'.",
+                            subject_type=subject_type,
+                            subject_id=clean_subject_id,
+                            requested_capability=req_cap,
+                            effective_autonomy_level=active_grant.autonomy_level,
+                            scope=resource_scope,
+                            data_mode=norm_data_mode,
+                            risk_status="UNKNOWN",
+                            request_id=request_id,
+                            grant_id=active_grant.grant_id,
+                        )
+                        return self._audit_and_persist_decision(dec, identity)
+
+                # Consistency check: action type
+                if action_type_str:
+                    stored_type_val = stored_action.action_type.value if hasattr(stored_action.action_type, "value") else str(stored_action.action_type)
+                    if stored_type_val.strip().upper() != str(action_type_str).strip().upper():
+                        dec = AutonomyDecision.create(
+                            decision=AutonomyDecisionEffect.DENY,
+                            reason_code=AutonomyReasonCode.ACTION_VALIDATION_FAILED,
+                            reason=f"Action type mismatch: stored action is '{stored_type_val}', but evaluation request specified '{action_type_str}'.",
+                            subject_type=subject_type,
+                            subject_id=clean_subject_id,
+                            requested_capability=req_cap,
+                            effective_autonomy_level=active_grant.autonomy_level,
+                            scope=resource_scope,
+                            data_mode=norm_data_mode,
+                            risk_status="UNKNOWN",
+                            request_id=request_id,
+                            grant_id=active_grant.grant_id,
+                        )
+                        return self._audit_and_persist_decision(dec, identity)
+
+                # Consistency check: target resource
+                if target_res_id and stored_action.target:
+                    stored_target_id = getattr(stored_action.target, "resource_id", None)
+                    if stored_target_id and str(stored_target_id).strip() != str(target_res_id).strip():
+                        dec = AutonomyDecision.create(
+                            decision=AutonomyDecisionEffect.DENY,
+                            reason_code=AutonomyReasonCode.SCOPE_MISMATCH,
+                            reason=f"Target mismatch: stored action targets '{stored_target_id}', but evaluation requested '{target_res_id}'.",
+                            subject_type=subject_type,
+                            subject_id=clean_subject_id,
+                            requested_capability=req_cap,
+                            effective_autonomy_level=active_grant.autonomy_level,
+                            scope=resource_scope,
+                            data_mode=norm_data_mode,
+                            risk_status="UNKNOWN",
+                            request_id=request_id,
+                            grant_id=active_grant.grant_id,
+                        )
+                        return self._audit_and_persist_decision(dec, identity)
+
+                # Stored action is valid and consistent
+                system_risk = stored_action.system_risk_level.value if hasattr(stored_action.system_risk_level, "value") else str(stored_action.system_risk_level)
+                system_requires_approval = bool(stored_action.requires_approval)
+                if stored_action.estimated_cost and hasattr(stored_action.estimated_cost, "value") and stored_action.estimated_cost.value is not None:
+                    authoritative_cost = float(stored_action.estimated_cost.value)
+
             else:
-                system_risk = "LOW"
+                # No action_id provided
+                if req_cap in ("VALIDATE_ACTION", "PREPARE_APPROVAL_PACKAGE", "REQUEST_HUMAN_REVIEW", "VALIDATE_MISSION_DAG"):
+                    dec = AutonomyDecision.create(
+                        decision=AutonomyDecisionEffect.REQUIRES_REVIEW,
+                        reason_code=AutonomyReasonCode.RISK_UNKNOWN,
+                        reason=f"Authoritative persisted action record ('action_id') is required for capability '{req_cap}'. Human review required.",
+                        subject_type=subject_type,
+                        subject_id=clean_subject_id,
+                        requested_capability=req_cap,
+                        effective_autonomy_level=active_grant.autonomy_level,
+                        scope=resource_scope,
+                        data_mode=norm_data_mode,
+                        risk_status="UNKNOWN",
+                        approval_requirement=True,
+                        request_id=request_id,
+                        grant_id=active_grant.grant_id,
+                    )
+                    return self._audit_and_persist_decision(dec, identity)
+
+                # For PROPOSE_ACTION (server-side pre-persistence validation)
+                if not action_type_str:
+                    dec = AutonomyDecision.create(
+                        decision=AutonomyDecisionEffect.REQUIRES_REVIEW,
+                        reason_code=AutonomyReasonCode.RISK_UNKNOWN,
+                        reason=f"Action details ('action_type') omitted for action capability '{req_cap}'. Authoritative risk cannot be established.",
+                        subject_type=subject_type,
+                        subject_id=clean_subject_id,
+                        requested_capability=req_cap,
+                        effective_autonomy_level=active_grant.autonomy_level,
+                        scope=resource_scope,
+                        data_mode=norm_data_mode,
+                        risk_status="UNKNOWN",
+                        approval_requirement=True,
+                        request_id=request_id,
+                        grant_id=active_grant.grant_id,
+                    )
+                    return self._audit_and_persist_decision(dec, identity)
+
+                try:
+                    act_type_enum = ActionType(str(action_type_str).strip().upper())
+                except (ValueError, KeyError):
+                    dec = AutonomyDecision.create(
+                        decision=AutonomyDecisionEffect.REQUIRES_REVIEW,
+                        reason_code=AutonomyReasonCode.RISK_UNKNOWN,
+                        reason=f"Invalid action type '{action_type_str}'. Authoritative risk cannot be established.",
+                        subject_type=subject_type,
+                        subject_id=clean_subject_id,
+                        requested_capability=req_cap,
+                        effective_autonomy_level=active_grant.autonomy_level,
+                        scope=resource_scope,
+                        data_mode=norm_data_mode,
+                        risk_status="UNKNOWN",
+                        approval_requirement=True,
+                        request_id=request_id,
+                        grant_id=active_grant.grant_id,
+                    )
+                    return self._audit_and_persist_decision(dec, identity)
+
+                # Validate parameters against parameter schema
+                param_schema = ACTION_PARAMETER_SCHEMAS.get(act_type_enum)
+                raw_params = risk_ctx.get("parameters")
+                validated_params = {}
+                if param_schema and raw_params is not None:
+                    try:
+                        validated_params = param_schema(**raw_params).model_dump()
+                    except Exception as e:
+                        dec = AutonomyDecision.create(
+                            decision=AutonomyDecisionEffect.REQUIRES_REVIEW,
+                            reason_code=AutonomyReasonCode.RISK_UNKNOWN,
+                            reason=f"Malformed parameters for action type '{act_type_enum.value}': {e}. Human review required.",
+                            subject_type=subject_type,
+                            subject_id=clean_subject_id,
+                            requested_capability=req_cap,
+                            effective_autonomy_level=active_grant.autonomy_level,
+                            scope=resource_scope,
+                            data_mode=norm_data_mode,
+                            risk_status="UNKNOWN",
+                            approval_requirement=True,
+                            request_id=request_id,
+                            grant_id=active_grant.grant_id,
+                        )
+                        return self._audit_and_persist_decision(dec, identity)
+                elif raw_params:
+                    validated_params = raw_params
+
+                # Validate target context
+                if not target_res_id and not resource_scope.plant_id and not resource_scope.equipment_id:
+                    dec = AutonomyDecision.create(
+                        decision=AutonomyDecisionEffect.REQUIRES_REVIEW,
+                        reason_code=AutonomyReasonCode.RISK_UNKNOWN,
+                        reason=f"Missing target resource or plant context for action '{act_type_enum.value}'. Authoritative risk cannot be established.",
+                        subject_type=subject_type,
+                        subject_id=clean_subject_id,
+                        requested_capability=req_cap,
+                        effective_autonomy_level=active_grant.autonomy_level,
+                        scope=resource_scope,
+                        data_mode=norm_data_mode,
+                        risk_status="UNKNOWN",
+                        approval_requirement=True,
+                        request_id=request_id,
+                        grant_id=active_grant.grant_id,
+                    )
+                    return self._audit_and_persist_decision(dec, identity)
+
+                try:
+                    classified_risk = action_registry.classify_risk(
+                        action_type=act_type_enum,
+                        target={"resource_id": target_res_id, "plant_id": resource_scope.plant_id},
+                        parameters=validated_params,
+                        cost_estimate=risk_ctx.get("cost_estimate_usd"),
+                        data_mode=norm_data_mode,
+                    )
+                    system_risk = classified_risk.value if hasattr(classified_risk, "value") else str(classified_risk)
+                except Exception:
+                    system_risk = "UNKNOWN"
+
+                if risk_ctx.get("cost_estimate_usd") is not None:
+                    try:
+                        authoritative_cost = float(risk_ctx.get("cost_estimate_usd"))
+                    except (ValueError, TypeError):
+                        authoritative_cost = None
+        else:
+            # Capability not explicitly categorized: must establish risk or fail closed
+            system_risk = "UNKNOWN"
 
         # INVARIANT: Client-supplied risk cannot downgrade system-computed risk!
-        # If client claims LOW but system computed HIGH or CRITICAL, system_risk prevails.
+        # Client can only claim higher risk (conservative escalation), never establish that an action is safe.
         risk_rank = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4, "UNKNOWN": 5}
-        authoritative_risk = system_risk
+        authoritative_risk = system_risk or "UNKNOWN"
         if client_claimed_risk in risk_rank and authoritative_risk in risk_rank:
-            # Client can only claim higher risk (conservative escalation), never downgrade!
             if risk_rank[client_claimed_risk] > risk_rank[authoritative_risk]:
                 authoritative_risk = client_claimed_risk
 
         # If authoritative risk is UNKNOWN for an action capability: fail closed to review required
-        if authoritative_risk == "UNKNOWN" and req_cap in ("PROPOSE_ACTION", "VALIDATE_ACTION", "PREPARE_APPROVAL_PACKAGE", "REQUEST_HUMAN_REVIEW"):
+        if authoritative_risk == "UNKNOWN" and req_cap in ACTION_CAPABILITIES:
             dec = AutonomyDecision.create(
                 decision=AutonomyDecisionEffect.REQUIRES_REVIEW,
                 reason_code=AutonomyReasonCode.RISK_UNKNOWN,
@@ -728,32 +1004,70 @@ class AutonomyService:
                 return self._audit_and_persist_decision(dec, identity)
 
         # Cost Limit Constraint Check
-        cost_usd = risk_ctx.get("cost_estimate_usd")
-        if cost_usd is not None and active_grant.constraints.max_cost_limit_usd is not None:
-            try:
-                c_val = float(cost_usd)
-                if c_val > active_grant.constraints.max_cost_limit_usd:
-                    dec = AutonomyDecision.create(
-                        decision=AutonomyDecisionEffect.REQUIRES_REVIEW,
-                        reason_code=AutonomyReasonCode.POLICY_REVIEW_REQUIRED,
-                        reason=(
-                            f"Estimated cost (${c_val:,.2f}) exceeds grant maximum cost threshold "
-                            f"(${active_grant.constraints.max_cost_limit_usd:,.2f}). Human review required."
-                        ),
-                        subject_type=subject_type,
-                        subject_id=clean_subject_id,
-                        requested_capability=req_cap,
-                        effective_autonomy_level=active_grant.autonomy_level,
-                        scope=resource_scope,
-                        data_mode=norm_data_mode,
-                        risk_status=authoritative_risk,
-                        approval_requirement=True,
-                        request_id=request_id,
-                        grant_id=active_grant.grant_id,
-                    )
-                    return self._audit_and_persist_decision(dec, identity)
-            except (ValueError, TypeError):
-                pass
+        max_cost_limit = active_grant.constraints.max_cost_limit_usd
+        if max_cost_limit is not None:
+            effective_cost = None
+            if authoritative_cost is not None:
+                effective_cost = authoritative_cost
+                # Client cost can escalate conservatism, but can never understate/override authoritative cost
+                client_cost = risk_ctx.get("cost_estimate_usd")
+                if client_cost is not None:
+                    try:
+                        c_val = float(client_cost)
+                        if c_val > effective_cost:
+                            effective_cost = c_val
+                    except (ValueError, TypeError):
+                        pass
+            else:
+                client_cost = risk_ctx.get("cost_estimate_usd")
+                if client_cost is not None:
+                    try:
+                        effective_cost = float(client_cost)
+                    except (ValueError, TypeError):
+                        effective_cost = None
+
+            if effective_cost is None:
+                # Mandatory cost limit cannot be evaluated
+                dec = AutonomyDecision.create(
+                    decision=AutonomyDecisionEffect.REQUIRES_REVIEW,
+                    reason_code=AutonomyReasonCode.POLICY_REVIEW_REQUIRED,
+                    reason=(
+                        f"Grant specifies mandatory max cost limit of ${max_cost_limit:,.2f}, "
+                        "but action cost cannot be authoritatively evaluated. Human review required."
+                    ),
+                    subject_type=subject_type,
+                    subject_id=clean_subject_id,
+                    requested_capability=req_cap,
+                    effective_autonomy_level=active_grant.autonomy_level,
+                    scope=resource_scope,
+                    data_mode=norm_data_mode,
+                    risk_status=authoritative_risk,
+                    approval_requirement=True,
+                    request_id=request_id,
+                    grant_id=active_grant.grant_id,
+                )
+                return self._audit_and_persist_decision(dec, identity)
+
+            if effective_cost > max_cost_limit:
+                dec = AutonomyDecision.create(
+                    decision=AutonomyDecisionEffect.REQUIRES_REVIEW,
+                    reason_code=AutonomyReasonCode.POLICY_REVIEW_REQUIRED,
+                    reason=(
+                        f"Authoritative cost (${effective_cost:,.2f}) exceeds grant maximum cost threshold "
+                        f"(${max_cost_limit:,.2f}). Human review required."
+                    ),
+                    subject_type=subject_type,
+                    subject_id=clean_subject_id,
+                    requested_capability=req_cap,
+                    effective_autonomy_level=active_grant.autonomy_level,
+                    scope=resource_scope,
+                    data_mode=norm_data_mode,
+                    risk_status=authoritative_risk,
+                    approval_requirement=True,
+                    request_id=request_id,
+                    grant_id=active_grant.grant_id,
+                )
+                return self._audit_and_persist_decision(dec, identity)
 
         # Risk Classification & Approval Evaluation
         # An autonomy grant NEVER suppresses a mandatory approval requirement!
@@ -906,12 +1220,18 @@ class AutonomyService:
         required_perm = f"autonomy.{action}"
         user_roles = [r.upper() for r in identity.roles]
         
-        # Security officers, plant managers, and administrators have grant authority
-        authorized_roles = {"ADMINISTRATOR", "SECURITY_ADMIN", "PLANT_MANAGER"}
+        # Explicit trusted role-based shortcuts covering the exact requested operation
+        if action == "grant":
+            authorized_roles = {"ADMINISTRATOR", "SECURITY_ADMIN", "PLANT_MANAGER", "SYSTEM_ADMIN"}
+        elif action == "read":
+            authorized_roles = {"ADMINISTRATOR", "SECURITY_ADMIN", "PLANT_MANAGER", "SYSTEM_ADMIN", "OPERATOR", "ANALYST", "VIEWER"}
+        else:
+            authorized_roles = {"ADMINISTRATOR", "SECURITY_ADMIN", "SYSTEM_ADMIN"}
+
         has_role = bool(set(user_roles) & authorized_roles)
 
         if not has_role:
-            # Check RBAC permission registry
+            # Check RBAC permission registry via authorization_service
             authz_scope = AuthorizationScope(
                 tenant_id=identity.tenant_id,
                 workspace_id=identity.workspace_id,
@@ -922,21 +1242,30 @@ class AutonomyService:
                 required_permission=required_perm,
                 scope=authz_scope,
             )
-            authz_dec = authorization_service.evaluate(authz_ctx)
-            if authz_dec.effect == AuthzDecisionEffect.DENY:
-                log_security_event(
-                    "AUTHORIZATION_FAILURE",
-                    {
-                        "user_id": identity.user_id,
-                        "required_permission": required_perm,
-                        "reason": authz_dec.reason,
-                    },
-                    severity="WARNING",
-                    user_id=identity.user_id,
-                    tenant_id=identity.tenant_id,
-                )
+            try:
+                authz_dec = authorization_service.evaluate(authz_ctx)
+                if not authz_dec or authz_dec.effect != AuthzDecisionEffect.ALLOW:
+                    reason = authz_dec.reason if authz_dec else "Authorization decision was empty or not ALLOW"
+                    log_security_event(
+                        "AUTHORIZATION_FAILURE",
+                        {
+                            "user_id": identity.user_id,
+                            "required_permission": required_perm,
+                            "reason": reason,
+                        },
+                        severity="WARNING",
+                        user_id=identity.user_id,
+                        tenant_id=identity.tenant_id,
+                    )
+                    raise AutonomyRepositoryError(
+                        f"Identity '{identity.user_id}' lacks permission '{required_perm}' (authorization effect: {authz_dec.effect.value if authz_dec else 'None'})."
+                    )
+            except AutonomyRepositoryError:
+                raise
+            except Exception as e:
+                logger.warning(f"Authorization evaluation exception for '{required_perm}': {e}")
                 raise AutonomyRepositoryError(
-                    f"Identity '{identity.user_id}' lacks permission '{required_perm}' to manage autonomy grants."
+                    f"Authorization evaluation failed for permission '{required_perm}': {e}"
                 )
 
     def create_grant(

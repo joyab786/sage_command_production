@@ -52,7 +52,19 @@ from tools.autonomy_context import (
     get_active_autonomy_identity,
 )
 from tools.action_tools import propose_action
-from data.schemas.action_contract import ActionType, ResourceType
+from data.schemas.action_contract import (
+    Action,
+    ActionType,
+    ActionStatus,
+    ResourceType,
+    CostEstimate,
+    ActionTarget,
+    ActionReason,
+    RiskLevel,
+)
+from services.action_store import action_store
+from data.schemas.authorization_contract import AuthzDecisionEffect, AuthorizationDecision
+from repositories.autonomy_repository import AutonomyRepositoryError
 
 
 class TestV3AutonomyFoundation(unittest.TestCase):
@@ -154,13 +166,18 @@ class TestV3AutonomyFoundation(unittest.TestCase):
             clearance_level=2,
         )
 
-        # PROPOSE_ACTION allowed
+        # PROPOSE_ACTION allowed with valid action context
         decision_allowed = self.service.evaluate_autonomy(
             identity=identity,
             subject_id=grant.subject_id,
             requested_capability="PROPOSE_ACTION",
             resource_scope=grant.scope,
             data_mode="SIMULATION",
+            risk_context={
+                "action_type": "ADJUST_REORDER_POINT",
+                "parameters": {"new_reorder_point": 100},
+                "target_resource_id": "SKU-01",
+            },
         )
         self.assertEqual(decision_allowed.decision, AutonomyDecisionEffect.ALLOW)
 
@@ -1506,5 +1523,840 @@ class TestV3AutonomyPrompt38ACorrections(unittest.TestCase):
             self.assertEqual(dec.reason_code, AutonomyReasonCode.EXECUTION_DISABLED)
 
 
+class TestV3AutonomyPrompt38BCorrections(unittest.TestCase):
+    """
+    Prompt 38B Security Corrections Test Suite:
+    1. Removal of implicit LOW-risk fallback (action capabilities require authoritative action/risk).
+    2. Session scope derived exclusively from trusted identity.
+    3. Action-bound risk evaluation (consistency, workspace containment, mandatory action record).
+    4. Authoritative cost constraints (understated client cost cannot bypass limits, missing cost fails closed).
+    5. Explicit authorization ALLOW requirement (DENY, indeterminate, exceptions fail closed).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.service = autonomy_service
+        cls.repo = autonomy_repository
+        cls.client = TestClient(app)
+
+    def _auth_headers(self, token="admin_token"):
+        return {
+            "Authorization": f"Bearer {token}",
+            "X-Tenant-ID": "tenant_default",
+            "X-Workspace-ID": "workspace_default",
+        }
+
+    # =========================================================================
+    # 1. REMOVE IMPLICIT LOW-RISK FALLBACK
+    # =========================================================================
+
+    def test_missing_action_context_for_action_capability_fails_closed(self):
+        """Requesting an action capability without action details cannot default to LOW; fails closed to REQUIRES_REVIEW."""
+        subject_id = f"agent_no_ctx_{uuid.uuid4().hex[:6]}"
+        grant = AutonomyGrant(
+            grant_id=f"grant_{uuid.uuid4().hex[:8]}",
+            subject_type=SubjectType.AGENT,
+            subject_id=subject_id,
+            autonomy_level=AutonomyLevel.RECOMMEND,
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            plant_id="plant_01",
+            data_mode="SIMULATION",
+            permitted_capabilities=["PROPOSE_ACTION"],
+            created_by="admin_01",
+        )
+        self.repo.save_grant(grant)
+
+        identity = Identity(
+            user_id="mgr_01",
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            roles=["operator", "manager"],
+            assigned_plants=["plant_01"],
+            clearance_level=2,
+        )
+
+        # Omit all action details
+        decision = self.service.evaluate_autonomy(
+            identity=identity,
+            subject_id=subject_id,
+            requested_capability="PROPOSE_ACTION",
+            resource_scope=grant.scope,
+            data_mode="SIMULATION",
+            risk_context={},
+        )
+        self.assertEqual(decision.decision, AutonomyDecisionEffect.REQUIRES_REVIEW)
+        self.assertEqual(decision.reason_code, AutonomyReasonCode.RISK_UNKNOWN)
+        self.assertEqual(decision.risk_status, "UNKNOWN")
+
+    def test_invalid_action_type_fails_closed(self):
+        """An unrecognized action type cannot establish authoritative risk; fails closed to REQUIRES_REVIEW."""
+        subject_id = f"agent_inv_act_{uuid.uuid4().hex[:6]}"
+        grant = AutonomyGrant(
+            grant_id=f"grant_{uuid.uuid4().hex[:8]}",
+            subject_type=SubjectType.AGENT,
+            subject_id=subject_id,
+            autonomy_level=AutonomyLevel.RECOMMEND,
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            plant_id="plant_01",
+            data_mode="SIMULATION",
+            permitted_capabilities=["PROPOSE_ACTION"],
+            created_by="admin_01",
+        )
+        self.repo.save_grant(grant)
+
+        identity = Identity(
+            user_id="mgr_01",
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            roles=["operator", "manager"],
+            assigned_plants=["plant_01"],
+            clearance_level=2,
+        )
+
+        decision = self.service.evaluate_autonomy(
+            identity=identity,
+            subject_id=subject_id,
+            requested_capability="PROPOSE_ACTION",
+            resource_scope=grant.scope,
+            data_mode="SIMULATION",
+            risk_context={
+                "action_type": "NONEXISTENT_BOGUS_ACTION_TYPE",
+                "risk_level": "LOW",
+            },
+        )
+        self.assertEqual(decision.decision, AutonomyDecisionEffect.REQUIRES_REVIEW)
+        self.assertEqual(decision.reason_code, AutonomyReasonCode.RISK_UNKNOWN)
+        self.assertEqual(decision.risk_status, "UNKNOWN")
+
+    def test_malformed_parameters_fails_closed(self):
+        """Malformed action parameters fail server-side schema validation and return REQUIRES_REVIEW with RISK_UNKNOWN."""
+        subject_id = f"agent_bad_params_{uuid.uuid4().hex[:6]}"
+        grant = AutonomyGrant(
+            grant_id=f"grant_{uuid.uuid4().hex[:8]}",
+            subject_type=SubjectType.AGENT,
+            subject_id=subject_id,
+            autonomy_level=AutonomyLevel.RECOMMEND,
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            plant_id="plant_01",
+            data_mode="SIMULATION",
+            permitted_capabilities=["PROPOSE_ACTION"],
+            created_by="admin_01",
+        )
+        self.repo.save_grant(grant)
+
+        identity = Identity(
+            user_id="mgr_01",
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            roles=["operator", "manager"],
+            assigned_plants=["plant_01"],
+            clearance_level=2,
+        )
+
+        decision = self.service.evaluate_autonomy(
+            identity=identity,
+            subject_id=subject_id,
+            requested_capability="PROPOSE_ACTION",
+            resource_scope=grant.scope,
+            data_mode="SIMULATION",
+            risk_context={
+                "action_type": "ADJUST_REORDER_POINT",
+                "target_resource_id": "SKU-01",
+                "parameters": {"new_reorder_point": -500},  # Negative value violates ge=0
+            },
+        )
+        self.assertEqual(decision.decision, AutonomyDecisionEffect.REQUIRES_REVIEW)
+        self.assertEqual(decision.reason_code, AutonomyReasonCode.RISK_UNKNOWN)
+
+    def test_missing_target_context_fails_closed(self):
+        """Missing target resource and plant context fails closed to REQUIRES_REVIEW."""
+        subject_id = f"agent_no_target_{uuid.uuid4().hex[:6]}"
+        grant = AutonomyGrant(
+            grant_id=f"grant_{uuid.uuid4().hex[:8]}",
+            subject_type=SubjectType.AGENT,
+            subject_id=subject_id,
+            autonomy_level=AutonomyLevel.RECOMMEND,
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            data_mode="SIMULATION",
+            permitted_capabilities=["PROPOSE_ACTION"],
+            created_by="admin_01",
+        )
+        self.repo.save_grant(grant)
+
+        identity = Identity(
+            user_id="mgr_01",
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            roles=["operator", "manager"],
+            clearance_level=2,
+        )
+
+        scope_no_target = AutonomyScope(
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            plant_id=None,
+            equipment_id=None,
+        )
+
+        decision = self.service.evaluate_autonomy(
+            identity=identity,
+            subject_id=subject_id,
+            requested_capability="PROPOSE_ACTION",
+            resource_scope=scope_no_target,
+            data_mode="SIMULATION",
+            risk_context={
+                "action_type": "ADJUST_REORDER_POINT",
+                "parameters": {"new_reorder_point": 100},
+            },
+        )
+        self.assertEqual(decision.decision, AutonomyDecisionEffect.REQUIRES_REVIEW)
+        self.assertEqual(decision.reason_code, AutonomyReasonCode.RISK_UNKNOWN)
+
+    def test_observation_and_analysis_capabilities_preserve_analytical_rules(self):
+        """Legitimate observation and analysis capabilities succeed without action records under explicit analytical rules."""
+        subject_id = f"agent_obs_analytical_{uuid.uuid4().hex[:6]}"
+        grant = AutonomyGrant(
+            grant_id=f"grant_{uuid.uuid4().hex[:8]}",
+            subject_type=SubjectType.AGENT,
+            subject_id=subject_id,
+            autonomy_level=AutonomyLevel.ANALYZE,
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            plant_id="plant_01",
+            data_mode="SIMULATION",
+            permitted_capabilities=["OBSERVE_TELEMETRY", "ANALYZE_EVIDENCE"],
+            created_by="admin_01",
+        )
+        self.repo.save_grant(grant)
+
+        identity = Identity(
+            user_id="mgr_01",
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            roles=["operator", "manager"],
+            assigned_plants=["plant_01"],
+            clearance_level=2,
+        )
+
+        for cap in ["OBSERVE_TELEMETRY", "ANALYZE_EVIDENCE"]:
+            decision = self.service.evaluate_autonomy(
+                identity=identity,
+                subject_id=subject_id,
+                requested_capability=cap,
+                resource_scope=grant.scope,
+                data_mode="SIMULATION",
+            )
+            self.assertEqual(decision.decision, AutonomyDecisionEffect.ALLOW)
+            self.assertEqual(decision.risk_status, "LOW")
+
+    # =========================================================================
+    # 2. DERIVE SESSION SCOPE EXCLUSIVELY FROM TRUSTED IDENTITY
+    # =========================================================================
+
+    def test_caller_with_no_session_submitting_session_scope_rejected(self):
+        """Caller with no trusted session submitting another session ID in scope must fail closed (SESSION_MISMATCH)."""
+        subject_id = f"agent_no_sess_spoof_{uuid.uuid4().hex[:6]}"
+        grant = AutonomyGrant(
+            grant_id=f"grant_{uuid.uuid4().hex[:8]}",
+            subject_type=SubjectType.AGENT,
+            subject_id=subject_id,
+            autonomy_level=AutonomyLevel.RECOMMEND,
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            plant_id="plant_01",
+            data_mode="SIMULATION",
+            permitted_capabilities=["GENERATE_RECOMMENDATION"],
+            created_by="admin_01",
+        )
+        self.repo.save_grant(grant)
+
+        identity_no_session = Identity(
+            user_id="mgr_01",
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            session_id=None,  # No trusted session
+            roles=["operator", "manager"],
+            assigned_plants=["plant_01"],
+            clearance_level=2,
+        )
+
+        scope_with_spoofed_session = AutonomyScope(
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            session_id="session_spoofed_123",  # Client-supplied session scope
+            plant_id="plant_01",
+        )
+
+        decision = self.service.evaluate_autonomy(
+            identity=identity_no_session,
+            subject_id=subject_id,
+            requested_capability="GENERATE_RECOMMENDATION",
+            resource_scope=scope_with_spoofed_session,
+            data_mode="SIMULATION",
+        )
+        self.assertEqual(decision.decision, AutonomyDecisionEffect.DENY)
+        self.assertEqual(decision.reason_code, AutonomyReasonCode.SESSION_MISMATCH)
+        self.assertIn("caller has no trusted session", decision.reason)
+
+    def test_caller_session_mismatch_with_scope_session_rejected(self):
+        """Caller with trusted session A supplying session B in scope must fail closed (SESSION_MISMATCH)."""
+        subject_id = f"agent_sess_mismatch_{uuid.uuid4().hex[:6]}"
+        grant = AutonomyGrant(
+            grant_id=f"grant_{uuid.uuid4().hex[:8]}",
+            subject_type=SubjectType.AGENT,
+            subject_id=subject_id,
+            autonomy_level=AutonomyLevel.RECOMMEND,
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            session_id="session_alpha",
+            plant_id="plant_01",
+            data_mode="SIMULATION",
+            permitted_capabilities=["GENERATE_RECOMMENDATION"],
+            created_by="admin_01",
+        )
+        self.repo.save_grant(grant)
+
+        identity_alpha = Identity(
+            user_id="mgr_01",
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            session_id="session_alpha",
+            roles=["operator", "manager"],
+            assigned_plants=["plant_01"],
+            clearance_level=2,
+        )
+
+        scope_beta = AutonomyScope(
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            session_id="session_beta_conflicting",
+            plant_id="plant_01",
+        )
+
+        decision = self.service.evaluate_autonomy(
+            identity=identity_alpha,
+            subject_id=subject_id,
+            requested_capability="GENERATE_RECOMMENDATION",
+            resource_scope=scope_beta,
+            data_mode="SIMULATION",
+        )
+        self.assertEqual(decision.decision, AutonomyDecisionEffect.DENY)
+        self.assertEqual(decision.reason_code, AutonomyReasonCode.SESSION_MISMATCH)
+
+    def test_unsessioned_caller_cannot_access_session_bound_grant_via_scope(self):
+        """Un-sessioned caller cannot unlock a session-bound grant by injecting session_id into AutonomyScope."""
+        subject_id = f"agent_sess_unlock_attempt_{uuid.uuid4().hex[:6]}"
+        grant = AutonomyGrant(
+            grant_id=f"grant_{uuid.uuid4().hex[:8]}",
+            subject_type=SubjectType.AGENT,
+            subject_id=subject_id,
+            autonomy_level=AutonomyLevel.RECOMMEND,
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            session_id="session_bound_target",
+            plant_id="plant_01",
+            data_mode="SIMULATION",
+            permitted_capabilities=["GENERATE_RECOMMENDATION"],
+            created_by="admin_01",
+        )
+        self.repo.save_grant(grant)
+
+        identity_un_sessioned = Identity(
+            user_id="mgr_01",
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            session_id=None,
+            roles=["operator", "manager"],
+            assigned_plants=["plant_01"],
+            clearance_level=2,
+        )
+
+        scope_attempt = AutonomyScope(
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            session_id="session_bound_target",
+            plant_id="plant_01",
+        )
+
+        decision = self.service.evaluate_autonomy(
+            identity=identity_un_sessioned,
+            subject_id=subject_id,
+            requested_capability="GENERATE_RECOMMENDATION",
+            resource_scope=scope_attempt,
+            data_mode="SIMULATION",
+        )
+        self.assertEqual(decision.decision, AutonomyDecisionEffect.DENY)
+        self.assertEqual(decision.reason_code, AutonomyReasonCode.SESSION_MISMATCH)
+
+    # =========================================================================
+    # 3. BIND RISK EVALUATION TO THE AUTHORITATIVE ACTION
+    # =========================================================================
+
+    def test_action_id_mandatory_for_validation_and_approval_capabilities(self):
+        """VALIDATE_ACTION, PREPARE_APPROVAL_PACKAGE, and REQUEST_HUMAN_REVIEW require an action_id."""
+        subject_id = f"agent_act_req_{uuid.uuid4().hex[:6]}"
+        grant = AutonomyGrant(
+            grant_id=f"grant_{uuid.uuid4().hex[:8]}",
+            subject_type=SubjectType.AGENT,
+            subject_id=subject_id,
+            autonomy_level=AutonomyLevel.PREPARE_FOR_APPROVAL,
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            plant_id="plant_01",
+            data_mode="SIMULATION",
+            permitted_capabilities=["VALIDATE_ACTION", "PREPARE_APPROVAL_PACKAGE", "REQUEST_HUMAN_REVIEW"],
+            created_by="admin_01",
+        )
+        self.repo.save_grant(grant)
+
+        identity = Identity(
+            user_id="mgr_01",
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            roles=["OPERATOR", "PLANT_MANAGER"],
+            assigned_plants=["plant_01"],
+            clearance_level=2,
+        )
+
+        for cap in ["VALIDATE_ACTION", "PREPARE_APPROVAL_PACKAGE", "REQUEST_HUMAN_REVIEW"]:
+            decision = self.service.evaluate_autonomy(
+                identity=identity,
+                subject_id=subject_id,
+                requested_capability=cap,
+                resource_scope=grant.scope,
+                data_mode="SIMULATION",
+                risk_context={"action_type": "ADJUST_REORDER_POINT"},  # No action_id
+            )
+            self.assertEqual(decision.decision, AutonomyDecisionEffect.REQUIRES_REVIEW)
+            self.assertEqual(decision.reason_code, AutonomyReasonCode.RISK_UNKNOWN)
+            self.assertIn("Authoritative persisted action record ('action_id') is required", decision.reason)
+
+    def test_cross_workspace_action_reference_rejected(self):
+        """Referencing an action stored in another workspace must fail closed with WORKSPACE_MISMATCH."""
+        # Store an action in workspace_finance
+        act = Action(
+            action_id=f"act_fin_{uuid.uuid4().hex[:8]}",
+            tenant_id="tenant_default",
+            workspace_id="workspace_finance",
+            session_id="session_01",
+            action_type=ActionType.ADJUST_REORDER_POINT,
+            version="1.0",
+            target=ActionTarget(resource_type=ResourceType.SKU, resource_id="SKU-FIN", plant_id="plant_01"),
+            parameters={"new_reorder_point": 100},
+            reason=ActionReason(reason_code="MAINT_SCHEDULE", summary="Finance inventory adjustment"),
+            data_mode="REAL",
+            system_risk_level=RiskLevel.LOW,
+            status=ActionStatus.PROPOSED,
+        )
+        action_store.save(act)
+
+        # Grant and caller in workspace_default
+        subject_id = f"agent_cross_act_{uuid.uuid4().hex[:6]}"
+        grant = AutonomyGrant(
+            grant_id=f"grant_{uuid.uuid4().hex[:8]}",
+            subject_type=SubjectType.AGENT,
+            subject_id=subject_id,
+            autonomy_level=AutonomyLevel.RECOMMEND,
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            plant_id="plant_01",
+            data_mode="REAL",
+            permitted_capabilities=["PROPOSE_ACTION"],
+            created_by="admin_01",
+        )
+        self.repo.save_grant(grant)
+
+        identity = Identity(
+            user_id="operator_01",
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            roles=["operator"],
+            assigned_plants=["plant_01"],
+            clearance_level=2,
+        )
+
+        decision = self.service.evaluate_autonomy(
+            identity=identity,
+            subject_id=subject_id,
+            requested_capability="PROPOSE_ACTION",
+            resource_scope=grant.scope,
+            data_mode="REAL",
+            risk_context={"action_id": act.action_id},
+        )
+        self.assertEqual(decision.decision, AutonomyDecisionEffect.DENY)
+        self.assertEqual(decision.reason_code, AutonomyReasonCode.WORKSPACE_MISMATCH)
+
+    def test_action_type_inconsistency_rejected(self):
+        """Submitting an action_type that mismatches the stored action record fails closed with ACTION_VALIDATION_FAILED."""
+        act = Action(
+            action_id=f"act_type_mismatch_{uuid.uuid4().hex[:8]}",
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            session_id="session_01",
+            action_type=ActionType.ADJUST_REORDER_POINT,
+            version="1.0",
+            target=ActionTarget(resource_type=ResourceType.SKU, resource_id="SKU-01", plant_id="plant_01"),
+            parameters={"new_reorder_point": 100},
+            reason=ActionReason(reason_code="MAINT_SCHEDULE", summary="Reorder adjust"),
+            data_mode="REAL",
+            system_risk_level=RiskLevel.LOW,
+            status=ActionStatus.PROPOSED,
+        )
+        action_store.save(act)
+
+        subject_id = f"agent_inconsistent_{uuid.uuid4().hex[:6]}"
+        grant = AutonomyGrant(
+            grant_id=f"grant_{uuid.uuid4().hex[:8]}",
+            subject_type=SubjectType.AGENT,
+            subject_id=subject_id,
+            autonomy_level=AutonomyLevel.RECOMMEND,
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            plant_id="plant_01",
+            data_mode="REAL",
+            permitted_capabilities=["PROPOSE_ACTION"],
+            created_by="admin_01",
+        )
+        self.repo.save_grant(grant)
+
+        identity = Identity(
+            user_id="mgr_01",
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            roles=["operator", "manager"],
+            assigned_plants=["plant_01"],
+            clearance_level=2,
+        )
+
+        decision = self.service.evaluate_autonomy(
+            identity=identity,
+            subject_id=subject_id,
+            requested_capability="PROPOSE_ACTION",
+            resource_scope=grant.scope,
+            data_mode="REAL",
+            risk_context={
+                "action_id": act.action_id,
+                "action_type": "RESCHEDULE_PRODUCTION",  # Inconsistent with stored ADJUST_REORDER_POINT
+            },
+        )
+        self.assertEqual(decision.decision, AutonomyDecisionEffect.DENY)
+        self.assertEqual(decision.reason_code, AutonomyReasonCode.ACTION_VALIDATION_FAILED)
+
+    def test_target_inconsistency_rejected(self):
+        """Submitting a target resource that mismatches the stored action record fails closed with SCOPE_MISMATCH."""
+        act = Action(
+            action_id=f"act_tgt_mismatch_{uuid.uuid4().hex[:8]}",
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            session_id="session_01",
+            action_type=ActionType.SCHEDULE_MAINTENANCE,
+            version="1.0",
+            target=ActionTarget(resource_type=ResourceType.MACHINE, resource_id="MACHINE-01", plant_id="plant_01"),
+            parameters={"machine_id": "MACHINE-01", "scheduled_start": "2026-11-01T08:00:00Z", "estimated_duration_minutes": 60},
+            reason=ActionReason(reason_code="MAINT_SCHEDULE", summary="Scheduled maintenance"),
+            data_mode="REAL",
+            system_risk_level=RiskLevel.MEDIUM,
+            status=ActionStatus.PROPOSED,
+        )
+        action_store.save(act)
+
+        subject_id = f"agent_tgt_inc_{uuid.uuid4().hex[:6]}"
+        grant = AutonomyGrant(
+            grant_id=f"grant_{uuid.uuid4().hex[:8]}",
+            subject_type=SubjectType.AGENT,
+            subject_id=subject_id,
+            autonomy_level=AutonomyLevel.RECOMMEND,
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            plant_id="plant_01",
+            data_mode="REAL",
+            permitted_capabilities=["PROPOSE_ACTION"],
+            created_by="admin_01",
+        )
+        self.repo.save_grant(grant)
+
+        identity = Identity(
+            user_id="mgr_01",
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            roles=["operator", "manager"],
+            assigned_plants=["plant_01"],
+            clearance_level=2,
+        )
+
+        decision = self.service.evaluate_autonomy(
+            identity=identity,
+            subject_id=subject_id,
+            requested_capability="PROPOSE_ACTION",
+            resource_scope=grant.scope,
+            data_mode="REAL",
+            risk_context={
+                "action_id": act.action_id,
+                "target_resource_id": "MACHINE-99",  # Mismatch with MACHINE-01
+            },
+        )
+        self.assertEqual(decision.decision, AutonomyDecisionEffect.DENY)
+        self.assertEqual(decision.reason_code, AutonomyReasonCode.SCOPE_MISMATCH)
+
+    def test_data_mode_inconsistency_rejected(self):
+        """Evaluating an action with a data mode that mismatches the stored action fails closed with DATA_MODE_MISMATCH."""
+        act = Action(
+            action_id=f"act_mode_mismatch_{uuid.uuid4().hex[:8]}",
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            session_id="session_01",
+            action_type=ActionType.ADJUST_REORDER_POINT,
+            version="1.0",
+            target=ActionTarget(resource_type=ResourceType.SKU, resource_id="SKU-01", plant_id="plant_01"),
+            parameters={"new_reorder_point": 100},
+            reason=ActionReason(reason_code="MAINT_SCHEDULE", summary="Simulated adjustment"),
+            data_mode="SIMULATION",  # Stored as SIMULATION
+            system_risk_level=RiskLevel.LOW,
+            status=ActionStatus.PROPOSED,
+        )
+        action_store.save(act)
+
+        subject_id = f"agent_mode_inc_{uuid.uuid4().hex[:6]}"
+        grant = AutonomyGrant(
+            grant_id=f"grant_{uuid.uuid4().hex[:8]}",
+            subject_type=SubjectType.AGENT,
+            subject_id=subject_id,
+            autonomy_level=AutonomyLevel.RECOMMEND,
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            plant_id="plant_01",
+            data_mode="REAL",
+            permitted_capabilities=["PROPOSE_ACTION"],
+            created_by="admin_01",
+        )
+        self.repo.save_grant(grant)
+
+        identity = Identity(
+            user_id="mgr_01",
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            roles=["operator", "manager"],
+            assigned_plants=["plant_01"],
+            clearance_level=2,
+        )
+
+        decision = self.service.evaluate_autonomy(
+            identity=identity,
+            subject_id=subject_id,
+            requested_capability="PROPOSE_ACTION",
+            resource_scope=grant.scope,
+            data_mode="REAL",  # Evaluating in REAL mode against SIMULATION action
+            risk_context={"action_id": act.action_id},
+        )
+        self.assertEqual(decision.decision, AutonomyDecisionEffect.DENY)
+        self.assertEqual(decision.reason_code, AutonomyReasonCode.DATA_MODE_MISMATCH)
+
+    # =========================================================================
+    # 4. USE AUTHORITATIVE COST FOR COST CONSTRAINTS
+    # =========================================================================
+
+    def test_understated_client_cost_cannot_bypass_max_cost_limit(self):
+        """Understated client cost cannot bypass a grant maximum cost constraint; authoritative stored cost prevails."""
+        act = Action(
+            action_id=f"act_expensive_{uuid.uuid4().hex[:8]}",
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            session_id="session_01",
+            action_type=ActionType.REORDER_INVENTORY,
+            version="1.0",
+            target=ActionTarget(resource_type=ResourceType.SKU, resource_id="SKU-EXPENSIVE", plant_id="plant_01"),
+            parameters={"sku_id": "SKU-EXPENSIVE", "quantity": 1000},
+            reason=ActionReason(reason_code="MAINT_SCHEDULE", summary="High-cost bulk order"),
+            data_mode="REAL",
+            system_risk_level=RiskLevel.MEDIUM,
+            estimated_cost=CostEstimate(value=50000.0, currency="USD"),  # Authoritative cost $50,000
+            status=ActionStatus.PROPOSED,
+        )
+        action_store.save(act)
+
+        subject_id = f"agent_cost_bypass_{uuid.uuid4().hex[:6]}"
+        grant = AutonomyGrant(
+            grant_id=f"grant_{uuid.uuid4().hex[:8]}",
+            subject_type=SubjectType.AGENT,
+            subject_id=subject_id,
+            autonomy_level=AutonomyLevel.RECOMMEND,
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            plant_id="plant_01",
+            data_mode="REAL",
+            permitted_capabilities=["PROPOSE_ACTION"],
+            constraints=AutonomyConstraints(max_cost_limit_usd=5000.0),  # Limit is $5,000
+            created_by="admin_01",
+        )
+        self.repo.save_grant(grant)
+
+        identity = Identity(
+            user_id="mgr_01",
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            roles=["operator", "manager"],
+            assigned_plants=["plant_01"],
+            clearance_level=2,
+        )
+
+        # Caller attempts to submit understated cost_estimate_usd=50.0
+        decision = self.service.evaluate_autonomy(
+            identity=identity,
+            subject_id=subject_id,
+            requested_capability="PROPOSE_ACTION",
+            resource_scope=grant.scope,
+            data_mode="REAL",
+            risk_context={
+                "action_id": act.action_id,
+                "cost_estimate_usd": 50.0,  # Understated attempt
+            },
+        )
+        self.assertEqual(decision.decision, AutonomyDecisionEffect.REQUIRES_REVIEW)
+        self.assertEqual(decision.reason_code, AutonomyReasonCode.POLICY_REVIEW_REQUIRED)
+        self.assertIn("Authoritative cost ($50,000.00) exceeds grant maximum cost threshold ($5,000.00)", decision.reason)
+
+    def test_missing_cost_for_mandatory_cost_limit_fails_closed(self):
+        """When grant has a mandatory max cost limit but action cost cannot be evaluated, evaluation returns REQUIRES_REVIEW."""
+        subject_id = f"agent_cost_missing_{uuid.uuid4().hex[:6]}"
+        grant = AutonomyGrant(
+            grant_id=f"grant_{uuid.uuid4().hex[:8]}",
+            subject_type=SubjectType.AGENT,
+            subject_id=subject_id,
+            autonomy_level=AutonomyLevel.RECOMMEND,
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            plant_id="plant_01",
+            data_mode="SIMULATION",
+            permitted_capabilities=["PROPOSE_ACTION"],
+            constraints=AutonomyConstraints(max_cost_limit_usd=5000.0),  # Mandatory cost limit
+            created_by="admin_01",
+        )
+        self.repo.save_grant(grant)
+
+        identity = Identity(
+            user_id="mgr_01",
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            roles=["operator", "manager"],
+            assigned_plants=["plant_01"],
+            clearance_level=2,
+        )
+
+        # Evaluating without cost
+        decision = self.service.evaluate_autonomy(
+            identity=identity,
+            subject_id=subject_id,
+            requested_capability="PROPOSE_ACTION",
+            resource_scope=grant.scope,
+            data_mode="SIMULATION",
+            risk_context={
+                "action_type": "ADJUST_REORDER_POINT",
+                "parameters": {"new_reorder_point": 100},
+                "target_resource_id": "SKU-01",
+                # cost_estimate_usd omitted
+            },
+        )
+        self.assertEqual(decision.decision, AutonomyDecisionEffect.REQUIRES_REVIEW)
+        self.assertEqual(decision.reason_code, AutonomyReasonCode.POLICY_REVIEW_REQUIRED)
+        self.assertIn("action cost cannot be authoritatively evaluated", decision.reason)
+
+    # =========================================================================
+    # 5. REQUIRE EXPLICIT AUTHORIZATION ALLOW
+    # =========================================================================
+
+    def test_authorization_deny_rejects_grant_permission(self):
+        """When authorization_service.evaluate returns DENY, _require_grant_permission raises AutonomyRepositoryError."""
+        identity = Identity(
+            user_id="guest_user",
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            roles=["guest"],  # Not an authorized role
+            clearance_level=1,
+        )
+
+        with self.assertRaises(AutonomyRepositoryError):
+            self.service._require_grant_permission(identity, "grant")
+
+    def test_authorization_indeterminate_or_review_rejects_grant_permission(self):
+        """When authorization_service.evaluate returns an unexpected/indeterminate effect, it must not authorize."""
+        identity = Identity(
+            user_id="guest_user",
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            roles=["guest"],
+            clearance_level=1,
+        )
+
+        mock_decision = MagicMock()
+        mock_decision.effect = "INDETERMINATE"
+        mock_decision.reason = "Manual approval required"
+
+        with patch("services.authorization_service.authorization_service.evaluate", return_value=mock_decision):
+            with self.assertRaises(AutonomyRepositoryError):
+                self.service._require_grant_permission(identity, "grant")
+
+    def test_authorization_exception_fails_closed(self):
+        """When authorization_service.evaluate raises an exception, it must fail closed and raise AutonomyRepositoryError."""
+        identity = Identity(
+            user_id="guest_user",
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            roles=["guest"],
+            clearance_level=1,
+        )
+
+        with patch("services.authorization_service.authorization_service.evaluate", side_effect=RuntimeError("Authorization DB connection timeout")):
+            with self.assertRaises(AutonomyRepositoryError):
+                self.service._require_grant_permission(identity, "grant")
+
+    def test_underlying_authorization_exception_in_capability_evaluation_fails_closed(self):
+        """When evaluating a capability with canonical permission and authz raises an exception, evaluate_autonomy returns DENY."""
+        subject_id = f"agent_authz_ex_{uuid.uuid4().hex[:6]}"
+        grant = AutonomyGrant(
+            grant_id=f"grant_{uuid.uuid4().hex[:8]}",
+            subject_type=SubjectType.AGENT,
+            subject_id=subject_id,
+            autonomy_level=AutonomyLevel.RECOMMEND,
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            plant_id="plant_01",
+            data_mode="SIMULATION",
+            permitted_capabilities=["PROPOSE_ACTION"],
+            created_by="admin_01",
+        )
+        self.repo.save_grant(grant)
+
+        identity = Identity(
+            user_id="mgr_01",
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            roles=["operator", "manager"],
+            assigned_plants=["plant_01"],
+            clearance_level=2,
+        )
+
+        with patch("services.authorization_service.authorization_service.evaluate", side_effect=RuntimeError("Authz network failure")):
+            decision = self.service.evaluate_autonomy(
+                identity=identity,
+                subject_id=subject_id,
+                requested_capability="PROPOSE_ACTION",
+                resource_scope=grant.scope,
+                data_mode="SIMULATION",
+                risk_context={
+                    "action_type": "ADJUST_REORDER_POINT",
+                    "parameters": {"new_reorder_point": 100},
+                    "target_resource_id": "SKU-01",
+                },
+            )
+            self.assertEqual(decision.decision, AutonomyDecisionEffect.DENY)
+            self.assertEqual(decision.reason_code, AutonomyReasonCode.AUTHORIZATION_DENIED)
+            self.assertIn("Underlying authorization evaluation failed", decision.reason)
+
+
 if __name__ == "__main__":
     unittest.main()
+

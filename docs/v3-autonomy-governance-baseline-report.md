@@ -229,24 +229,25 @@ A dedicated test suite `backend/test_v3_autonomy.py` validates all security and 
 - **Cross-Tenant Isolation:** Proves cross-tenant grant retrieval and listing fail closed.
 - **Cryptographic Provenance:** Verifies decision records contain valid standalone SHA-256 digests.
 - **Prompt 38A Regression Suite (`TestV3AutonomyPrompt38ACorrections`):** Exhaustively tests all 13 Prompt 38A security requirements.
+- **Prompt 38B Regression Suite (`TestV3AutonomyPrompt38BCorrections`):** Exhaustively tests all 5 Prompt 38B security gap categories (19 tests).
 
-**Result: 41 passed out of 41 tests.**
+**Result: 60 passed out of 60 tests.**
 
 ---
 
 ## 18. Regression Test Results
-Full regression suites were executed across the codebase:
-- `backend/test_v3_autonomy.py`: 41 passed, 0 failed.
+Full regression suites were executed across the codebase in the repository environment:
+- `backend/test_v3_autonomy.py`: 60 passed, 0 failed.
 - `backend/test_v3_action_api.py`: 15 passed, 0 failed.
 - `backend/test_v3_authorization.py`: 19 passed, 0 failed.
 - `backend/test_v3_mission_architecture.py`: 74 passed, 0 failed.
 - `backend/test_v3_security.py`: 14 passed, 0 failed.
-- **Total Tests Passing in this Session: 163 passed, 0 failed.**
+- **Total Tests Passing in this Session: 182 passed, 0 failed.**
 
 ---
 
 ## 19. Known Limitations and Remaining Risks
-- **Level 4 and 5 Unimplemented:** Autonomous and supervised execution remains permanently unavailable pending future execution safety infrastructure.
+- **Level 4 and 5 Unimplemented:** Autonomous and supervised execution remains permanently unavailable pending future execution safety infrastructure (`EXECUTION_DISABLED`).
 - **Single-Node SQLite WAL:** Persistent storage uses local SQLite WAL. Multi-node setups require shared storage or database adapter promotion in future prompts.
 - **Standalone Digests (No Block Hash Chain):** Decision records store individual SHA-256 fingerprints rather than a backlinked hash chain across successive evaluation events.
 
@@ -269,3 +270,41 @@ This section documents the specific security corrections applied under Prompt 38
 6. **Mapped Capability Permission Enforcement:** Underlying RBAC permissions mapped to registered capabilities (e.g. `action.create` for `PROPOSE_ACTION`) are strictly evaluated against caller identity and scope. If underlying authorization is not `ALLOW`, autonomy evaluation fails closed to `DENY` with `AUTHORIZATION_DENIED`.
 7. **Strict Lifecycle and Capability Validation on Update:** `update_grant` rejects unknown capability IDs, forbids Levels 4 and 5, and prevents direct transition to `REVOKED` (which requires dedicated `revoke_grant`).
 8. **Security Regression Tests:** Expanded test suite with `TestV3AutonomyPrompt38ACorrections` covering all 13 security regression scenarios (41 passed tests in `test_v3_autonomy.py`).
+
+---
+
+## 22. Prompt 38B Security Corrections (Closing Remaining Autonomy Evaluation Security Gaps)
+This section documents the specific security gap closures implemented under Prompt 38B:
+1. **Removal of Implicit LOW-Risk Fallback:**
+   - Capabilities requiring action risk (`PROPOSE_ACTION`, `VALIDATE_ACTION`, `PREPARE_APPROVAL_PACKAGE`, `REQUEST_HUMAN_REVIEW`, `VALIDATE_MISSION_DAG`) strictly reject missing, invalid, or untrusted risk context.
+   - Never defaults to `LOW` when risk context is absent or incomplete. When risk context, action record, or parameters are missing or invalid, evaluation returns safe `REQUIRES_REVIEW` (or `DENY`) with `UNKNOWN` risk status and reason code `RISK_UNKNOWN` or `ACTION_VALIDATION_FAILED`.
+   - Client-supplied risk can only increase conservatism, never downgrade authoritative risk.
+   - Observation and analysis capabilities (`OBSERVE_TELEMETRY`, `READ_AUTHORIZED_SCHEMA`, `ANALYZE_EVIDENCE`, `GENERATE_RECOMMENDATION`, `VIEW_AUDIT_HISTORY`) preserve explicit analytical capability rules without requiring action records.
+2. **Authoritative Session Scope Derivation:**
+   - Resolved `caller_session` strictly and exclusively from authenticated `Identity.session_id`.
+   - Never substitutes `resource_scope.session_id`, request payload fields, model output, or frontend state.
+   - If a caller request provides a session in `resource_scope.session_id`, it is compared against the trusted session; any mismatch or presence when caller is unsessioned immediately fails closed with `SESSION_MISMATCH`.
+   - When trusted session is missing, session-bound grants are ineligible.
+3. **Binding Risk Evaluation to Authoritative Action Records:**
+   - Capabilities requiring action verification (`VALIDATE_ACTION`, `PREPARE_APPROVAL_PACKAGE`, `REQUEST_HUMAN_REVIEW`, `VALIDATE_MISSION_DAG`) require an authoritative persisted action record (`action_id`). Missing record returns `REQUIRES_REVIEW` with `RISK_UNKNOWN`.
+   - For pre-persistence `PROPOSE_ACTION`, schema and parameter validation is strictly validated server-side against `ACTION_PARAMETER_SCHEMAS`. Missing target or malformed parameters fail closed with `ACTION_VALIDATION_FAILED`.
+   - Cross-workspace action references are strictly forbidden; stored action must match authenticated tenant and authorized workspace (`WORKSPACE_MISMATCH`).
+   - Consistency is verified between stored action and evaluation request: action type (`ACTION_VALIDATION_FAILED`), target resource (`SCOPE_MISMATCH`), plant scope (`SCOPE_MISMATCH`), session (`SESSION_MISMATCH`), and operating data mode (`DATA_MODE_MISMATCH`).
+4. **Authoritative Cost Constraints:**
+   - Stored action cost estimate prevails over client-submitted cost estimates. Understated client cost cannot bypass or undermine a grant's `max_cost_limit_usd`.
+   - When a grant specifies a mandatory maximum cost limit but action cost cannot be authoritatively evaluated, evaluation fails closed to `REQUIRES_REVIEW` (`POLICY_REVIEW_REQUIRED`).
+5. **Explicit Authorization ALLOW Requirement:**
+   - Both `_require_grant_permission()` and underlying capability evaluation require explicit `ALLOW` effect from `authorization_service.evaluate()`.
+   - `DENY`, indeterminate outcomes, and authorization evaluation exceptions fail closed (`AutonomyRepositoryError` or `DENY` with `AUTHORIZATION_DENIED`). Implicit authorization is impossible.
+6. **Preservation of Architectural Invariants:**
+   - Tenant and workspace isolation preserved.
+   - Session-bound grant filtering preserved.
+   - Complete idempotency hashing preserved.
+   - Revision locking and optimistic concurrency preserved.
+   - Capability allowlists strictly maintained.
+   - Levels 4 and 5 permanently disabled.
+   - Mandatory audit persistence fail-closed behavior preserved.
+   - Non-operational execution boundary preserved (zero execution endpoints or operational side effects).
+7. **Regression Tests:**
+   - Added `TestV3AutonomyPrompt38BCorrections` with 19 dedicated tests covering all Prompt 38B security gaps. Total tests in `backend/test_v3_autonomy.py` increased to 60 (all passing).
+

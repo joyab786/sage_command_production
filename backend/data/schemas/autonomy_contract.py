@@ -262,6 +262,7 @@ class AutonomyReasonCode(str, Enum):
     INVALID_STATE_TRANSITION = "INVALID_STATE_TRANSITION"
     RATE_LIMIT_EXCEEDED = "RATE_LIMIT_EXCEEDED"
     EVALUATION_ERROR = "EVALUATION_ERROR"
+    ACTION_VALIDATION_FAILED = "ACTION_VALIDATION_FAILED"
 
 
 # =============================================================================

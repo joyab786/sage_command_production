@@ -129,7 +129,7 @@ def propose_action(
         if active_ident:
             effective_tenant = active_ident.tenant_id
             effective_workspace = active_ident.workspace_id
-            effective_session = active_ident.session_id or session_id or "session_default"
+            effective_session = active_ident.session_id or session_id
             auth_ident = active_ident
         else:
             effective_tenant = tenant_id
@@ -149,7 +149,7 @@ def propose_action(
         autonomy_scope = AutonomyScope(
             tenant_id=effective_tenant,
             workspace_id=effective_workspace,
-            session_id=effective_session,
+            session_id=auth_ident.session_id,
             plant_id=plant_id
         )
 
@@ -162,6 +162,8 @@ def propose_action(
             data_mode="REAL",
             risk_context={
                 "action_type": act_type_enum.value,
+                "target_resource_id": target.resource_id if target else None,
+                "parameters": parameters,
                 "cost_estimate_usd": float(estimated_cost_usd),
                 "risk_level": system_risk.value,
                 "proposer_id": auth_ident.user_id,
