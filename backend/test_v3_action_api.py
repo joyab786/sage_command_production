@@ -30,6 +30,13 @@ from data.schemas.action_contract import (
     ActionStatus,
     ActionErrorCode,
 )
+from data.schemas.autonomy_contract import (
+    AutonomyGrant,
+    AutonomyLevel,
+    SubjectType,
+)
+from repositories.autonomy_repository import autonomy_repository
+from tools.autonomy_context import active_autonomy_context
 
 
 class TestV3ActionAPI(unittest.TestCase):
@@ -439,32 +446,59 @@ class TestV3ActionAPI(unittest.TestCase):
         self.assertIn("ADJUST_REORDER_POINT", tool_catalog)
         self.assertIn("SCHEDULE_MAINTENANCE", tool_catalog)
 
-        # 2. propose_action
-        proposal_out = propose_action.invoke({
-            "action_type": "REORDER_INVENTORY",
-            "resource_type": "SKU",
-            "resource_id": "SKU-TOOL-01",
-            "parameters": {"sku_id": "SKU-TOOL-01", "quantity": 75, "priority": "EXPEDITE"},
-            "reason": "Agent autonomous restock decision",
-            "estimated_cost_usd": 1800.0,
-            "estimated_duration_minutes": 30
-        })
-        self.assertIn("ACTION PROPOSED SUCCESSFULLY", proposal_out)
-        self.assertIn("SKU-TOOL-01", proposal_out)
+        # Set up active autonomy grant & identity context for agent tool
+        subject_id = f"agent_tool_{uuid.uuid4().hex[:6]}"
+        grant = AutonomyGrant(
+            grant_id=f"grant_{uuid.uuid4().hex[:8]}",
+            subject_type=SubjectType.AGENT,
+            subject_id=subject_id,
+            autonomy_level=AutonomyLevel.RECOMMEND,
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            plant_id="plant_001",
+            data_mode="REAL",
+            permitted_capabilities=["PROPOSE_ACTION"],
+            created_by="manager_01",
+        )
+        autonomy_repository.save_grant(grant)
 
-        # Extract Action ID from tool output
-        lines = proposal_out.splitlines()
-        act_id = None
-        for line in lines:
-            if line.startswith("Action ID:"):
-                act_id = line.split(":", 1)[1].strip()
-                break
-        self.assertIsNotNone(act_id)
+        operator_identity = Identity(
+            user_id="operator_01",
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            session_id="session_default",
+            roles=["operator"],
+            assigned_plants=["plant_001"],
+            clearance_level=2,
+        )
 
-        # 3. preview_action_impact
-        preview_out = preview_action_impact.invoke({"action_id": act_id})
-        self.assertIn(f"SIMULATION PREVIEW for {act_id}", preview_out)
-        self.assertIn("pending_inbound_quantity", preview_out)
+        # 2. propose_action within trusted autonomy context
+        with active_autonomy_context(subject_id=subject_id, identity=operator_identity):
+            proposal_out = propose_action.invoke({
+                "action_type": "REORDER_INVENTORY",
+                "resource_type": "SKU",
+                "resource_id": "SKU-TOOL-01",
+                "parameters": {"sku_id": "SKU-TOOL-01", "quantity": 75, "priority": "EXPEDITE"},
+                "reason": "Agent autonomous restock decision",
+                "estimated_cost_usd": 1800.0,
+                "estimated_duration_minutes": 30
+            })
+            self.assertIn("ACTION PROPOSED SUCCESSFULLY", proposal_out)
+            self.assertIn("SKU-TOOL-01", proposal_out)
+
+            # Extract Action ID from tool output
+            lines = proposal_out.splitlines()
+            act_id = None
+            for line in lines:
+                if line.startswith("Action ID:"):
+                    act_id = line.split(":", 1)[1].strip()
+                    break
+            self.assertIsNotNone(act_id)
+
+            # 3. preview_action_impact
+            preview_out = preview_action_impact.invoke({"action_id": act_id})
+            self.assertIn(f"SIMULATION PREVIEW for {act_id}", preview_out)
+            self.assertIn("pending_inbound_quantity", preview_out)
 
 
 if __name__ == "__main__":

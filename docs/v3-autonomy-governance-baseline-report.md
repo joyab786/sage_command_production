@@ -308,3 +308,59 @@ This section documents the specific security gap closures implemented under Prom
 7. **Regression Tests:**
    - Added `TestV3AutonomyPrompt38BCorrections` with 19 dedicated tests covering all Prompt 38B security gaps. Total tests in `backend/test_v3_autonomy.py` increased to 60 (all passing).
 
+---
+
+## 23. Prompt 38C Security Corrections (Closing Autonomy Cost & Identity-Binding Gaps)
+
+This section documents the specific security gap closures implemented under Prompt 38C:
+
+### 1. Pre-Persistence Cost Authority Hardening
+- **Distinction of Cost Authority:** In `AutonomyService.evaluate_autonomy()`, authoritative cost and client estimates are explicitly decoupled:
+  - `authoritative_cost` is strictly established only from trusted persisted action records (`Action.estimated_cost.value`) or deterministic server-side calculations.
+  - Client-supplied `cost_estimate_usd` in `risk_context` is classified as untrusted input (`client_estimate`).
+- **Mandatory Cost Constraints Cannot Be Satisfied by Client Input:** Pre-persistence action proposals lack a persisted action record or server catalog cost. When a grant specifies an active `max_cost_limit_usd` and authoritative cost cannot be established, the evaluation fails closed to `REQUIRES_REVIEW` with reason code `POLICY_REVIEW_REQUIRED`. Client estimates alone can never establish that an action satisfies a mandatory cost constraint.
+- **Client Estimate Asymmetric Conservatism:** Client cost estimates may only increase conservatism (escalating effective cost and triggering review when exceeding grant limits), but can never understate or bypass authoritative costs.
+- **Input Validation:** Non-finite (`NaN`, `Infinity`, `-Infinity`), negative, and malformed non-numeric cost values in `risk_context` fail closed immediately to `REQUIRES_REVIEW` with reason code `RISK_UNKNOWN`.
+
+### 2. Session-Bound Stored-Action Validation Hardening
+- **Authoritative Identity-Derived Session:** Caller session is derived exclusively from the authenticated `Identity.session_id`. Scope parameters (`resource_scope.session_id`) or tool arguments can never manufacture a trusted session.
+- **Elimination of Truthy-Guard Bypass:** The stored-action session check previously guarded session validation with `if caller_session and getattr(stored_action, "session_id", None):`, which inadvertently bypassed validation for unsessioned callers. This has been replaced with:
+  ```python
+  stored_act_session = getattr(stored_action, "session_id", None)
+  if stored_act_session:
+      if not caller_session:
+          # Reject unsessioned callers attempting to evaluate session-bound actions
+          return DENY (SESSION_MISMATCH)
+      if str(stored_act_session).strip() != str(caller_session).strip():
+          # Reject mismatched session callers
+          return DENY (SESSION_MISMATCH)
+  ```
+- **Session Matching Invariant:** An unsessioned caller or a caller with a mismatched session attempting to evaluate a session-bound stored action is strictly denied access with `SESSION_MISMATCH`.
+
+### 3. Trusted Identity Requirement in `propose_action()`
+- **Fail-Closed Missing Identity Context:** In `backend/tools/action_tools.py:propose_action()`, if `get_active_autonomy_identity()` returns `None`, the tool immediately aborts before autonomy evaluation, parameter validation, or action persistence. It returns an explicit error: `"ACTION PROPOSAL BLOCKED: Authenticated autonomy context is required. No active trusted identity found in server execution context."`
+- **Elimination of Synthetic Identity Manufacturing:** Removed all fallback logic that constructed synthetic `Identity(user_id="agent_action_tool", roles=["operator"], assigned_plants=["*"], ...)` from tool arguments.
+- **Strict Identity Derivation & Anti-Forgery Protection:**
+  - `tenant_id` and `workspace_id` are derived directly from `auth_ident`. Any conflicting caller-supplied `tenant_id` or `workspace_id` arguments are flagged as forged context and rejected immediately.
+  - `session_id` is derived exclusively from `auth_ident.session_id`. If `session_id` is supplied by the caller when the authenticated identity is unsessioned, or if it contradicts `auth_ident.session_id`, the call is blocked.
+  - The same authoritative identity is passed to `action_validator.validate_all(action, auth_ident)` and persisted into `action.requested_by`.
+
+### 4. Repository Code Search Audit Findings
+A comprehensive repository search was conducted across the codebase:
+- **`active_ident.session_id or session_id`:** 0 occurrences found (eliminated).
+- **Synthetic `Identity` in agent tools:** Eliminated from `action_tools.py`. The only remaining occurrences are in `backend/tools/db_tools.py` (lines 49, 84, 123, 152), which are read-only schema/table inspection tools (`sql_db_list_tables`, `sql_db_schema`, `sql_db_query_checker`, `sql_db_query`). These tools only query internal telemetry metadata and cannot propose actions or alter operational state.
+- **Direct assignment of client cost to authoritative cost:** 0 occurrences found. `authoritative_cost` is initialized to `None` and is only populated from persisted `Action` models in SQLite.
+- **Session checks guarded by truthy caller-session conditions:** Eliminated. Line 419-424 of `autonomy_service.py` was inspected and verified to explicitly handle missing caller session for session-bound grants with `SESSION_MISMATCH`.
+- **Alternative paths for client input to establish identity, session, or authoritative cost:** 0 alternative paths exist.
+
+### 5. Regression Test Results
+- **Dedicated Suite:** `TestV3AutonomyPrompt38CCorrections` added to `backend/test_v3_autonomy.py` containing 19 test cases covering pre-persistence cost authority, session-bound stored-action validation, anti-forgery, and trusted identity enforcement.
+- **Test Executions:**
+  1. `backend/test_v3_autonomy.py`: 79 passed, 0 failed.
+  2. `backend/test_v3_action_api.py backend/test_v3_authorization.py backend/test_v3_mission_architecture.py backend/test_v3_security.py`: 122 passed, 0 failed.
+  Total: 201 automated tests passing across the governance, action, security, and authorization suites.
+
+### 6. Non-Operational Execution Boundary Confirmation
+- Autonomy Levels 4 and 5 remain `DISABLED` and `NOT_IMPLEMENTED`.
+- SageCommand V3 does not contain operational execution endpoints, background execution daemons, or autonomous write pathways. All proposals require human-in-the-loop review and approval.
+

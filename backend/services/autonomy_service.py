@@ -16,6 +16,7 @@ Cardinal Invariants:
 """
 
 import logging
+import math
 import time
 import uuid
 from typing import Dict, Any, List, Optional, Tuple, Set, Union
@@ -651,6 +652,66 @@ class AutonomyService:
         system_risk = None
         system_requires_approval = False
         authoritative_cost = None
+        client_estimate = None
+
+        # Validate client cost estimate if provided (Prompt 38C)
+        # Reject malformed, non-finite, negative, or otherwise invalid cost values.
+        raw_client_cost = risk_ctx.get("cost_estimate_usd")
+        if raw_client_cost is not None:
+            try:
+                c_val = float(raw_client_cost)
+                if math.isnan(c_val) or math.isinf(c_val):
+                    dec = AutonomyDecision.create(
+                        decision=AutonomyDecisionEffect.REQUIRES_REVIEW,
+                        reason_code=AutonomyReasonCode.RISK_UNKNOWN,
+                        reason=f"Non-finite cost estimate '{raw_client_cost}': NaN and Infinity values are prohibited.",
+                        subject_type=subject_type,
+                        subject_id=clean_subject_id,
+                        requested_capability=req_cap,
+                        effective_autonomy_level=active_grant.autonomy_level,
+                        scope=resource_scope,
+                        data_mode=norm_data_mode,
+                        risk_status="UNKNOWN",
+                        approval_requirement=True,
+                        request_id=request_id,
+                        grant_id=active_grant.grant_id,
+                    )
+                    return self._audit_and_persist_decision(dec, identity)
+                if c_val < 0.0:
+                    dec = AutonomyDecision.create(
+                        decision=AutonomyDecisionEffect.REQUIRES_REVIEW,
+                        reason_code=AutonomyReasonCode.RISK_UNKNOWN,
+                        reason=f"Negative cost estimate '{raw_client_cost}': must be a non-negative number.",
+                        subject_type=subject_type,
+                        subject_id=clean_subject_id,
+                        requested_capability=req_cap,
+                        effective_autonomy_level=active_grant.autonomy_level,
+                        scope=resource_scope,
+                        data_mode=norm_data_mode,
+                        risk_status="UNKNOWN",
+                        approval_requirement=True,
+                        request_id=request_id,
+                        grant_id=active_grant.grant_id,
+                    )
+                    return self._audit_and_persist_decision(dec, identity)
+                client_estimate = c_val
+            except (ValueError, TypeError):
+                dec = AutonomyDecision.create(
+                    decision=AutonomyDecisionEffect.REQUIRES_REVIEW,
+                    reason_code=AutonomyReasonCode.RISK_UNKNOWN,
+                    reason=f"Malformed cost estimate '{raw_client_cost}': could not parse as float.",
+                    subject_type=subject_type,
+                    subject_id=clean_subject_id,
+                    requested_capability=req_cap,
+                    effective_autonomy_level=active_grant.autonomy_level,
+                    scope=resource_scope,
+                    data_mode=norm_data_mode,
+                    risk_status="UNKNOWN",
+                    approval_requirement=True,
+                    request_id=request_id,
+                    grant_id=active_grant.grant_id,
+                )
+                return self._audit_and_persist_decision(dec, identity)
 
         if req_cap in NON_ACTION_CAPABILITIES:
             # Observation and analysis capabilities do not alter state or require action risk.
@@ -764,13 +825,32 @@ class AutonomyService:
                         )
                         return self._audit_and_persist_decision(dec, identity)
 
-                # Session scope check on stored action
-                if caller_session and getattr(stored_action, "session_id", None):
-                    if stored_action.session_id and stored_action.session_id != caller_session:
+                # Session scope check on stored action (Prompt 38C)
+                stored_act_session = getattr(stored_action, "session_id", None)
+                if stored_act_session:
+                    # If the stored action has a session binding, require a non-empty trusted caller session.
+                    # Reject access when the caller session is absent or differs from stored action's session.
+                    if not caller_session:
                         dec = AutonomyDecision.create(
                             decision=AutonomyDecisionEffect.DENY,
                             reason_code=AutonomyReasonCode.SESSION_MISMATCH,
-                            reason=f"Session mismatch: stored action is bound to session '{stored_action.session_id}', but caller session is '{caller_session}'.",
+                            reason=f"Session required: stored action '{action_id}' is bound to session '{stored_act_session}', but caller identity has no authenticated session.",
+                            subject_type=subject_type,
+                            subject_id=clean_subject_id,
+                            requested_capability=req_cap,
+                            effective_autonomy_level=active_grant.autonomy_level,
+                            scope=resource_scope,
+                            data_mode=norm_data_mode,
+                            risk_status="UNKNOWN",
+                            request_id=request_id,
+                            grant_id=active_grant.grant_id,
+                        )
+                        return self._audit_and_persist_decision(dec, identity)
+                    if str(stored_act_session).strip() != str(caller_session).strip():
+                        dec = AutonomyDecision.create(
+                            decision=AutonomyDecisionEffect.DENY,
+                            reason_code=AutonomyReasonCode.SESSION_MISMATCH,
+                            reason=f"Session mismatch: stored action is bound to session '{stored_act_session}', but caller session is '{caller_session}'.",
                             subject_type=subject_type,
                             subject_id=clean_subject_id,
                             requested_capability=req_cap,
@@ -946,11 +1026,9 @@ class AutonomyService:
                 except Exception:
                     system_risk = "UNKNOWN"
 
-                if risk_ctx.get("cost_estimate_usd") is not None:
-                    try:
-                        authoritative_cost = float(risk_ctx.get("cost_estimate_usd"))
-                    except (ValueError, TypeError):
-                        authoritative_cost = None
+                # Pre-persistence proposal: authoritative cost is unavailable (no persisted action record or server pricing catalog).
+                # Client estimate must never establish authoritative cost.
+                authoritative_cost = None
         else:
             # Capability not explicitly categorized: must establish risk or fail closed
             system_risk = "UNKNOWN"
@@ -1003,37 +1081,19 @@ class AutonomyService:
                 )
                 return self._audit_and_persist_decision(dec, identity)
 
-        # Cost Limit Constraint Check
+        # Cost Limit Constraint Check (Prompt 38C)
         max_cost_limit = active_grant.constraints.max_cost_limit_usd
         if max_cost_limit is not None:
-            effective_cost = None
-            if authoritative_cost is not None:
-                effective_cost = authoritative_cost
-                # Client cost can escalate conservatism, but can never understate/override authoritative cost
-                client_cost = risk_ctx.get("cost_estimate_usd")
-                if client_cost is not None:
-                    try:
-                        c_val = float(client_cost)
-                        if c_val > effective_cost:
-                            effective_cost = c_val
-                    except (ValueError, TypeError):
-                        pass
-            else:
-                client_cost = risk_ctx.get("cost_estimate_usd")
-                if client_cost is not None:
-                    try:
-                        effective_cost = float(client_cost)
-                    except (ValueError, TypeError):
-                        effective_cost = None
-
-            if effective_cost is None:
-                # Mandatory cost limit cannot be evaluated
+            if authoritative_cost is None:
+                # Mandatory cost limit cannot be evaluated authoritatively.
+                # Client estimate alone must NEVER establish that an action satisfies a mandatory cost constraint.
                 dec = AutonomyDecision.create(
                     decision=AutonomyDecisionEffect.REQUIRES_REVIEW,
                     reason_code=AutonomyReasonCode.POLICY_REVIEW_REQUIRED,
                     reason=(
                         f"Grant specifies mandatory max cost limit of ${max_cost_limit:,.2f}, "
-                        "but action cost cannot be authoritatively evaluated. Human review required."
+                        "but action cost cannot be authoritatively evaluated. "
+                        "Client estimate cannot satisfy mandatory cost constraint. Human review required."
                     ),
                     subject_type=subject_type,
                     subject_id=clean_subject_id,
@@ -1047,6 +1107,11 @@ class AutonomyService:
                     grant_id=active_grant.grant_id,
                 )
                 return self._audit_and_persist_decision(dec, identity)
+
+            effective_cost = authoritative_cost
+            # Client estimate may increase conservatism (escalate cost), but never understate or satisfy a check alone
+            if client_estimate is not None and client_estimate > effective_cost:
+                effective_cost = client_estimate
 
             if effective_cost > max_cost_limit:
                 dec = AutonomyDecision.create(

@@ -364,7 +364,7 @@ class Action(BaseModel):
 
     tenant_id: str = Field(..., description="Scoped tenant organization")
     workspace_id: str = Field(..., description="Scoped workspace partition")
-    session_id: str = Field(..., description="Scoped active session")
+    session_id: Optional[str] = Field(default=None, description="Scoped active session")
 
     mission_id: Optional[str] = Field(default=None)
     incident_id: Optional[str] = Field(default=None)

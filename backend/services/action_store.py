@@ -134,7 +134,7 @@ class ActionStore:
                         action.action_id,
                         action.tenant_id,
                         action.workspace_id,
-                        action.session_id,
+                        action.session_id or "",
                         action.action_type.value,
                         action.status.value,
                         action.system_risk_level.value,

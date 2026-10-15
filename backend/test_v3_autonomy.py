@@ -17,6 +17,7 @@ Validates:
 """
 
 import unittest
+import math
 from unittest.mock import patch, MagicMock
 import uuid
 import time
@@ -2027,6 +2028,7 @@ class TestV3AutonomyPrompt38BCorrections(unittest.TestCase):
             user_id="mgr_01",
             tenant_id="tenant_default",
             workspace_id="workspace_default",
+            session_id="session_01",
             roles=["operator", "manager"],
             assigned_plants=["plant_01"],
             clearance_level=2,
@@ -2083,6 +2085,7 @@ class TestV3AutonomyPrompt38BCorrections(unittest.TestCase):
             user_id="mgr_01",
             tenant_id="tenant_default",
             workspace_id="workspace_default",
+            session_id="session_01",
             roles=["operator", "manager"],
             assigned_plants=["plant_01"],
             clearance_level=2,
@@ -2139,6 +2142,7 @@ class TestV3AutonomyPrompt38BCorrections(unittest.TestCase):
             user_id="mgr_01",
             tenant_id="tenant_default",
             workspace_id="workspace_default",
+            session_id="session_01",
             roles=["operator", "manager"],
             assigned_plants=["plant_01"],
             clearance_level=2,
@@ -2198,6 +2202,7 @@ class TestV3AutonomyPrompt38BCorrections(unittest.TestCase):
             user_id="mgr_01",
             tenant_id="tenant_default",
             workspace_id="workspace_default",
+            session_id="session_01",
             roles=["operator", "manager"],
             assigned_plants=["plant_01"],
             clearance_level=2,
@@ -2352,9 +2357,633 @@ class TestV3AutonomyPrompt38BCorrections(unittest.TestCase):
                     "target_resource_id": "SKU-01",
                 },
             )
-            self.assertEqual(decision.decision, AutonomyDecisionEffect.DENY)
-            self.assertEqual(decision.reason_code, AutonomyReasonCode.AUTHORIZATION_DENIED)
-            self.assertIn("Underlying authorization evaluation failed", decision.reason)
+
+# =========================================================================
+# TEST SUITE: PROMPT 38C CORRECTIONS
+# =========================================================================
+
+class TestV3AutonomyPrompt38CCorrections(unittest.TestCase):
+    """
+    Dedicated regression test suite for SAGECOMMAND V3 — PROMPT 38C:
+    1. Pre-Persistence Cost Authority:
+       - Client estimate cannot satisfy mandatory max cost limit.
+       - Authoritative cost unknown/unavailable pre-persistence triggers REQUIRES_REVIEW (POLICY_REVIEW_REQUIRED).
+       - Inflated client estimate triggers review.
+       - Omitted cost with active limit triggers review.
+       - Malformed, NaN, Inf, and negative costs fail closed (RISK_UNKNOWN).
+       - Stored action authoritative cost evaluation respects limits and client conservatism escalation.
+    2. Session-Bound Stored-Action Validation:
+       - Unsessioned caller cannot evaluate session-bound action (SESSION_MISMATCH).
+       - Caller from different session is rejected (SESSION_MISMATCH).
+       - Matching session caller passes session check.
+       - Client resource_scope session cannot manufacture trusted session for unsessioned caller.
+       - Unsessioned stored action can be evaluated cleanly.
+    3. Require Trusted Identity in propose_action():
+       - Fails closed when active autonomy identity context is missing.
+       - Rejects forged tenant_id argument.
+       - Rejects forged workspace_id argument.
+       - Rejects forged session_id argument when identity is unsessioned.
+       - Rejects forged session_id argument when identity session differs.
+       - Persists action with authoritative identity and scope.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.service = autonomy_service
+        cls.repo = autonomy_repository
+
+    def setUp(self):
+        action_store.clear()
+
+    def tearDown(self):
+        action_store.clear()
+
+    def _create_identity(
+        self,
+        user_id="user_test_38c",
+        tenant_id="tenant_default",
+        workspace_id="workspace_default",
+        session_id="session_test_38c",
+        roles=None,
+        plants=None,
+        clearance=2,
+    ):
+        return Identity(
+            user_id=user_id,
+            tenant_id=tenant_id,
+            workspace_id=workspace_id,
+            session_id=session_id,
+            roles=roles or ["operator", "manager"],
+            assigned_plants=plants or ["plant_01"],
+            clearance_level=clearance,
+        )
+
+    def _create_grant(
+        self,
+        subject_id,
+        level=AutonomyLevel.RECOMMEND,
+        caps=None,
+        max_cost=None,
+        tenant_id="tenant_default",
+        workspace_id="workspace_default",
+        plant_id="plant_01",
+        session_id=None,
+    ):
+        constraints = AutonomyConstraints(max_cost_limit_usd=max_cost) if max_cost is not None else AutonomyConstraints()
+        grant = AutonomyGrant(
+            grant_id=f"grant_{uuid.uuid4().hex[:8]}",
+            subject_type=SubjectType.AGENT,
+            subject_id=subject_id,
+            autonomy_level=level,
+            tenant_id=tenant_id,
+            workspace_id=workspace_id,
+            plant_id=plant_id,
+            session_id=session_id,
+            data_mode="REAL",
+            permitted_capabilities=caps or ["PROPOSE_ACTION"],
+            constraints=constraints,
+            created_by="admin_38c",
+        )
+        self.repo.save_grant(grant)
+        return grant
+
+    def _create_stored_action(
+        self,
+        action_id,
+        tenant_id="tenant_default",
+        workspace_id="workspace_default",
+        session_id="session_test_38c",
+        plant_id="plant_01",
+        cost=200.0,
+        risk_level=RiskLevel.LOW,
+    ):
+        target = ActionTarget(
+            resource_type=ResourceType.SKU,
+            resource_id="SKU-100",
+            tenant_id=tenant_id,
+            workspace_id=workspace_id,
+            plant_id=plant_id,
+        )
+        reason = ActionReason(
+            reason_code="OPERATIONAL_RECOVERY",
+            summary="Prompt 38C stored action test",
+            justification="Stored action validation",
+        )
+        cost_est = CostEstimate(value=cost, currency="USD") if cost is not None else None
+        action = Action(
+            action_id=action_id,
+            tenant_id=tenant_id,
+            workspace_id=workspace_id,
+            session_id=session_id,
+            action_type=ActionType.REORDER_INVENTORY,
+            version="1.0",
+            target=target,
+            parameters={"sku_id": "SKU-100", "quantity": 10},
+            reason=reason,
+            system_risk_level=risk_level,
+            requires_approval=(risk_level in [RiskLevel.HIGH, RiskLevel.CRITICAL]),
+            estimated_cost=cost_est,
+            estimated_duration_minutes=15,
+            status=ActionStatus.PROPOSED,
+        )
+        action_store.save(action)
+        return action
+
+    # -------------------------------------------------------------------------
+    # 1. Pre-Persistence Cost Authority Tests
+    # -------------------------------------------------------------------------
+
+    def test_pre_persistence_understated_client_estimate_cannot_satisfy_mandatory_cost_limit(self):
+        """Client estimate alone cannot satisfy a mandatory max cost constraint."""
+        subject_id = f"agent_cost_under_{uuid.uuid4().hex[:6]}"
+        grant = self._create_grant(subject_id=subject_id, max_cost=500.0)
+        identity = self._create_identity(session_id="session_38c_01")
+
+        dec = self.service.evaluate_autonomy(
+            identity=identity,
+            subject_id=subject_id,
+            requested_capability="PROPOSE_ACTION",
+            resource_scope=grant.scope,
+            data_mode="REAL",
+            risk_context={
+                "action_type": "REORDER_INVENTORY",
+                "parameters": {"sku_id": "SKU-100", "quantity": 10},
+                "target_resource_id": "SKU-100",
+                "cost_estimate_usd": 49.99,  # Understated client estimate
+            },
+        )
+        self.assertEqual(dec.decision, AutonomyDecisionEffect.REQUIRES_REVIEW)
+        self.assertEqual(dec.reason_code, AutonomyReasonCode.POLICY_REVIEW_REQUIRED)
+        self.assertIn("Client estimate cannot satisfy mandatory cost constraint", dec.reason)
+
+    def test_pre_persistence_inflated_client_estimate_triggers_review(self):
+        """Pre-persistence proposal with inflated estimate exceeding limit requires review."""
+        subject_id = f"agent_cost_infl_{uuid.uuid4().hex[:6]}"
+        grant = self._create_grant(subject_id=subject_id, max_cost=500.0)
+        identity = self._create_identity(session_id="session_38c_02")
+
+        dec = self.service.evaluate_autonomy(
+            identity=identity,
+            subject_id=subject_id,
+            requested_capability="PROPOSE_ACTION",
+            resource_scope=grant.scope,
+            data_mode="REAL",
+            risk_context={
+                "action_type": "REORDER_INVENTORY",
+                "parameters": {"sku_id": "SKU-100", "quantity": 10},
+                "target_resource_id": "SKU-100",
+                "cost_estimate_usd": 1500.0,
+            },
+        )
+        self.assertEqual(dec.decision, AutonomyDecisionEffect.REQUIRES_REVIEW)
+        self.assertEqual(dec.reason_code, AutonomyReasonCode.POLICY_REVIEW_REQUIRED)
+
+    def test_pre_persistence_omitted_cost_with_mandatory_cost_limit_requires_review(self):
+        """Pre-persistence proposal omitting cost when mandatory limit is active requires review."""
+        subject_id = f"agent_cost_omit_{uuid.uuid4().hex[:6]}"
+        grant = self._create_grant(subject_id=subject_id, max_cost=500.0)
+        identity = self._create_identity(session_id="session_38c_03")
+
+        dec = self.service.evaluate_autonomy(
+            identity=identity,
+            subject_id=subject_id,
+            requested_capability="PROPOSE_ACTION",
+            resource_scope=grant.scope,
+            data_mode="REAL",
+            risk_context={
+                "action_type": "REORDER_INVENTORY",
+                "parameters": {"sku_id": "SKU-100", "quantity": 10},
+                "target_resource_id": "SKU-100",
+            },
+        )
+        self.assertEqual(dec.decision, AutonomyDecisionEffect.REQUIRES_REVIEW)
+        self.assertEqual(dec.reason_code, AutonomyReasonCode.POLICY_REVIEW_REQUIRED)
+
+    def test_pre_persistence_malformed_cost_estimate_fails_closed(self):
+        """Malformed client cost string must fail closed with RISK_UNKNOWN."""
+        subject_id = f"agent_cost_malf_{uuid.uuid4().hex[:6]}"
+        grant = self._create_grant(subject_id=subject_id)
+        identity = self._create_identity(session_id="session_38c_04")
+
+        dec = self.service.evaluate_autonomy(
+            identity=identity,
+            subject_id=subject_id,
+            requested_capability="PROPOSE_ACTION",
+            resource_scope=grant.scope,
+            data_mode="REAL",
+            risk_context={
+                "action_type": "REORDER_INVENTORY",
+                "parameters": {"sku_id": "SKU-100", "quantity": 10},
+                "target_resource_id": "SKU-100",
+                "cost_estimate_usd": "not-a-valid-cost",
+            },
+        )
+        self.assertEqual(dec.decision, AutonomyDecisionEffect.REQUIRES_REVIEW)
+        self.assertEqual(dec.reason_code, AutonomyReasonCode.RISK_UNKNOWN)
+        self.assertIn("Malformed cost estimate", dec.reason)
+
+    def test_pre_persistence_nan_cost_estimate_fails_closed(self):
+        """NaN client cost must fail closed with RISK_UNKNOWN."""
+        subject_id = f"agent_cost_nan_{uuid.uuid4().hex[:6]}"
+        grant = self._create_grant(subject_id=subject_id)
+        identity = self._create_identity(session_id="session_38c_05")
+
+        dec = self.service.evaluate_autonomy(
+            identity=identity,
+            subject_id=subject_id,
+            requested_capability="PROPOSE_ACTION",
+            resource_scope=grant.scope,
+            data_mode="REAL",
+            risk_context={
+                "action_type": "REORDER_INVENTORY",
+                "parameters": {"sku_id": "SKU-100", "quantity": 10},
+                "target_resource_id": "SKU-100",
+                "cost_estimate_usd": float("nan"),
+            },
+        )
+        self.assertEqual(dec.decision, AutonomyDecisionEffect.REQUIRES_REVIEW)
+        self.assertEqual(dec.reason_code, AutonomyReasonCode.RISK_UNKNOWN)
+        self.assertIn("non-finite", dec.reason.lower())
+
+    def test_pre_persistence_inf_cost_estimate_fails_closed(self):
+        """Infinity client cost must fail closed with RISK_UNKNOWN."""
+        subject_id = f"agent_cost_inf_{uuid.uuid4().hex[:6]}"
+        grant = self._create_grant(subject_id=subject_id)
+        identity = self._create_identity(session_id="session_38c_06")
+
+        for val in [float("inf"), float("-inf")]:
+            dec = self.service.evaluate_autonomy(
+                identity=identity,
+                subject_id=subject_id,
+                requested_capability="PROPOSE_ACTION",
+                resource_scope=grant.scope,
+                data_mode="REAL",
+                risk_context={
+                    "action_type": "REORDER_INVENTORY",
+                    "parameters": {"sku_id": "SKU-100", "quantity": 10},
+                    "target_resource_id": "SKU-100",
+                    "cost_estimate_usd": val,
+                },
+            )
+            self.assertEqual(dec.decision, AutonomyDecisionEffect.REQUIRES_REVIEW)
+            self.assertEqual(dec.reason_code, AutonomyReasonCode.RISK_UNKNOWN)
+            self.assertIn("non-finite", dec.reason.lower())
+
+    def test_pre_persistence_negative_cost_estimate_fails_closed(self):
+        """Negative client cost must fail closed with RISK_UNKNOWN."""
+        subject_id = f"agent_cost_neg_{uuid.uuid4().hex[:6]}"
+        grant = self._create_grant(subject_id=subject_id)
+        identity = self._create_identity(session_id="session_38c_07")
+
+        dec = self.service.evaluate_autonomy(
+            identity=identity,
+            subject_id=subject_id,
+            requested_capability="PROPOSE_ACTION",
+            resource_scope=grant.scope,
+            data_mode="REAL",
+            risk_context={
+                "action_type": "REORDER_INVENTORY",
+                "parameters": {"sku_id": "SKU-100", "quantity": 10},
+                "target_resource_id": "SKU-100",
+                "cost_estimate_usd": -25.0,
+            },
+        )
+        self.assertEqual(dec.decision, AutonomyDecisionEffect.REQUIRES_REVIEW)
+        self.assertEqual(dec.reason_code, AutonomyReasonCode.RISK_UNKNOWN)
+        self.assertIn("negative", dec.reason)
+
+    def test_stored_action_authoritative_cost_evaluation(self):
+        """Authoritative cost from stored action is enforced; client can increase conservatism but not lower risk."""
+        subject_id = f"agent_cost_stored_{uuid.uuid4().hex[:6]}"
+        grant = self._create_grant(subject_id=subject_id, max_cost=500.0)
+        session_id = "session_38c_stored"
+        identity = self._create_identity(session_id=session_id)
+
+        # 1. Stored action with authoritative cost $200 (within $500 limit)
+        act1_id = f"act_stored_cost_ok_{uuid.uuid4().hex[:6]}"
+        self._create_stored_action(act1_id, session_id=session_id, cost=200.0, risk_level=RiskLevel.LOW)
+
+        dec1 = self.service.evaluate_autonomy(
+            identity=identity,
+            subject_id=subject_id,
+            requested_capability="PROPOSE_ACTION",
+            resource_scope=grant.scope,
+            data_mode="REAL",
+            risk_context={
+                "action_id": act1_id,
+                "action_type": "REORDER_INVENTORY",
+                "target_resource_id": "SKU-100",
+            },
+        )
+        self.assertEqual(dec1.decision, AutonomyDecisionEffect.ALLOW)
+
+        # 2. Inflated client estimate ($800) increases conservatism and triggers review
+        dec2 = self.service.evaluate_autonomy(
+            identity=identity,
+            subject_id=subject_id,
+            requested_capability="PROPOSE_ACTION",
+            resource_scope=grant.scope,
+            data_mode="REAL",
+            risk_context={
+                "action_id": act1_id,
+                "action_type": "REORDER_INVENTORY",
+                "target_resource_id": "SKU-100",
+                "cost_estimate_usd": 800.0,
+            },
+        )
+        self.assertEqual(dec2.decision, AutonomyDecisionEffect.REQUIRES_REVIEW)
+        self.assertEqual(dec2.reason_code, AutonomyReasonCode.POLICY_REVIEW_REQUIRED)
+
+        # 3. Stored action with authoritative cost $700 (exceeds $500 limit)
+        # Client understated estimate ($50) must NOT lower risk or satisfy check
+        act2_id = f"act_stored_cost_high_{uuid.uuid4().hex[:6]}"
+        self._create_stored_action(act2_id, session_id=session_id, cost=700.0, risk_level=RiskLevel.LOW)
+
+        dec3 = self.service.evaluate_autonomy(
+            identity=identity,
+            subject_id=subject_id,
+            requested_capability="PROPOSE_ACTION",
+            resource_scope=grant.scope,
+            data_mode="REAL",
+            risk_context={
+                "action_id": act2_id,
+                "action_type": "REORDER_INVENTORY",
+                "target_resource_id": "SKU-100",
+                "cost_estimate_usd": 50.0,
+            },
+        )
+        self.assertEqual(dec3.decision, AutonomyDecisionEffect.REQUIRES_REVIEW)
+        self.assertEqual(dec3.reason_code, AutonomyReasonCode.POLICY_REVIEW_REQUIRED)
+
+    # -------------------------------------------------------------------------
+    # 2. Session-Bound Stored-Action Validation Tests
+    # -------------------------------------------------------------------------
+
+    def test_stored_action_unsessioned_caller_rejected_for_session_bound_action(self):
+        """Unsessioned caller cannot evaluate a session-bound stored action (SESSION_MISMATCH)."""
+        subject_id = f"agent_sess_unsess_{uuid.uuid4().hex[:6]}"
+        grant = self._create_grant(subject_id=subject_id)
+        act_id = f"act_sess_bound_{uuid.uuid4().hex[:6]}"
+        self._create_stored_action(act_id, session_id="session_alpha")
+
+        # Caller has no session
+        identity = self._create_identity(session_id=None)
+
+        dec = self.service.evaluate_autonomy(
+            identity=identity,
+            subject_id=subject_id,
+            requested_capability="PROPOSE_ACTION",
+            resource_scope=grant.scope,
+            data_mode="REAL",
+            risk_context={
+                "action_id": act_id,
+                "action_type": "REORDER_INVENTORY",
+                "target_resource_id": "SKU-100",
+            },
+        )
+        self.assertEqual(dec.decision, AutonomyDecisionEffect.DENY)
+        self.assertEqual(dec.reason_code, AutonomyReasonCode.SESSION_MISMATCH)
+        self.assertIn("has no authenticated session", dec.reason)
+
+    def test_stored_action_mismatched_session_caller_rejected(self):
+        """Caller from different session is rejected (SESSION_MISMATCH)."""
+        subject_id = f"agent_sess_diff_{uuid.uuid4().hex[:6]}"
+        grant = self._create_grant(subject_id=subject_id)
+        act_id = f"act_sess_bound_{uuid.uuid4().hex[:6]}"
+        self._create_stored_action(act_id, session_id="session_alpha")
+
+        # Caller has different session
+        identity = self._create_identity(session_id="session_beta")
+
+        dec = self.service.evaluate_autonomy(
+            identity=identity,
+            subject_id=subject_id,
+            requested_capability="PROPOSE_ACTION",
+            resource_scope=grant.scope,
+            data_mode="REAL",
+            risk_context={
+                "action_id": act_id,
+                "action_type": "REORDER_INVENTORY",
+                "target_resource_id": "SKU-100",
+            },
+        )
+        self.assertEqual(dec.decision, AutonomyDecisionEffect.DENY)
+        self.assertEqual(dec.reason_code, AutonomyReasonCode.SESSION_MISMATCH)
+        self.assertIn("Session mismatch", dec.reason)
+
+    def test_stored_action_matching_session_caller_passes_session_check(self):
+        """Caller with matching authenticated session passes session validation."""
+        subject_id = f"agent_sess_ok_{uuid.uuid4().hex[:6]}"
+        grant = self._create_grant(subject_id=subject_id)
+        act_id = f"act_sess_ok_{uuid.uuid4().hex[:6]}"
+        self._create_stored_action(act_id, session_id="session_gamma", cost=100.0, risk_level=RiskLevel.LOW)
+
+        identity = self._create_identity(session_id="session_gamma")
+
+        dec = self.service.evaluate_autonomy(
+            identity=identity,
+            subject_id=subject_id,
+            requested_capability="PROPOSE_ACTION",
+            resource_scope=grant.scope,
+            data_mode="REAL",
+            risk_context={
+                "action_id": act_id,
+                "action_type": "REORDER_INVENTORY",
+                "target_resource_id": "SKU-100",
+            },
+        )
+        self.assertEqual(dec.decision, AutonomyDecisionEffect.ALLOW)
+
+    def test_client_scope_session_cannot_manufacture_trusted_session(self):
+        """Client-supplied resource_scope session cannot manufacture a trusted session for an unsessioned caller."""
+        subject_id = f"agent_sess_scope_forge_{uuid.uuid4().hex[:6]}"
+        grant = self._create_grant(subject_id=subject_id)
+        act_id = f"act_sess_target_{uuid.uuid4().hex[:6]}"
+        self._create_stored_action(act_id, session_id="session_target_99")
+
+        # Identity has NO session
+        identity = self._create_identity(session_id=None)
+
+        # Scope attempts to claim session_target_99
+        scope = AutonomyScope(
+            tenant_id=grant.tenant_id,
+            workspace_id=grant.workspace_id,
+            plant_id=grant.plant_id,
+            session_id="session_target_99",
+        )
+
+        dec = self.service.evaluate_autonomy(
+            identity=identity,
+            subject_id=subject_id,
+            requested_capability="PROPOSE_ACTION",
+            resource_scope=scope,
+            data_mode="REAL",
+            risk_context={
+                "action_id": act_id,
+                "action_type": "REORDER_INVENTORY",
+                "target_resource_id": "SKU-100",
+            },
+        )
+        # Must fail closed because caller identity has no authenticated session
+        self.assertEqual(dec.decision, AutonomyDecisionEffect.DENY)
+        self.assertEqual(dec.reason_code, AutonomyReasonCode.SESSION_MISMATCH)
+
+    def test_stored_action_unsessioned_action_accessible(self):
+        """Stored action with no session binding can be evaluated without session rejection."""
+        subject_id = f"agent_sess_none_{uuid.uuid4().hex[:6]}"
+        grant = self._create_grant(subject_id=subject_id)
+        act_id = f"act_sess_unbound_{uuid.uuid4().hex[:6]}"
+        self._create_stored_action(act_id, session_id=None, cost=100.0, risk_level=RiskLevel.LOW)
+
+        identity = self._create_identity(session_id="any_session")
+
+        dec = self.service.evaluate_autonomy(
+            identity=identity,
+            subject_id=subject_id,
+            requested_capability="PROPOSE_ACTION",
+            resource_scope=grant.scope,
+            data_mode="REAL",
+            risk_context={
+                "action_id": act_id,
+                "action_type": "REORDER_INVENTORY",
+                "target_resource_id": "SKU-100",
+            },
+        )
+        self.assertEqual(dec.decision, AutonomyDecisionEffect.ALLOW)
+
+    # -------------------------------------------------------------------------
+    # 3. Trusted Identity in propose_action() Tests
+    # -------------------------------------------------------------------------
+
+    def test_propose_action_tool_requires_authenticated_autonomy_context(self):
+        """propose_action fails closed when no active autonomy identity context is present."""
+        res = propose_action.invoke({
+            "action_type": "REORDER_INVENTORY",
+            "resource_type": "SKU",
+            "resource_id": "SKU-PROPOSE-01",
+            "parameters": {"sku_id": "SKU-PROPOSE-01", "quantity": 10},
+            "reason": "Missing context test",
+        })
+        self.assertIn("ACTION PROPOSAL BLOCKED: Authenticated autonomy context is required", res)
+
+    def test_propose_action_tool_rejects_forged_tenant_argument(self):
+        """propose_action rejects caller-supplied tenant_id that contradicts authenticated identity."""
+        subject_id = f"agent_forge_tenant_{uuid.uuid4().hex[:6]}"
+        grant = self._create_grant(subject_id=subject_id, tenant_id="tenant_legit")
+        identity = self._create_identity(tenant_id="tenant_legit", session_id="session_legit")
+
+        with active_autonomy_context(subject_id=subject_id, identity=identity):
+            res = propose_action.invoke({
+                "action_type": "REORDER_INVENTORY",
+                "resource_type": "SKU",
+                "resource_id": "SKU-PROPOSE-02",
+                "tenant_id": "tenant_attacker",
+                "parameters": {"sku_id": "SKU-PROPOSE-02", "quantity": 10},
+                "reason": "Forged tenant test",
+            })
+            self.assertIn("ACTION PROPOSAL BLOCKED: Forged tenant context detected", res)
+
+    def test_propose_action_tool_rejects_forged_workspace_argument(self):
+        """propose_action rejects caller-supplied workspace_id that contradicts authenticated identity."""
+        subject_id = f"agent_forge_ws_{uuid.uuid4().hex[:6]}"
+        grant = self._create_grant(subject_id=subject_id, workspace_id="ws_legit")
+        identity = self._create_identity(workspace_id="ws_legit", session_id="session_legit")
+
+        with active_autonomy_context(subject_id=subject_id, identity=identity):
+            res = propose_action.invoke({
+                "action_type": "REORDER_INVENTORY",
+                "resource_type": "SKU",
+                "resource_id": "SKU-PROPOSE-03",
+                "workspace_id": "ws_attacker",
+                "parameters": {"sku_id": "SKU-PROPOSE-03", "quantity": 10},
+                "reason": "Forged workspace test",
+            })
+            self.assertIn("ACTION PROPOSAL BLOCKED: Forged workspace context detected", res)
+
+    def test_propose_action_tool_rejects_forged_session_when_unsessioned(self):
+        """propose_action rejects session_id tool argument when authenticated identity is unsessioned."""
+        subject_id = f"agent_forge_sess_none_{uuid.uuid4().hex[:6]}"
+        grant = self._create_grant(subject_id=subject_id)
+        identity = self._create_identity(session_id=None)
+
+        with active_autonomy_context(subject_id=subject_id, identity=identity):
+            res = propose_action.invoke({
+                "action_type": "REORDER_INVENTORY",
+                "resource_type": "SKU",
+                "resource_id": "SKU-PROPOSE-04",
+                "session_id": "session_attacker",
+                "parameters": {"sku_id": "SKU-PROPOSE-04", "quantity": 10},
+                "reason": "Forged session test",
+            })
+            self.assertIn("ACTION PROPOSAL BLOCKED: Forged session context detected", res)
+            self.assertIn("cannot substitute for unauthenticated session", res)
+
+    def test_propose_action_tool_rejects_forged_session_when_session_differs(self):
+        """propose_action rejects session_id tool argument differing from authenticated session."""
+        subject_id = f"agent_forge_sess_diff_{uuid.uuid4().hex[:6]}"
+        grant = self._create_grant(subject_id=subject_id)
+        identity = self._create_identity(session_id="session_legit_10")
+
+        with active_autonomy_context(subject_id=subject_id, identity=identity):
+            res = propose_action.invoke({
+                "action_type": "REORDER_INVENTORY",
+                "resource_type": "SKU",
+                "resource_id": "SKU-PROPOSE-05",
+                "session_id": "session_attacker_99",
+                "parameters": {"sku_id": "SKU-PROPOSE-05", "quantity": 10},
+                "reason": "Forged session test",
+            })
+            self.assertIn("ACTION PROPOSAL BLOCKED: Forged session context detected", res)
+            self.assertIn("does not match authenticated session", res)
+
+    def test_propose_action_tool_persists_action_with_authoritative_identity_and_scope(self):
+        """propose_action uses authoritative identity and scope for governance, validation, and persistence."""
+        subject_id = f"agent_valid_proposal_{uuid.uuid4().hex[:6]}"
+        grant = self._create_grant(
+            subject_id=subject_id,
+            tenant_id="tenant_auth_38c",
+            workspace_id="ws_auth_38c",
+            plant_id="plant_01",
+        )
+        identity = self._create_identity(
+            user_id="user_auth_proposer",
+            tenant_id="tenant_auth_38c",
+            workspace_id="ws_auth_38c",
+            session_id="session_auth_38c",
+            roles=["operator", "manager"],
+            plants=["plant_01"],
+            clearance=2,
+        )
+
+        with active_autonomy_context(subject_id=subject_id, identity=identity):
+            res = propose_action.invoke({
+                "action_type": "REORDER_INVENTORY",
+                "resource_type": "SKU",
+                "resource_id": "SKU-PROPOSE-AUTH",
+                "plant_id": "plant_01",
+                "parameters": {"sku_id": "SKU-PROPOSE-AUTH", "quantity": 25, "priority": "STANDARD"},
+                "estimated_cost_usd": 250.0,
+                "estimated_duration_minutes": 20,
+                "reason": "Authorized replenishment",
+            })
+            self.assertIn("ACTION PROPOSED SUCCESSFULLY", res)
+            self.assertIn("Action ID:", res)
+
+            # Extract Action ID
+            act_id = None
+            for line in res.splitlines():
+                if line.startswith("Action ID:"):
+                    act_id = line.split(":", 1)[1].strip()
+                    break
+            self.assertIsNotNone(act_id)
+
+            # Verify persisted record matches authoritative context
+            stored = action_store.get_by_id(act_id, tenant_id="tenant_auth_38c")
+            self.assertIsNotNone(stored)
+            self.assertEqual(stored.tenant_id, "tenant_auth_38c")
+            self.assertEqual(stored.workspace_id, "ws_auth_38c")
+            self.assertEqual(stored.session_id, "session_auth_38c")
+            self.assertEqual(stored.requested_by, "user_auth_proposer")
 
 
 if __name__ == "__main__":

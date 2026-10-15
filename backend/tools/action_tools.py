@@ -63,9 +63,9 @@ def propose_action(
     reason_code: str = "OPERATIONAL_RECOVERY",
     estimated_cost_usd: float = 0.0,
     estimated_duration_minutes: int = 0,
-    tenant_id: str = "tenant_default",
-    workspace_id: str = "workspace_default",
-    session_id: str = "session_default",
+    tenant_id: Optional[str] = None,
+    workspace_id: Optional[str] = None,
+    session_id: Optional[str] = None,
     plant_id: str = "plant_001"
 ) -> str:
     """
@@ -77,6 +77,42 @@ def propose_action(
       NOTIFY_STAKEHOLDER, UPDATE_SLA_PRIORITY.
     """
     try:
+        # Require trusted authenticated autonomy identity (Prompt 38C)
+        active_ident = get_active_autonomy_identity()
+        if not active_ident:
+            return (
+                "ACTION PROPOSAL BLOCKED: Authenticated autonomy context is required. "
+                "No active trusted identity found in server execution context."
+            )
+
+        auth_ident = active_ident
+        auth_tenant = auth_ident.tenant_id
+        auth_workspace = getattr(auth_ident, "workspace_id", None) or "workspace_default"
+        auth_session = getattr(auth_ident, "session_id", None)
+
+        # Reject forged context arguments if provided
+        if tenant_id is not None and str(tenant_id).strip() != str(auth_tenant).strip():
+            return (
+                f"ACTION PROPOSAL BLOCKED: Forged tenant context detected. "
+                f"Tool argument tenant_id '{tenant_id}' does not match authenticated tenant '{auth_tenant}'."
+            )
+        if workspace_id is not None and str(workspace_id).strip() != str(auth_workspace).strip():
+            return (
+                f"ACTION PROPOSAL BLOCKED: Forged workspace context detected. "
+                f"Tool argument workspace_id '{workspace_id}' does not match authenticated workspace '{auth_workspace}'."
+            )
+        if session_id is not None:
+            if not auth_session:
+                return (
+                    f"ACTION PROPOSAL BLOCKED: Forged session context detected. "
+                    f"Tool argument session_id '{session_id}' cannot substitute for unauthenticated session."
+                )
+            if str(session_id).strip() != str(auth_session).strip():
+                return (
+                    f"ACTION PROPOSAL BLOCKED: Forged session context detected. "
+                    f"Tool argument session_id '{session_id}' does not match authenticated session '{auth_session}'."
+                )
+
         # 1. Parse and validate ActionType
         try:
             act_type_enum = ActionType(action_type.upper().strip())
@@ -91,12 +127,12 @@ def propose_action(
             valid_resources = [r.value for r in ResourceType]
             return f"Error: Invalid resource_type '{resource_type}'. Must be one of: {', '.join(valid_resources)}"
 
-        # 3. Build domain components
+        # 3. Build domain components using authoritative identity
         target = ActionTarget(
             resource_type=res_type_enum,
             resource_id=resource_id.strip(),
-            tenant_id=tenant_id,
-            workspace_id=workspace_id,
+            tenant_id=auth_tenant,
+            workspace_id=auth_workspace,
             plant_id=plant_id
         )
 
@@ -109,7 +145,7 @@ def propose_action(
         )
 
         provenance = ActionProvenance(
-            requested_by_user_id="agent_action_tool",
+            requested_by_user_id=auth_ident.user_id,
             source="AGENT",
             model_name="agent-evaluator-v3",
             reasoning_trace=reason
@@ -124,39 +160,20 @@ def propose_action(
         )
         requires_approval = system_risk in [RiskLevel.HIGH, RiskLevel.CRITICAL]
 
-        # 4a. Autonomy Evaluation Boundary (Prompt 38)
-        active_ident = get_active_autonomy_identity()
-        if active_ident:
-            effective_tenant = active_ident.tenant_id
-            effective_workspace = active_ident.workspace_id
-            effective_session = active_ident.session_id or session_id
-            auth_ident = active_ident
-        else:
-            effective_tenant = tenant_id
-            effective_workspace = workspace_id
-            effective_session = session_id
-            auth_ident = Identity(
-                user_id="agent_action_tool",
-                tenant_id=effective_tenant,
-                workspace_id=effective_workspace,
-                session_id=effective_session,
-                assigned_plants=["*"],
-                roles=["operator"]
-            )
-
+        # 4a. Autonomy Evaluation Boundary
         subj_type, subj_id = get_active_autonomy_subject()
 
         autonomy_scope = AutonomyScope(
-            tenant_id=effective_tenant,
-            workspace_id=effective_workspace,
-            session_id=auth_ident.session_id,
+            tenant_id=auth_tenant,
+            workspace_id=auth_workspace,
+            session_id=auth_session,
             plant_id=plant_id
         )
 
         autonomy_dec = autonomy_service.evaluate_autonomy(
             identity=auth_ident,
             subject_type=subj_type,
-            subject_id=subj_id if active_ident else "agent_action_tool",
+            subject_id=subj_id,
             requested_capability="PROPOSE_ACTION",
             resource_scope=autonomy_scope,
             data_mode="REAL",
@@ -164,7 +181,7 @@ def propose_action(
                 "action_type": act_type_enum.value,
                 "target_resource_id": target.resource_id if target else None,
                 "parameters": parameters,
-                "cost_estimate_usd": float(estimated_cost_usd),
+                "cost_estimate_usd": float(estimated_cost_usd) if estimated_cost_usd is not None else None,
                 "risk_level": system_risk.value,
                 "proposer_id": auth_ident.user_id,
             }
@@ -179,9 +196,9 @@ def propose_action(
             )
 
         action = Action(
-            tenant_id=effective_tenant,
-            workspace_id=effective_workspace,
-            session_id=effective_session,
+            tenant_id=auth_tenant,
+            workspace_id=auth_workspace,
+            session_id=auth_session,
             action_type=act_type_enum,
             version="1.0",
             target=target,
@@ -192,14 +209,13 @@ def propose_action(
             requires_approval=requires_approval,
             estimated_cost=cost,
             estimated_duration_minutes=estimated_duration_minutes,
+            requested_by=auth_ident.user_id,
             provenance=provenance,
             status=ActionStatus.PROPOSED
         )
 
-
-        # 5. Execute two-layer validation
-        identity = Identity(user_id="agent_action_tool", tenant_id=tenant_id, session_id=session_id)
-        is_valid, checks = action_validator.validate_all(action, identity)
+        # 5. Execute two-layer validation using authoritative identity
+        is_valid, checks = action_validator.validate_all(action, auth_ident)
         failed_checks = [c for c in checks if c.status == "FAIL"]
 
         if not is_valid:
