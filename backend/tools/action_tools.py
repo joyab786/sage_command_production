@@ -26,6 +26,9 @@ try:
     from services.action_store import action_store
     from services.policy_service import policy_service
     from data.schemas.policy_contract import PolicyEvaluationContext
+    from data.schemas.autonomy_contract import AutonomyScope, AutonomyDecisionEffect, SubjectType
+    from services.autonomy_service import autonomy_service
+    from tools.autonomy_context import get_active_autonomy_identity, get_active_autonomy_subject
 except ModuleNotFoundError:
     from backend.core.auth import Identity
     from backend.data.schemas.action_contract import (
@@ -44,6 +47,10 @@ except ModuleNotFoundError:
     from backend.services.action_store import action_store
     from backend.services.policy_service import policy_service
     from backend.data.schemas.policy_contract import PolicyEvaluationContext
+    from backend.data.schemas.autonomy_contract import AutonomyScope, AutonomyDecisionEffect, SubjectType
+    from backend.services.autonomy_service import autonomy_service
+    from backend.tools.autonomy_context import get_active_autonomy_identity, get_active_autonomy_subject
+
 
 
 @tool
@@ -117,10 +124,62 @@ def propose_action(
         )
         requires_approval = system_risk in [RiskLevel.HIGH, RiskLevel.CRITICAL]
 
+        # 4a. Autonomy Evaluation Boundary (Prompt 38)
+        active_ident = get_active_autonomy_identity()
+        if active_ident:
+            effective_tenant = active_ident.tenant_id
+            effective_workspace = active_ident.workspace_id
+            effective_session = active_ident.session_id
+            auth_ident = active_ident
+        else:
+            effective_tenant = tenant_id
+            effective_workspace = workspace_id
+            effective_session = session_id
+            auth_ident = Identity(
+                user_id="agent_action_tool",
+                tenant_id=effective_tenant,
+                workspace_id=effective_workspace,
+                session_id=effective_session,
+                assigned_plants=["*"],
+                roles=["operator"]
+            )
+
+        subj_type, subj_id = get_active_autonomy_subject()
+
+        autonomy_scope = AutonomyScope(
+            tenant_id=effective_tenant,
+            workspace_id=effective_workspace,
+            session_id=effective_session,
+            plant_id=plant_id
+        )
+
+        autonomy_dec = autonomy_service.evaluate_autonomy(
+            identity=auth_ident,
+            subject_type=subj_type,
+            subject_id=subj_id if active_ident else "agent_action_tool",
+            requested_capability="PROPOSE_ACTION",
+            resource_scope=autonomy_scope,
+            data_mode="REAL",
+            risk_context={
+                "action_type": act_type_enum.value,
+                "cost_estimate_usd": float(estimated_cost_usd),
+                "risk_level": system_risk.value,
+                "proposer_id": auth_ident.user_id,
+            }
+        )
+
+        if autonomy_dec.decision != AutonomyDecisionEffect.ALLOW:
+            return (
+                f"ACTION PROPOSAL BLOCKED BY AUTONOMY GOVERNANCE:\n"
+                f"Decision: {autonomy_dec.decision.value}\n"
+                f"Reason Code: {autonomy_dec.reason_code.value}\n"
+                f"Explanation: {autonomy_dec.reason}"
+            )
+
         action = Action(
-            tenant_id=tenant_id,
-            workspace_id=workspace_id,
-            session_id=session_id,
+            tenant_id=effective_tenant,
+            workspace_id=effective_workspace,
+            session_id=effective_session,
             action_type=act_type_enum,
             version="1.0",
             target=target,
@@ -134,6 +193,7 @@ def propose_action(
             provenance=provenance,
             status=ActionStatus.PROPOSED
         )
+
 
         # 5. Execute two-layer validation
         identity = Identity(user_id="agent_action_tool", tenant_id=tenant_id, session_id=session_id)

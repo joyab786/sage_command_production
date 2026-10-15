@@ -26,6 +26,8 @@ import OptimizationModal from "./components/OptimizationModal";
 import DecisionEngineModal from "./components/DecisionEngineModal";
 import EvidenceExplainabilityModal from "./components/EvidenceExplainabilityModal";
 import ConfidenceUncertaintyModal from "./components/ConfidenceUncertaintyModal";
+import AutonomyModal from "./components/AutonomyModal";
+
 
 export default function ObsidianCommandCenter() {
   // --- CORE STATE ---
@@ -95,6 +97,10 @@ export default function ObsidianCommandCenter() {
 
   // --- CONFIDENCE & UNCERTAINTY INTELLIGENCE FOUNDATION STATE ---
   const [showConfidenceModal, setShowConfidenceModal] = useState(false);
+
+  // --- AUTONOMY LEVELS & GUARDED DELEGATION STATE (Prompt 38) ---
+  const [showAutonomyModal, setShowAutonomyModal] = useState(false);
+
 
   // --- SECURITY INTRUSION ALERT STATE ---
   const [securityAlert, setSecurityAlert] = useState<{
@@ -425,6 +431,7 @@ export default function ObsidianCommandCenter() {
         onDecisionEngineClick={() => setShowDecisionEngineModal(true)}
         onExplainabilityClick={() => setShowEvidenceExplainabilityModal(true)}
         onConfidenceClick={() => setShowConfidenceModal(true)}
+        onAutonomyClick={() => setShowAutonomyModal(true)}
         onHardwareVisionClick={() => imageInputRef.current?.click()}
         onCoreScanClick={triggerScan}
         onRoleChange={setUserRole}
@@ -579,6 +586,11 @@ export default function ObsidianCommandCenter() {
       <ConfidenceUncertaintyModal
         isOpen={showConfidenceModal}
         onClose={() => setShowConfidenceModal(false)}
+      />
+
+      <AutonomyModal
+        isOpen={showAutonomyModal}
+        onClose={() => setShowAutonomyModal(false)}
       />
     </div>
   );

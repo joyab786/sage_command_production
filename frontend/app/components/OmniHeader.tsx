@@ -1,7 +1,8 @@
 "use client";
 import React from "react";
 import { motion } from "framer-motion";
-import { Activity, Terminal, Database, Search, FileText, Layers, Network, Box, ShieldAlert, Compass } from "lucide-react";
+import { Activity, Terminal, Database, Search, FileText, Layers, Network, Box, ShieldAlert, Compass, ShieldCheck } from "lucide-react";
+
 
 interface OmniHeaderProps {
   systemStatus: string;
@@ -31,6 +32,7 @@ interface OmniHeaderProps {
   onDecisionEngineClick?: () => void;
   onExplainabilityClick?: () => void;
   onConfidenceClick?: () => void;
+  onAutonomyClick?: () => void;
   onHardwareVisionClick: () => void;
   onCoreScanClick: () => void;
   onRoleChange: (role: "operator" | "manager") => void;
@@ -64,10 +66,12 @@ export default function OmniHeader({
   onDecisionEngineClick,
   onExplainabilityClick,
   onConfidenceClick,
+  onAutonomyClick,
   onHardwareVisionClick,
   onCoreScanClick,
   onRoleChange,
 }: OmniHeaderProps) {
+
   const isOnline = systemStatus === "ONLINE";
 
   return (
@@ -287,6 +291,17 @@ export default function OmniHeader({
           icon={<ShieldAlert className="w-3 h-3 text-indigo-300" />}
           label="Confidence"
         />
+
+        {/* Autonomy Levels & Guarded Delegation (Prompt 38) */}
+        <HeaderButton
+          onClick={onAutonomyClick || (() => {})}
+          active={false}
+          activeClass=""
+          className="border-cyan-500/30 bg-cyan-500/10 text-cyan-300 hover:bg-cyan-500/20"
+          icon={<ShieldCheck className="w-3 h-3 text-cyan-300" />}
+          label="Autonomy"
+        />
+
 
         {/* Hardware Vision */}
         <input

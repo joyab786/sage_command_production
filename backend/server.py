@@ -51,6 +51,7 @@ try:
     from api.organizational_memory_routes import router as organizational_memory_router
     from api.mission_routes import router as mission_router
     from api.verification_routes import router as verification_router, feedback_router
+    from api.autonomy_routes import router as autonomy_router
     from services.event_bus import get_event_bus
     from services.verification_trigger_coordinator import get_verification_trigger_coordinator
     from core.config import (
@@ -58,6 +59,7 @@ try:
         SAGE_VERIFICATION_EVENT_TRIGGER_ENABLED,
         SAGE_CLOSED_LOOP_SUBSCRIPTION_SCOPES,
     )
+
 except (ImportError, ModuleNotFoundError):
     from backend.core.config import SAGE_ALLOWED_ORIGINS, IS_PRODUCTION
     from backend.governance.middleware import (
@@ -100,6 +102,7 @@ except (ImportError, ModuleNotFoundError):
     from backend.api.organizational_memory_routes import router as organizational_memory_router
     from backend.api.mission_routes import router as mission_router
     from backend.api.verification_routes import router as verification_router, feedback_router
+    from backend.api.autonomy_routes import router as autonomy_router
     from backend.services.event_bus import get_event_bus
     from backend.services.verification_trigger_coordinator import get_verification_trigger_coordinator
     from backend.core.config import (
@@ -107,6 +110,7 @@ except (ImportError, ModuleNotFoundError):
         SAGE_VERIFICATION_EVENT_TRIGGER_ENABLED,
         SAGE_CLOSED_LOOP_SUBSCRIPTION_SCOPES,
     )
+
 
 app = FastAPI(title="SageCommand V3 Industrial Operations AI OS")
 
@@ -222,6 +226,8 @@ app.include_router(organizational_memory_router)
 app.include_router(mission_router)
 app.include_router(verification_router)
 app.include_router(feedback_router)
+app.include_router(autonomy_router)
+
 
 # BOOT SEQUENCE
 if __name__ == "__main__":
