@@ -364,3 +364,90 @@ A comprehensive repository search was conducted across the codebase:
 - Autonomy Levels 4 and 5 remain `DISABLED` and `NOT_IMPLEMENTED`.
 - SageCommand V3 does not contain operational execution endpoints, background execution daemons, or autonomous write pathways. All proposals require human-in-the-loop review and approval.
 
+---
+
+## 24. Prompt 38D Security Corrections (Action-Tool Identity, Scope, and Inspection Hardening)
+
+This section documents the specific security gap closures implemented under Prompt 38D:
+
+### 1. Securing `preview_action_impact()`
+- **Trusted Identity Context Required:** `preview_action_impact()` strictly requires an active, server-authoritative `Identity` retrieved via `get_active_autonomy_identity()`. If missing, the tool immediately aborts with: `"ACTION PREVIEW BLOCKED: Authenticated autonomy context is required. No active trusted identity found in server execution context."`
+- **Identity-Derived Isolation:** Tenant and workspace are derived exclusively from the trusted identity (`auth_tenant`, `auth_workspace`). Caller-supplied context arguments (`tenant_id`, `workspace_id`, `session_id`) are checked for tampering and rejected if they contradict authenticated identity.
+- **Missing Workspace Rejection:** If the authenticated identity lacks a workspace, access is rejected before inspecting actions: `"ACTION PREVIEW BLOCKED: Authenticated identity lacks required workspace scope."`
+- **Safe, Non-Disclosing Cross-Tenant Rejection:** Action lookup is scoped strictly to the authenticated tenant: `action_store.get_by_id(action_id, auth_tenant)`. Inaccessible or nonexistent actions return a uniform, non-disclosing error: `ACTION PREVIEW BLOCKED: Action '{action_id}' not found.`
+- **Hierarchical Scope Enforcement:**
+  - Workspace mismatch between action and caller returns `ACTION PREVIEW BLOCKED: Workspace scope mismatch`.
+  - Session-bound actions strictly require a matching authenticated caller session (`SESSION_MISMATCH` rejection for unsessioned or mismatched callers).
+  - Target plant authorization is strictly checked against the authenticated identity's `assigned_plants`.
+- **Pure Simulation Preview:** `action_validator.generate_simulation()` is invoked only after all scope checks succeed. No live database writes or physical device mutations occur.
+
+### 2. Securing `check_action_policy()`
+- **Elimination of Hard-Coded Synthetic Identity:** Completely removed `user_id="agent_action_tool"` and hard-coded `roles=["operator"]` from `PolicyEvaluationContext`.
+- **Authoritative Policy Context Construction:**
+  - Requires active trusted autonomy identity.
+  - Derives `tenant_id`, `workspace_id`, `session_id`, `user_id`, and `roles` directly from the authenticated identity.
+  - Enforces tenant isolation, workspace containment, session matching, and plant scope before evaluating policy.
+  - Populates `PolicyEvaluationContext` with:
+    - `user_id = auth_ident.user_id`
+    - `roles = list(auth_ident.roles)`
+    - `permissions = list(auth_ident.permissions)`
+    - `tenant_id = auth_tenant`
+    - `workspace_id = action.workspace_id`
+    - `plant_id = action.target.plant_id`
+    - `session_id = action.session_id or (auth_session or "session_default")`
+    - `data_mode = action.data_mode`
+- **Separation of Policy and Execution:** Policy evaluation remains strictly advisory/governance-oriented, executing `policy_service.evaluate()` with decision persistence enabled and zero physical side effects.
+
+### 3. Removal of Synthetic Scope Defaults in `propose_action()`
+- **Removal of `"workspace_default"` Fallback:** The previous fallback `getattr(auth_ident, "workspace_id", None) or "workspace_default"` has been eliminated. If the trusted identity lacks a valid workspace identifier, the proposal fails closed immediately: `"ACTION PROPOSAL BLOCKED: Authenticated identity lacks required workspace scope."`
+- **Anti-Forgery Retention:** Continues to reject caller-supplied `tenant_id`, `workspace_id`, or `session_id` arguments that contradict authenticated identity.
+
+### 4. Authoritative Target Plant Scope Binding
+- **Fail-Closed Plant Authorization:** Defined `is_plant_authorized(identity, plant_id)` to validate the requested target plant against the caller's authoritative `assigned_plants`:
+  - Wildcard plant argument (`plant_id="*"`) supplied by an LLM or tool caller is strictly rejected.
+  - Missing, empty, or None `plant_id` fails closed immediately.
+  - Caller identity with empty or missing `assigned_plants` fails closed.
+  - Caller identity with explicit wildcard `"*"` in `assigned_plants` (e.g. system administrator or multi-plant director) is permitted for any concrete plant.
+  - Otherwise, the requested plant must explicitly exist in `identity.assigned_plants`.
+- **Pre-Autonomy Evaluation Rejection:** Unauthorized plant requests are rejected BEFORE invoking `autonomy_service.evaluate_autonomy()`.
+- **Single Authoritative Plant Scope:** Validated target plant is bound identically across `ActionTarget.plant_id`, `AutonomyScope.plant_id`, `Action.target.plant_id`, and validation context.
+
+### 5. Repository-Wide Code Search Audit Findings
+- **`user_id="agent_action_tool"`:** 0 occurrences in executable code (fully eliminated; previously present at `backend/tools/action_tools.py:295`).
+- **`roles=["operator"]`:** 0 occurrences in tool code (fully eliminated from `backend/tools/action_tools.py:297`).
+- **`workspace_default`:** Eliminated as a fallback in `propose_action()`, `preview_action_impact()`, and `check_action_policy()`.
+- **`get_by_id(action_id, tenant_id)`:** In `action_tools.py`, `tenant_id` is passed strictly as `auth_tenant` derived from trusted runtime identity.
+- **`get_active_autonomy_identity()`:** Consistently enforced across `propose_action()`, `preview_action_impact()`, and `check_action_policy()`.
+- **`PolicyEvaluationContext(`:** Now receives real caller identity, real roles, and authoritative action metadata.
+
+### 6. Regression Test Verification
+- **Dedicated Suite:** Added `TestV3ActionToolIdentityAndScopePrompt38D` to `backend/test_v3_autonomy.py` covering:
+  - Preview rejection without trusted identity
+  - Preview cross-tenant boundary containment and non-disclosure
+  - Preview cross-workspace boundary rejection
+  - Preview session-bound caller matching and rejection
+  - Preview unbound session accessibility
+  - Preview unauthorized plant rejection
+  - Policy check rejection without trusted identity
+  - Policy check anti-forgery on tenant, workspace, and session
+  - Policy check cross-tenant, cross-workspace, and cross-session isolation
+  - Policy check plant scope authorization
+  - Policy evaluation context real user ID and roles binding
+  - Missing workspace fail-closed behavior across all action tools
+  - Unauthorized plant rejection before autonomy evaluation
+  - Missing plant authorization fail-closed behavior
+  - Valid authorized plant success and scope consistency
+  - Administrator wildcard plant authorization for concrete plants
+  - Verification that no inspection tool uses hard-coded synthetic identities
+  - Preserved Prompt 38A, 38B, and 38C foundational invariants
+- **Test Executions:**
+  1. `backend/test_v3_autonomy.py`: 99 passed, 0 failed.
+  2. `backend/test_v3_action_api.py backend/test_v3_authorization.py backend/test_v3_mission_architecture.py backend/test_v3_security.py`: 122 passed, 0 failed.
+  3. `backend/test_v3_policy_engine.py`: 17 passed, 0 failed.
+  Total: 238 automated tests passing across the test suite.
+
+### 7. Non-Operational Execution Boundary Confirmation
+- Autonomy Levels 4 and 5 remain `DISABLED` and `NOT_IMPLEMENTED`.
+- Action proposal, simulation preview, and policy checking remain strictly non-operational with zero operational writes or physical execution pathways.
+
+

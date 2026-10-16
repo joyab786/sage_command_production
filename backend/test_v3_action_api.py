@@ -22,7 +22,7 @@ from core.auth import Identity
 from services.action_registry import action_registry
 from services.action_validator import action_validator
 from services.action_store import action_store
-from tools.action_tools import propose_action, preview_action_impact, list_supported_actions
+from tools.action_tools import propose_action, preview_action_impact, list_supported_actions, check_action_policy
 from data.schemas.action_contract import (
     ActionType,
     ResourceType,
@@ -478,6 +478,7 @@ class TestV3ActionAPI(unittest.TestCase):
                 "action_type": "REORDER_INVENTORY",
                 "resource_type": "SKU",
                 "resource_id": "SKU-TOOL-01",
+                "plant_id": "plant_001",
                 "parameters": {"sku_id": "SKU-TOOL-01", "quantity": 75, "priority": "EXPEDITE"},
                 "reason": "Agent autonomous restock decision",
                 "estimated_cost_usd": 1800.0,
@@ -499,6 +500,11 @@ class TestV3ActionAPI(unittest.TestCase):
             preview_out = preview_action_impact.invoke({"action_id": act_id})
             self.assertIn(f"SIMULATION PREVIEW for {act_id}", preview_out)
             self.assertIn("pending_inbound_quantity", preview_out)
+
+            # 4. check_action_policy
+            policy_out = check_action_policy.invoke({"action_id": act_id})
+            self.assertIn(f"POLICY EVALUATION RESULT for {act_id}", policy_out)
+            self.assertIn("Decision:", policy_out)
 
 
 if __name__ == "__main__":

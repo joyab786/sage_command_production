@@ -52,7 +52,8 @@ from tools.autonomy_context import (
     get_active_autonomy_subject,
     get_active_autonomy_identity,
 )
-from tools.action_tools import propose_action
+from tools.action_tools import propose_action, preview_action_impact, check_action_policy
+from services.policy_service import policy_service
 from data.schemas.action_contract import (
     Action,
     ActionType,
@@ -2986,6 +2987,616 @@ class TestV3AutonomyPrompt38CCorrections(unittest.TestCase):
             self.assertEqual(stored.requested_by, "user_auth_proposer")
 
 
+# =============================================================================
+# 11. Prompt 38D Action Tool Identity & Scope Hardening Test Suite
+# =============================================================================
+
+class TestV3ActionToolIdentityAndScopePrompt38D(unittest.TestCase):
+    """
+    Dedicated security regression test suite for Prompt 38D.
+    Validates:
+    - preview without trusted identity is rejected;
+    - preview cannot cross tenant boundaries;
+    - preview cannot cross workspace boundaries;
+    - preview cannot cross session boundaries for session-bound actions;
+    - policy checking without trusted identity is rejected;
+    - policy checking cannot use a forged tenant;
+    - policy checking cannot use a forged workspace or session;
+    - policy context uses the real authenticated user and roles;
+    - missing workspace does not silently become workspace_default;
+    - unauthorized plant is rejected before autonomy evaluation;
+    - valid authorized plant continues to work;
+    - no action inspection tool can use a hard-coded synthetic operator identity;
+    - no regression in Prompt 38A, 38B, or 38C protections.
+    """
+
+    def setUp(self):
+        self.repo = autonomy_repository
+        self.service = autonomy_service
+        action_store.clear()
+
+    def tearDown(self):
+        action_store.clear()
+
+    def _create_identity(
+        self,
+        user_id="user_test_38d",
+        tenant_id="tenant_alpha",
+        workspace_id="workspace_alpha",
+        session_id="session_alpha",
+        roles=None,
+        plants=None,
+        clearance=2,
+    ):
+        return Identity(
+            user_id=user_id,
+            tenant_id=tenant_id,
+            workspace_id=workspace_id,
+            session_id=session_id,
+            roles=roles or ["operator", "manager"],
+            assigned_plants=plants if plants is not None else ["plant_01"],
+            clearance_level=clearance,
+        )
+
+    def _create_grant(
+        self,
+        subject_id,
+        level=AutonomyLevel.RECOMMEND,
+        caps=None,
+        max_cost=None,
+        tenant_id="tenant_alpha",
+        workspace_id="workspace_alpha",
+        plant_id="plant_01",
+        session_id=None,
+    ):
+        constraints = AutonomyConstraints(max_cost_limit_usd=max_cost) if max_cost is not None else AutonomyConstraints()
+        grant = AutonomyGrant(
+            grant_id=f"grant_{uuid.uuid4().hex[:8]}",
+            subject_type=SubjectType.AGENT,
+            subject_id=subject_id,
+            autonomy_level=level,
+            tenant_id=tenant_id,
+            workspace_id=workspace_id,
+            plant_id=plant_id,
+            session_id=session_id,
+            data_mode="REAL",
+            permitted_capabilities=caps or ["PROPOSE_ACTION"],
+            constraints=constraints,
+            created_by="admin_38d",
+        )
+        self.repo.save_grant(grant)
+        return grant
+
+    def _create_stored_action(
+        self,
+        action_id,
+        tenant_id="tenant_alpha",
+        workspace_id="workspace_alpha",
+        session_id="session_alpha",
+        plant_id="plant_01",
+        cost=150.0,
+        risk_level=RiskLevel.LOW,
+    ):
+        target = ActionTarget(
+            resource_type=ResourceType.SKU,
+            resource_id="SKU-38D-01",
+            tenant_id=tenant_id,
+            workspace_id=workspace_id,
+            plant_id=plant_id,
+        )
+        reason = ActionReason(
+            reason_code="OPERATIONAL_RECOVERY",
+            summary="Prompt 38D stored action",
+            justification="Identity and scope validation test",
+        )
+        cost_est = CostEstimate(value=cost, currency="USD") if cost is not None else None
+        action = Action(
+            action_id=action_id,
+            tenant_id=tenant_id,
+            workspace_id=workspace_id,
+            session_id=session_id,
+            action_type=ActionType.REORDER_INVENTORY,
+            version="1.0",
+            target=target,
+            parameters={"sku_id": "SKU-38D-01", "quantity": 25},
+            reason=reason,
+            system_risk_level=risk_level,
+            requires_approval=(risk_level in [RiskLevel.HIGH, RiskLevel.CRITICAL]),
+            estimated_cost=cost_est,
+            estimated_duration_minutes=20,
+            status=ActionStatus.PROPOSED,
+        )
+        action_store.save(action)
+        return action
+
+    # -------------------------------------------------------------------------
+    # 1. preview_action_impact Security Tests
+    # -------------------------------------------------------------------------
+
+    def test_preview_without_trusted_identity_is_rejected(self):
+        """preview_action_impact fails closed when no active autonomy identity context is present."""
+        act_id = f"act_no_ident_{uuid.uuid4().hex[:6]}"
+        self._create_stored_action(act_id)
+
+        res = preview_action_impact.invoke({"action_id": act_id})
+        self.assertIn("ACTION PREVIEW BLOCKED: Authenticated autonomy context is required", res)
+        self.assertNotIn("SIMULATION PREVIEW", res)
+        self.assertNotIn("Expected Effects", res)
+
+    def test_preview_cannot_cross_tenant_boundaries(self):
+        """preview_action_impact cannot inspect actions across tenants and returns a safe non-disclosing error."""
+        act_id = f"act_tenant_iso_{uuid.uuid4().hex[:6]}"
+        self._create_stored_action(act_id, tenant_id="tenant_secret_target")
+
+        # Caller belongs to tenant_alpha
+        subject_id = f"agent_prev_tenant_{uuid.uuid4().hex[:6]}"
+        identity = self._create_identity(tenant_id="tenant_alpha")
+
+        with active_autonomy_context(subject_id=subject_id, identity=identity):
+            # 1. Direct retrieval attempt across tenant boundary yields safe non-disclosing error
+            res = preview_action_impact.invoke({"action_id": act_id})
+            self.assertIn("ACTION PREVIEW BLOCKED: Action", res)
+            self.assertIn("not found", res)
+            self.assertNotIn("SIMULATION PREVIEW", res)
+            self.assertNotIn("Expected Effects", res)
+
+            # 2. Tampering via tool argument tenant_id to access target tenant is caught as forgery
+            res_forged = preview_action_impact.invoke({
+                "action_id": act_id,
+                "tenant_id": "tenant_secret_target",
+            })
+            self.assertIn("ACTION PREVIEW BLOCKED: Forged tenant context detected", res_forged)
+            self.assertNotIn("SIMULATION PREVIEW", res_forged)
+
+    def test_preview_cannot_cross_workspace_boundaries(self):
+        """preview_action_impact rejects access when caller workspace does not match action workspace."""
+        act_id = f"act_ws_iso_{uuid.uuid4().hex[:6]}"
+        self._create_stored_action(act_id, workspace_id="ws_finance")
+
+        # Caller belongs to ws_operations
+        subject_id = f"agent_prev_ws_{uuid.uuid4().hex[:6]}"
+        identity = self._create_identity(workspace_id="ws_operations")
+
+        with active_autonomy_context(subject_id=subject_id, identity=identity):
+            # 1. Cross-workspace access rejected
+            res = preview_action_impact.invoke({"action_id": act_id})
+            self.assertIn("ACTION PREVIEW BLOCKED: Workspace scope mismatch", res)
+            self.assertNotIn("SIMULATION PREVIEW", res)
+
+            # 2. Tampering via tool argument workspace_id is caught as forgery
+            res_forged = preview_action_impact.invoke({
+                "action_id": act_id,
+                "workspace_id": "ws_finance",
+            })
+            self.assertIn("ACTION PREVIEW BLOCKED: Forged workspace context detected", res_forged)
+            self.assertNotIn("SIMULATION PREVIEW", res_forged)
+
+    def test_preview_cannot_cross_session_boundaries_for_session_bound_actions(self):
+        """preview_action_impact requires caller session to match for session-bound actions."""
+        act_id = f"act_sess_iso_{uuid.uuid4().hex[:6]}"
+        self._create_stored_action(act_id, session_id="session_alpha_bound")
+
+        subject_id = f"agent_prev_sess_{uuid.uuid4().hex[:6]}"
+
+        # Case A: Unsessioned caller rejected
+        unsessioned_id = self._create_identity(session_id=None)
+        with active_autonomy_context(subject_id=subject_id, identity=unsessioned_id):
+            res_unsess = preview_action_impact.invoke({"action_id": act_id})
+            self.assertIn("ACTION PREVIEW BLOCKED: Session mismatch", res_unsess)
+            self.assertIn("has no active session", res_unsess)
+            self.assertNotIn("SIMULATION PREVIEW", res_unsess)
+
+            # Tool argument session_id cannot substitute
+            res_sub = preview_action_impact.invoke({
+                "action_id": act_id,
+                "session_id": "session_alpha_bound",
+            })
+            self.assertIn("ACTION PREVIEW BLOCKED: Forged session context detected", res_sub)
+
+        # Case B: Caller from different session rejected
+        diff_session_id = self._create_identity(session_id="session_other")
+        with active_autonomy_context(subject_id=subject_id, identity=diff_session_id):
+            res_diff = preview_action_impact.invoke({"action_id": act_id})
+            self.assertIn("ACTION PREVIEW BLOCKED: Session mismatch", res_diff)
+            self.assertNotIn("SIMULATION PREVIEW", res_diff)
+
+        # Case C: Caller with matching session permitted
+        match_session_id = self._create_identity(session_id="session_alpha_bound")
+        with active_autonomy_context(subject_id=subject_id, identity=match_session_id):
+            res_ok = preview_action_impact.invoke({"action_id": act_id})
+            self.assertIn("SIMULATION PREVIEW", res_ok)
+            self.assertIn("pending_inbound_quantity", res_ok)
+
+    def test_preview_unbound_session_action_accessible(self):
+        """preview_action_impact allows access to unsessioned actions within matching tenant, workspace, and plant."""
+        act_id = f"act_unbound_{uuid.uuid4().hex[:6]}"
+        self._create_stored_action(act_id, session_id=None)
+
+        subject_id = f"agent_prev_unbound_{uuid.uuid4().hex[:6]}"
+        identity = self._create_identity(session_id="session_any")
+
+        with active_autonomy_context(subject_id=subject_id, identity=identity):
+            res = preview_action_impact.invoke({"action_id": act_id})
+            self.assertIn("SIMULATION PREVIEW", res)
+
+    def test_preview_unauthorized_plant_is_rejected(self):
+        """preview_action_impact rejects access if caller is not authorized for target plant."""
+        act_id = f"act_plant_iso_{uuid.uuid4().hex[:6]}"
+        self._create_stored_action(act_id, plant_id="plant_restricted_99")
+
+        subject_id = f"agent_prev_plant_{uuid.uuid4().hex[:6]}"
+        identity = self._create_identity(plants=["plant_01"])
+
+        with active_autonomy_context(subject_id=subject_id, identity=identity):
+            res = preview_action_impact.invoke({"action_id": act_id})
+            self.assertIn("ACTION PREVIEW BLOCKED: Plant scope denied", res)
+            self.assertIn("plant_restricted_99", res)
+            self.assertNotIn("SIMULATION PREVIEW", res)
+
+    # -------------------------------------------------------------------------
+    # 2. check_action_policy Security Tests
+    # -------------------------------------------------------------------------
+
+    def test_policy_check_without_trusted_identity_is_rejected(self):
+        """check_action_policy fails closed when no active autonomy identity context is present."""
+        act_id = f"act_pol_no_id_{uuid.uuid4().hex[:6]}"
+        self._create_stored_action(act_id)
+
+        res = check_action_policy.invoke({"action_id": act_id})
+        self.assertIn("ACTION POLICY CHECK BLOCKED: Authenticated autonomy context is required", res)
+        self.assertNotIn("POLICY EVALUATION RESULT", res)
+
+    def test_policy_check_cannot_use_forged_tenant(self):
+        """check_action_policy rejects forged caller tenant arguments."""
+        act_id = f"act_pol_forged_t_{uuid.uuid4().hex[:6]}"
+        self._create_stored_action(act_id, tenant_id="tenant_alpha")
+
+        subject_id = f"agent_pol_tenant_{uuid.uuid4().hex[:6]}"
+        identity = self._create_identity(tenant_id="tenant_alpha")
+
+        with active_autonomy_context(subject_id=subject_id, identity=identity):
+            res = check_action_policy.invoke({
+                "action_id": act_id,
+                "tenant_id": "tenant_intruder",
+            })
+            self.assertIn("ACTION POLICY CHECK BLOCKED: Forged tenant context detected", res)
+
+    def test_policy_check_cannot_cross_tenant_boundaries(self):
+        """check_action_policy returns safe non-disclosing error when attempting to inspect another tenant's action."""
+        act_id = f"act_pol_cross_t_{uuid.uuid4().hex[:6]}"
+        self._create_stored_action(act_id, tenant_id="tenant_target_isolated")
+
+        subject_id = f"agent_pol_cross_{uuid.uuid4().hex[:6]}"
+        identity = self._create_identity(tenant_id="tenant_caller_1")
+
+        with active_autonomy_context(subject_id=subject_id, identity=identity):
+            res = check_action_policy.invoke({"action_id": act_id})
+            self.assertIn("ACTION POLICY CHECK BLOCKED: Action", res)
+            self.assertIn("not found", res)
+            self.assertNotIn("POLICY EVALUATION RESULT", res)
+
+    def test_policy_check_cannot_use_forged_workspace_or_session(self):
+        """check_action_policy rejects forged workspace and session arguments."""
+        act_id = f"act_pol_forged_ws_{uuid.uuid4().hex[:6]}"
+        self._create_stored_action(act_id)
+
+        subject_id = f"agent_pol_forged_ws_{uuid.uuid4().hex[:6]}"
+        identity = self._create_identity(workspace_id="ws_real", session_id="session_real")
+
+        with active_autonomy_context(subject_id=subject_id, identity=identity):
+            # Forged workspace
+            res_ws = check_action_policy.invoke({
+                "action_id": act_id,
+                "workspace_id": "ws_forged",
+            })
+            self.assertIn("ACTION POLICY CHECK BLOCKED: Forged workspace context detected", res_ws)
+
+            # Forged session
+            res_sess = check_action_policy.invoke({
+                "action_id": act_id,
+                "session_id": "session_forged",
+            })
+            self.assertIn("ACTION POLICY CHECK BLOCKED: Forged session context detected", res_sess)
+
+    def test_policy_check_cannot_cross_workspace_or_session_boundaries(self):
+        """check_action_policy rejects access across workspaces and sessions."""
+        act_id = f"act_pol_scope_iso_{uuid.uuid4().hex[:6]}"
+        self._create_stored_action(act_id, workspace_id="ws_team_a", session_id="session_team_a")
+
+        subject_id = f"agent_pol_scope_{uuid.uuid4().hex[:6]}"
+
+        # Mismatched workspace
+        identity_ws = self._create_identity(workspace_id="ws_team_b", session_id="session_team_a")
+        with active_autonomy_context(subject_id=subject_id, identity=identity_ws):
+            res_ws = check_action_policy.invoke({"action_id": act_id})
+            self.assertIn("ACTION POLICY CHECK BLOCKED: Workspace scope mismatch", res_ws)
+
+        # Mismatched session
+        identity_sess = self._create_identity(workspace_id="ws_team_a", session_id="session_team_b")
+        with active_autonomy_context(subject_id=subject_id, identity=identity_sess):
+            res_sess = check_action_policy.invoke({"action_id": act_id})
+            self.assertIn("ACTION POLICY CHECK BLOCKED: Session mismatch", res_sess)
+
+    def test_policy_check_unauthorized_plant_is_rejected(self):
+        """check_action_policy rejects evaluation if caller lacks target plant authorization."""
+        act_id = f"act_pol_plant_denied_{uuid.uuid4().hex[:6]}"
+        self._create_stored_action(act_id, plant_id="plant_99")
+
+        subject_id = f"agent_pol_plant_{uuid.uuid4().hex[:6]}"
+        identity = self._create_identity(plants=["plant_01"])
+
+        with active_autonomy_context(subject_id=subject_id, identity=identity):
+            res = check_action_policy.invoke({"action_id": act_id})
+            self.assertIn("ACTION POLICY CHECK BLOCKED: Plant scope denied", res)
+            self.assertIn("plant_99", res)
+
+    def test_policy_context_uses_real_authenticated_user_and_roles(self):
+        """check_action_policy builds PolicyEvaluationContext from real authenticated user and roles, never hard-coded synthetic operator."""
+        act_id = f"act_pol_real_id_{uuid.uuid4().hex[:6]}"
+        self._create_stored_action(act_id, plant_id="plant_01")
+
+        subject_id = f"agent_pol_real_{uuid.uuid4().hex[:6]}"
+        real_user_id = "user_safety_lead_99"
+        real_roles = ["safety_director", "compliance_lead"]
+        identity = self._create_identity(
+            user_id=real_user_id,
+            roles=real_roles,
+            plants=["plant_01"]
+        )
+
+        captured_contexts = []
+        original_evaluate = policy_service.evaluate
+
+        def capturing_evaluate(action, context, persist_decision=True):
+            captured_contexts.append(context)
+            return original_evaluate(action=action, context=context, persist_decision=persist_decision)
+
+        with patch.object(policy_service, "evaluate", side_effect=capturing_evaluate):
+            with active_autonomy_context(subject_id=subject_id, identity=identity):
+                res = check_action_policy.invoke({"action_id": act_id})
+                self.assertIn("POLICY EVALUATION RESULT", res)
+
+        self.assertEqual(len(captured_contexts), 1)
+        ctx = captured_contexts[0]
+
+        # Verify context is derived exclusively from authenticated identity
+        self.assertEqual(ctx.user_id, real_user_id)
+        self.assertNotEqual(ctx.user_id, "agent_action_tool")
+        self.assertEqual(ctx.roles, real_roles)
+        self.assertNotEqual(ctx.roles, ["operator"])
+        self.assertEqual(ctx.tenant_id, identity.tenant_id)
+        self.assertEqual(ctx.workspace_id, identity.workspace_id)
+        self.assertEqual(ctx.plant_id, "plant_01")
+
+    # -------------------------------------------------------------------------
+    # 3. propose_action Scope & Plant Authorization Tests
+    # -------------------------------------------------------------------------
+
+    def test_missing_workspace_does_not_silently_become_workspace_default(self):
+        """propose_action, preview_action_impact, and check_action_policy fail closed when identity lacks workspace scope."""
+        subject_id = f"agent_no_ws_{uuid.uuid4().hex[:6]}"
+        grant = self._create_grant(subject_id=subject_id)
+
+        # Identity with workspace_id=None
+        identity = self._create_identity()
+        identity.workspace_id = None
+
+        with active_autonomy_context(subject_id=subject_id, identity=identity):
+            # 1. propose_action fails closed
+            res_prop = propose_action.invoke({
+                "action_type": "REORDER_INVENTORY",
+                "resource_type": "SKU",
+                "resource_id": "SKU-WS-FAIL",
+                "plant_id": "plant_01",
+                "parameters": {"sku_id": "SKU-WS-FAIL", "quantity": 10},
+                "reason": "Missing workspace test",
+            })
+            self.assertIn("ACTION PROPOSAL BLOCKED: Authenticated identity lacks required workspace scope", res_prop)
+
+            # Verify no action with workspace_default was stored
+            self.assertIsNone(action_store.get_by_scope("SKU-WS-FAIL", identity.tenant_id, "workspace_default"))
+
+            # 2. preview_action_impact fails closed
+            res_prev = preview_action_impact.invoke({"action_id": "any_act"})
+            self.assertIn("ACTION PREVIEW BLOCKED:", res_prev)
+
+            # 3. check_action_policy fails closed
+            res_pol = check_action_policy.invoke({"action_id": "any_act"})
+            self.assertIn("ACTION POLICY CHECK BLOCKED:", res_pol)
+
+    def test_unauthorized_plant_rejected_before_autonomy_evaluation(self):
+        """propose_action rejects unauthorized plant scope BEFORE invoking autonomy evaluation."""
+        subject_id = f"agent_unauth_plant_{uuid.uuid4().hex[:6]}"
+        self._create_grant(subject_id=subject_id, plant_id="plant_01")
+        identity = self._create_identity(plants=["plant_01"])
+
+        with patch.object(self.service, "evaluate_autonomy", wraps=self.service.evaluate_autonomy) as mock_eval:
+            with active_autonomy_context(subject_id=subject_id, identity=identity):
+                res = propose_action.invoke({
+                    "action_type": "REORDER_INVENTORY",
+                    "resource_type": "SKU",
+                    "resource_id": "SKU-PLANT-FAIL",
+                    "plant_id": "plant_99",  # Unauthorized!
+                    "parameters": {"sku_id": "SKU-PLANT-FAIL", "quantity": 10},
+                    "reason": "Unauthorized plant test",
+                })
+                self.assertIn("ACTION PROPOSAL BLOCKED: Unauthorized plant scope", res)
+                self.assertIn("plant_99", res)
+                # Autonomy evaluation must NOT have been called
+                mock_eval.assert_not_called()
+
+    def test_missing_plant_authorization_fails_closed(self):
+        """propose_action strictly fails closed for missing or wildcard plant assignments."""
+        subject_id = f"agent_missing_plant_{uuid.uuid4().hex[:6]}"
+        self._create_grant(subject_id=subject_id)
+
+        # Case A: Identity has explicitly empty assigned_plants=[]
+        empty_plants_id = self._create_identity(plants=[])
+        with active_autonomy_context(subject_id=subject_id, identity=empty_plants_id):
+            res_a = propose_action.invoke({
+                "action_type": "REORDER_INVENTORY",
+                "resource_type": "SKU",
+                "resource_id": "SKU-EMPTY-P",
+                "plant_id": "plant_01",
+                "parameters": {"sku_id": "SKU-EMPTY-P", "quantity": 10},
+                "reason": "Empty plants test",
+            })
+            self.assertIn("ACTION PROPOSAL BLOCKED: Unauthorized plant scope", res_a)
+
+        # Case B: Identity has assigned_plants=None
+        none_plants_id = self._create_identity()
+        none_plants_id.assigned_plants = None
+        with active_autonomy_context(subject_id=subject_id, identity=none_plants_id):
+            res_b = propose_action.invoke({
+                "action_type": "REORDER_INVENTORY",
+                "resource_type": "SKU",
+                "resource_id": "SKU-NONE-P",
+                "plant_id": "plant_01",
+                "parameters": {"sku_id": "SKU-NONE-P", "quantity": 10},
+                "reason": "None plants test",
+            })
+            self.assertIn("ACTION PROPOSAL BLOCKED: Unauthorized plant scope", res_b)
+
+        # Case C: Tool caller supplies plant_id=None or omits plant
+        valid_id = self._create_identity(plants=["plant_01"])
+        with active_autonomy_context(subject_id=subject_id, identity=valid_id):
+            res_c = propose_action.invoke({
+                "action_type": "REORDER_INVENTORY",
+                "resource_type": "SKU",
+                "resource_id": "SKU-MISSING-ARG",
+                "plant_id": None,
+                "parameters": {"sku_id": "SKU-MISSING-ARG", "quantity": 10},
+                "reason": "Missing plant argument test",
+            })
+            self.assertIn("ACTION PROPOSAL BLOCKED: Missing target plant scope", res_c)
+
+        # Case D: Tool caller supplies plant_id="*" (wildcard tool argument is never authorization)
+        with active_autonomy_context(subject_id=subject_id, identity=valid_id):
+            res_d = propose_action.invoke({
+                "action_type": "REORDER_INVENTORY",
+                "resource_type": "SKU",
+                "resource_id": "SKU-WILD-ARG",
+                "plant_id": "*",
+                "parameters": {"sku_id": "SKU-WILD-ARG", "quantity": 10},
+                "reason": "Wildcard plant argument test",
+            })
+            self.assertIn("ACTION PROPOSAL BLOCKED: Wildcard plant identifier is not permitted", res_d)
+
+    def test_valid_authorized_plant_continues_to_work(self):
+        """propose_action succeeds and persists identical validated plant scope across target, autonomy, and action."""
+        subject_id = f"agent_valid_plant_{uuid.uuid4().hex[:6]}"
+        grant = self._create_grant(
+            subject_id=subject_id,
+            tenant_id="tenant_p38d",
+            workspace_id="ws_p38d",
+            plant_id="plant_valid_01",
+        )
+        identity = self._create_identity(
+            user_id="user_plant_mgr",
+            tenant_id="tenant_p38d",
+            workspace_id="ws_p38d",
+            session_id="session_p38d",
+            roles=["operator", "manager"],
+            plants=["plant_valid_01"],
+        )
+
+        with active_autonomy_context(subject_id=subject_id, identity=identity):
+            res = propose_action.invoke({
+                "action_type": "REORDER_INVENTORY",
+                "resource_type": "SKU",
+                "resource_id": "SKU-PLANT-OK",
+                "plant_id": "plant_valid_01",
+                "parameters": {"sku_id": "SKU-PLANT-OK", "quantity": 40},
+                "estimated_cost_usd": 400.0,
+                "estimated_duration_minutes": 25,
+                "reason": "Authorized plant replenishment",
+            })
+            self.assertIn("ACTION PROPOSED SUCCESSFULLY", res)
+
+            # Extract Action ID
+            act_id = None
+            for line in res.splitlines():
+                if line.startswith("Action ID:"):
+                    act_id = line.split(":", 1)[1].strip()
+                    break
+            self.assertIsNotNone(act_id)
+
+            # Verify persisted record
+            stored = action_store.get_by_id(act_id, tenant_id="tenant_p38d")
+            self.assertIsNotNone(stored)
+            self.assertEqual(stored.target.plant_id, "plant_valid_01")
+            self.assertEqual(stored.workspace_id, "ws_p38d")
+            self.assertEqual(stored.tenant_id, "tenant_p38d")
+
+    def test_admin_wildcard_plant_authorized_for_concrete_plant(self):
+        """Identity with authoritative wildcard plant ['*'] can propose for any concrete plant."""
+        subject_id = f"agent_admin_plant_{uuid.uuid4().hex[:6]}"
+        self._create_grant(
+            subject_id=subject_id,
+            tenant_id="tenant_admin_p",
+            workspace_id="ws_admin_p",
+            plant_id="*",
+        )
+        admin_identity = self._create_identity(
+            user_id="admin_user_01",
+            tenant_id="tenant_admin_p",
+            workspace_id="ws_admin_p",
+            roles=["operator", "admin"],
+            plants=["*"],  # Authoritative administrator wildcard
+        )
+
+        with active_autonomy_context(subject_id=subject_id, identity=admin_identity):
+            res = propose_action.invoke({
+                "action_type": "REORDER_INVENTORY",
+                "resource_type": "SKU",
+                "resource_id": "SKU-ADMIN-P",
+                "plant_id": "plant_mumbai_09",
+                "parameters": {"sku_id": "SKU-ADMIN-P", "quantity": 15},
+                "reason": "Admin multi-plant management",
+            })
+            self.assertIn("ACTION PROPOSED SUCCESSFULLY", res)
+
+    def test_no_action_inspection_tool_uses_hardcoded_synthetic_operator_identity(self):
+        """Ensures preview_action_impact and check_action_policy never rely on synthetic operator identity."""
+        act_id = f"act_no_synth_{uuid.uuid4().hex[:6]}"
+        self._create_stored_action(act_id, plant_id="plant_01")
+
+        # Calling without identity fails closed on BOTH inspection tools
+        res_prev = preview_action_impact.invoke({"action_id": act_id})
+        self.assertIn("ACTION PREVIEW BLOCKED: Authenticated autonomy context is required", res_prev)
+
+        res_pol = check_action_policy.invoke({"action_id": act_id})
+        self.assertIn("ACTION POLICY CHECK BLOCKED: Authenticated autonomy context is required", res_pol)
+
+    def test_no_regression_in_prompt_38a_38b_38c_protections(self):
+        """Verifies Prompt 38A, 38B, and 38C foundational invariants remain active."""
+        # 38A: Level 4/5 disabled
+        self.assertFalse(AutonomyLevel.LEVEL_4_SUPERVISED_EXECUTION.is_operational)
+        self.assertFalse(AutonomyLevel.LEVEL_5_BOUNDED_AUTONOMY.is_operational)
+
+        # 38C: Unpersisted client estimate cannot bypass cost constraints
+        subject_id = f"agent_cost_reg_{uuid.uuid4().hex[:6]}"
+        grant = self._create_grant(subject_id=subject_id, max_cost=300.0)
+        identity = self._create_identity()
+
+        dec = self.service.evaluate_autonomy(
+            identity=identity,
+            subject_id=subject_id,
+            requested_capability="PROPOSE_ACTION",
+            resource_scope=grant.scope,
+            data_mode="REAL",
+            risk_context={
+                "action_type": "REORDER_INVENTORY",
+                "parameters": {"sku_id": "SKU-100", "quantity": 10},
+                "target_resource_id": "SKU-100",
+                "cost_estimate_usd": 50.0,
+            },
+        )
+        self.assertEqual(dec.decision, AutonomyDecisionEffect.REQUIRES_REVIEW)
+        self.assertEqual(dec.reason_code, AutonomyReasonCode.POLICY_REVIEW_REQUIRED)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 

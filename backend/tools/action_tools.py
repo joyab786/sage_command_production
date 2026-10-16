@@ -53,6 +53,30 @@ except ModuleNotFoundError:
 
 
 
+def is_plant_authorized(identity: Identity, plant_id: Optional[str]) -> bool:
+    """
+    Validates requested target plant against authenticated identity's authoritative plant assignments.
+    Strictly fail-closed:
+    - Target plant must not be empty or wildcard.
+    - Identity must have non-empty assigned_plants.
+    - Wildcard '*' in identity.assigned_plants grants admin access to any specific plant.
+    - Otherwise, requested plant must explicitly be in identity.assigned_plants.
+    """
+    if not plant_id or not str(plant_id).strip():
+        return False
+    clean_plant = str(plant_id).strip()
+    if clean_plant == "*":
+        return False  # Tool argument plant_id="*" is never allowed as target authorization
+
+    raw_plants = getattr(identity, "assigned_plants", None)
+    if not raw_plants or not isinstance(raw_plants, (list, set, tuple)):
+        return False
+    user_plants = set(raw_plants)
+    if "*" in user_plants:
+        return True
+    return clean_plant in user_plants
+
+
 @tool
 def propose_action(
     action_type: str,
@@ -66,7 +90,7 @@ def propose_action(
     tenant_id: Optional[str] = None,
     workspace_id: Optional[str] = None,
     session_id: Optional[str] = None,
-    plant_id: str = "plant_001"
+    plant_id: Optional[str] = None
 ) -> str:
     """
     Proposes a typed, validated industrial action instead of raw operational SQL.
@@ -87,7 +111,10 @@ def propose_action(
 
         auth_ident = active_ident
         auth_tenant = auth_ident.tenant_id
-        auth_workspace = getattr(auth_ident, "workspace_id", None) or "workspace_default"
+        auth_workspace = getattr(auth_ident, "workspace_id", None)
+        if not auth_workspace or not str(auth_workspace).strip():
+            return "ACTION PROPOSAL BLOCKED: Authenticated identity lacks required workspace scope."
+        auth_workspace = str(auth_workspace).strip()
         auth_session = getattr(auth_ident, "session_id", None)
 
         # Reject forged context arguments if provided
@@ -96,7 +123,7 @@ def propose_action(
                 f"ACTION PROPOSAL BLOCKED: Forged tenant context detected. "
                 f"Tool argument tenant_id '{tenant_id}' does not match authenticated tenant '{auth_tenant}'."
             )
-        if workspace_id is not None and str(workspace_id).strip() != str(auth_workspace).strip():
+        if workspace_id is not None and str(workspace_id).strip() != auth_workspace:
             return (
                 f"ACTION PROPOSAL BLOCKED: Forged workspace context detected. "
                 f"Tool argument workspace_id '{workspace_id}' does not match authenticated workspace '{auth_workspace}'."
@@ -112,6 +139,21 @@ def propose_action(
                     f"ACTION PROPOSAL BLOCKED: Forged session context detected. "
                     f"Tool argument session_id '{session_id}' does not match authenticated session '{auth_session}'."
                 )
+
+        # Validate target plant scope against trusted identity before autonomy evaluation
+        if not plant_id or not str(plant_id).strip():
+            return "ACTION PROPOSAL BLOCKED: Missing target plant scope. A specific authorized plant_id must be provided."
+
+        clean_plant = str(plant_id).strip()
+        if clean_plant == "*":
+            return "ACTION PROPOSAL BLOCKED: Wildcard plant identifier is not permitted for action proposal."
+
+        if not is_plant_authorized(auth_ident, clean_plant):
+            user_plants = getattr(auth_ident, "assigned_plants", None) or []
+            return (
+                f"ACTION PROPOSAL BLOCKED: Unauthorized plant scope. "
+                f"Caller '{auth_ident.user_id}' is assigned to {user_plants}, but requested plant '{clean_plant}' is not authorized."
+            )
 
         # 1. Parse and validate ActionType
         try:
@@ -133,7 +175,7 @@ def propose_action(
             resource_id=resource_id.strip(),
             tenant_id=auth_tenant,
             workspace_id=auth_workspace,
-            plant_id=plant_id
+            plant_id=clean_plant
         )
 
         cost = CostEstimate(value=float(estimated_cost_usd), currency="USD") if estimated_cost_usd > 0 else None
@@ -167,7 +209,7 @@ def propose_action(
             tenant_id=auth_tenant,
             workspace_id=auth_workspace,
             session_id=auth_session,
-            plant_id=plant_id
+            plant_id=clean_plant
         )
 
         autonomy_dec = autonomy_service.evaluate_autonomy(
@@ -208,7 +250,7 @@ def propose_action(
             system_risk_level=system_risk,
             requires_approval=requires_approval,
             estimated_cost=cost,
-            estimated_duration_minutes=estimated_duration_minutes,
+            estimated_duration_minutes=estimated_duration_minutes if estimated_duration_minutes > 0 else 15,
             requested_by=auth_ident.user_id,
             provenance=provenance,
             status=ActionStatus.PROPOSED
@@ -244,24 +286,95 @@ def propose_action(
 @tool
 def preview_action_impact(
     action_id: str,
-    tenant_id: str = "tenant_default"
+    tenant_id: Optional[str] = None,
+    workspace_id: Optional[str] = None,
+    session_id: Optional[str] = None,
 ) -> str:
     """Generates a safe simulation of the expected effects and impact of a proposed action."""
-    action = action_store.get_by_id(action_id, tenant_id)
-    if not action:
-        return f"Error: Action '{action_id}' not found for tenant '{tenant_id}'."
+    try:
+        active_ident = get_active_autonomy_identity()
+        if not active_ident:
+            return (
+                "ACTION PREVIEW BLOCKED: Authenticated autonomy context is required. "
+                "No active trusted identity found in server execution context."
+            )
 
-    sim = action_validator.generate_simulation(action)
-    effects_str = "\n".join([
-        f"- Resource: {e.resource} | Field: {e.field} | Before: {e.before} -> After: {e.after}"
-        for e in sim.expected_effects
-    ])
-    return (
-        f"SIMULATION PREVIEW for {action.action_id} ({action.action_type.value}):\n"
-        f"Expected Effects:\n{effects_str}\n\n"
-        f"Estimated Impact:\n{sim.estimated_impact}\n"
-        f"Note: This was a simulated preview. Live state has not been modified."
-    )
+        auth_ident = active_ident
+        auth_tenant = auth_ident.tenant_id
+        auth_workspace = getattr(auth_ident, "workspace_id", None)
+        auth_session = getattr(auth_ident, "session_id", None)
+
+        # Anti-forgery checks on optional caller-supplied context arguments
+        if tenant_id is not None and str(tenant_id).strip() != str(auth_tenant).strip():
+            return (
+                f"ACTION PREVIEW BLOCKED: Forged tenant context detected. "
+                f"Tool argument tenant_id '{tenant_id}' does not match authenticated tenant '{auth_tenant}'."
+            )
+        if workspace_id is not None:
+            if not auth_workspace or str(workspace_id).strip() != str(auth_workspace).strip():
+                return (
+                    f"ACTION PREVIEW BLOCKED: Forged workspace context detected. "
+                    f"Tool argument workspace_id '{workspace_id}' does not match authenticated workspace '{auth_workspace}'."
+                )
+        if session_id is not None:
+            if not auth_session:
+                return (
+                    f"ACTION PREVIEW BLOCKED: Forged session context detected. "
+                    f"Tool argument session_id '{session_id}' cannot substitute for unauthenticated session."
+                )
+            if str(session_id).strip() != str(auth_session).strip():
+                return (
+                    f"ACTION PREVIEW BLOCKED: Forged session context detected. "
+                    f"Tool argument session_id '{session_id}' does not match authenticated session '{auth_session}'."
+                )
+
+        # Retrieve action strictly within trusted tenant (non-disclosing error if missing/cross-tenant)
+        action = action_store.get_by_id(action_id, auth_tenant)
+        if not action:
+            return f"ACTION PREVIEW BLOCKED: Action '{action_id}' not found."
+
+        # Validate workspace scope
+        if not auth_workspace or not str(auth_workspace).strip():
+            return "ACTION PREVIEW BLOCKED: Authenticated identity lacks required workspace scope."
+        if action.workspace_id and str(action.workspace_id).strip() != str(auth_workspace).strip():
+            return f"ACTION PREVIEW BLOCKED: Workspace scope mismatch. Action '{action_id}' does not belong to workspace '{auth_workspace}'."
+
+        # Validate session scope for session-bound actions
+        act_session = getattr(action, "session_id", None)
+        if act_session and str(act_session).strip():
+            clean_act_sess = str(act_session).strip()
+            if not auth_session or not str(auth_session).strip():
+                return (
+                    f"ACTION PREVIEW BLOCKED: Session mismatch. "
+                    f"Action '{action_id}' is session-bound, but authenticated identity has no active session."
+                )
+            if str(auth_session).strip() != clean_act_sess:
+                return (
+                    f"ACTION PREVIEW BLOCKED: Session mismatch. "
+                    f"Action '{action_id}' belongs to session '{clean_act_sess}', not '{auth_session}'."
+                )
+
+        # Validate plant scope
+        act_plant = action.target.plant_id if action.target else None
+        if not is_plant_authorized(auth_ident, act_plant):
+            return (
+                f"ACTION PREVIEW BLOCKED: Plant scope denied. "
+                f"Caller '{auth_ident.user_id}' is not authorized for target plant '{act_plant}'."
+            )
+
+        sim = action_validator.generate_simulation(action)
+        effects_str = "\n".join([
+            f"- Resource: {e.resource} | Field: {e.field} | Before: {e.before} -> After: {e.after}"
+            for e in sim.expected_effects
+        ])
+        return (
+            f"SIMULATION PREVIEW for {action.action_id} ({action.action_type.value}):\n"
+            f"Expected Effects:\n{effects_str}\n\n"
+            f"Estimated Impact:\n{sim.estimated_impact}\n"
+            f"Note: This was a simulated preview. Live state has not been modified."
+        )
+    except Exception as e:
+        return f"Failed to preview action impact: {str(e)}"
 
 
 @tool
@@ -281,32 +394,105 @@ def list_supported_actions() -> str:
 @tool
 def check_action_policy(
     action_id: str,
-    tenant_id: str = "tenant_default"
+    tenant_id: Optional[str] = None,
+    workspace_id: Optional[str] = None,
+    session_id: Optional[str] = None,
 ) -> str:
     """Evaluates an existing proposed action against active system policies and returns the governance decision."""
-    action = action_store.get_by_id(action_id, tenant_id)
-    if not action:
-        return f"Error: Action '{action_id}' not found for tenant '{tenant_id}'."
+    try:
+        active_ident = get_active_autonomy_identity()
+        if not active_ident:
+            return (
+                "ACTION POLICY CHECK BLOCKED: Authenticated autonomy context is required. "
+                "No active trusted identity found in server execution context."
+            )
 
-    context = PolicyEvaluationContext(
-        tenant_id=tenant_id,
-        workspace_id=action.workspace_id,
-        session_id=action.session_id,
-        user_id="agent_action_tool",
-        plant_id=action.target.plant_id,
-        roles=["operator"],
-        data_mode=action.data_mode
-    )
+        auth_ident = active_ident
+        auth_tenant = auth_ident.tenant_id
+        auth_workspace = getattr(auth_ident, "workspace_id", None)
+        auth_session = getattr(auth_ident, "session_id", None)
 
-    decision = policy_service.evaluate(action=action, context=context, persist_decision=True)
-    approval_str = f"Yes ({decision.approval_requirement.reason})" if decision.requires_approval and decision.approval_requirement else ("Yes" if decision.requires_approval else "No")
+        # Anti-forgery checks on optional caller-supplied context arguments
+        if tenant_id is not None and str(tenant_id).strip() != str(auth_tenant).strip():
+            return (
+                f"ACTION POLICY CHECK BLOCKED: Forged tenant context detected. "
+                f"Tool argument tenant_id '{tenant_id}' does not match authenticated tenant '{auth_tenant}'."
+            )
+        if workspace_id is not None:
+            if not auth_workspace or str(workspace_id).strip() != str(auth_workspace).strip():
+                return (
+                    f"ACTION POLICY CHECK BLOCKED: Forged workspace context detected. "
+                    f"Tool argument workspace_id '{workspace_id}' does not match authenticated workspace '{auth_workspace}'."
+                )
+        if session_id is not None:
+            if not auth_session:
+                return (
+                    f"ACTION POLICY CHECK BLOCKED: Forged session context detected. "
+                    f"Tool argument session_id '{session_id}' cannot substitute for unauthenticated session."
+                )
+            if str(session_id).strip() != str(auth_session).strip():
+                return (
+                    f"ACTION POLICY CHECK BLOCKED: Forged session context detected. "
+                    f"Tool argument session_id '{session_id}' does not match authenticated session '{auth_session}'."
+                )
 
-    return (
-        f"POLICY EVALUATION RESULT for {action.action_id}:\n"
-        f"Decision: {decision.decision.value}\n"
-        f"Governing Policy: {decision.policy_id or 'None'} (v{decision.policy_version or 'N/A'})\n"
-        f"Requires Approval: {approval_str}\n"
-        f"Explanation: {decision.explanation}\n"
-        f"Reason Codes: {', '.join(decision.reason_codes)}"
-    )
+        # Retrieve action strictly within trusted tenant (non-disclosing error if missing/cross-tenant)
+        action = action_store.get_by_id(action_id, auth_tenant)
+        if not action:
+            return f"ACTION POLICY CHECK BLOCKED: Action '{action_id}' not found."
+
+        # Validate workspace scope
+        if not auth_workspace or not str(auth_workspace).strip():
+            return "ACTION POLICY CHECK BLOCKED: Authenticated identity lacks required workspace scope."
+        if action.workspace_id and str(action.workspace_id).strip() != str(auth_workspace).strip():
+            return f"ACTION POLICY CHECK BLOCKED: Workspace scope mismatch. Action '{action_id}' does not belong to workspace '{auth_workspace}'."
+
+        # Validate session scope for session-bound actions
+        act_session = getattr(action, "session_id", None)
+        if act_session and str(act_session).strip():
+            clean_act_sess = str(act_session).strip()
+            if not auth_session or not str(auth_session).strip():
+                return (
+                    f"ACTION POLICY CHECK BLOCKED: Session mismatch. "
+                    f"Action '{action_id}' is session-bound, but authenticated identity has no active session."
+                )
+            if str(auth_session).strip() != clean_act_sess:
+                return (
+                    f"ACTION POLICY CHECK BLOCKED: Session mismatch. "
+                    f"Action '{action_id}' belongs to session '{clean_act_sess}', not '{auth_session}'."
+                )
+
+        # Validate plant scope
+        act_plant = action.target.plant_id if action.target else None
+        if not is_plant_authorized(auth_ident, act_plant):
+            return (
+                f"ACTION POLICY CHECK BLOCKED: Plant scope denied. "
+                f"Caller '{auth_ident.user_id}' is not authorized for target plant '{act_plant}'."
+            )
+
+        # Build PolicyEvaluationContext strictly from trusted identity and authoritative action data
+        context = PolicyEvaluationContext(
+            tenant_id=auth_tenant,
+            workspace_id=action.workspace_id,
+            session_id=action.session_id or (auth_session or "session_default"),
+            user_id=auth_ident.user_id,
+            plant_id=act_plant,
+            roles=list(auth_ident.roles or []),
+            permissions=list(getattr(auth_ident, "permissions", []) or []),
+            data_mode=action.data_mode
+        )
+
+        decision = policy_service.evaluate(action=action, context=context, persist_decision=True)
+        approval_str = f"Yes ({decision.approval_requirement.reason})" if decision.requires_approval and decision.approval_requirement else ("Yes" if decision.requires_approval else "No")
+
+        return (
+            f"POLICY EVALUATION RESULT for {action.action_id}:\n"
+            f"Decision: {decision.decision.value}\n"
+            f"Governing Policy: {decision.policy_id or 'None'} (v{decision.policy_version or 'N/A'})\n"
+            f"Requires Approval: {approval_str}\n"
+            f"Explanation: {decision.explanation}\n"
+            f"Reason Codes: {', '.join(decision.reason_codes)}"
+        )
+    except Exception as e:
+        return f"Failed to check action policy: {str(e)}"
 
