@@ -450,4 +450,74 @@ This section documents the specific security gap closures implemented under Prom
 - Autonomy Levels 4 and 5 remain `DISABLED` and `NOT_IMPLEMENTED`.
 - Action proposal, simulation preview, and policy checking remain strictly non-operational with zero operational writes or physical execution pathways.
 
+---
+
+## 25. Prompt 38E Security Corrections (Closing Session, Workspace, and Error-Disclosure Gaps)
+
+This section documents the specific security gap closures implemented under Prompt 38E:
+
+### 1. Removal of Synthetic Session Fallbacks
+- **Elimination of `session_default` Fallback:** In `backend/tools/action_tools.py:check_action_policy()`, removed:
+  ```python
+  session_id=action.session_id or (auth_session or "session_default")
+  ```
+- **Explicit Truthful Session Enforcement:**
+  - Evaluates `effective_session = clean_act_sess or clean_auth_sess`.
+  - For session-bound actions, requires exact match between stored action session and authenticated caller session.
+  - If neither the stored action nor the trusted identity provides an active session, `check_action_policy()` strictly fails closed before policy evaluation: `"ACTION POLICY CHECK BLOCKED: Missing authoritative session scope. Policy evaluation requires a valid session context."`
+  - Zero synthetic session identifiers are invented. The authoritative `PolicyEvaluationContext` receives only truthful sessions supplied by trusted identity or stored action.
+
+### 2. Mandatory Workspace Matching in Inspection Tools
+- **Enforced in `preview_action_impact()` and `check_action_policy()`:**
+  - Requires non-empty authenticated workspace (`clean_auth_workspace`).
+  - Requires non-empty stored action workspace (`clean_act_workspace`).
+  - Requires exact normalized equality between the two (`clean_act_workspace == clean_auth_workspace`).
+  - Rejects missing, empty (`""`), or whitespace-only stored action workspace identifiers with: `"ACTION [PREVIEW|POLICY CHECK] BLOCKED: Missing stored action workspace scope. Action '{action_id}' lacks a valid workspace."`
+  - Eliminates the previous conditional `if action.workspace_id and ...` check that permitted empty or missing stored workspaces to skip validation.
+  - Stored actions are never silently repaired by assigning them the caller's workspace.
+
+### 3. Safe, Non-Disclosing Tool Errors
+- **Removal of Raw `str(e)` Error Returns:** In `propose_action()`, `preview_action_impact()`, and `check_action_policy()`, raw exception strings `str(e)` are no longer returned to callers or models.
+- **Stable Operation-Appropriate Error Messages:**
+  - `propose_action()`: `"ACTION PROPOSAL FAILED: An internal error occurred while processing the action proposal."`
+  - `preview_action_impact()`: `"ACTION PREVIEW FAILED: An internal error occurred while generating action preview."`
+  - `check_action_policy()`: `"ACTION POLICY CHECK FAILED: An internal error occurred while evaluating action policy."`
+- **Protected Diagnostic Logging:** Unhandled exceptions are logged to server-side logs via `logger.error("Internal error ...", type(e).__name__, exc_info=True)`.
+- **Zero Information Leakage:** Prevents exposure of internal database paths, connection strings, table names, SQL statements, or stack traces. Errors are never suppressed to falsely indicate success.
+
+### 4. Static Code Search Audit Findings
+A comprehensive repository search verified the following invariants:
+- **`session_default`:** 0 occurrences in `action_tools.py`. Legacy default occurrences in test fixtures (`test_v3_transactions.py`), DB exploration tools (`db_tools.py`), and default database context schemas preserved without breaking existing tests.
+- **`workspace_default`:** 0 occurrences in `action_tools.py`.
+- **`str(e)`:** 0 occurrences in `action_tools.py`. Raw exception disclosures eliminated across all three action tools.
+- **`except Exception`:** All three action tools catch exceptions, log diagnostics server-side with `logger.error(..., exc_info=True)`, and return stable, non-disclosing error messages.
+- **`action.workspace_id`:** Enforced to be non-empty and matching caller workspace in both `preview_action_impact()` and `check_action_policy()`.
+- **`PolicyEvaluationContext(`:** Receives real user ID, real roles, validated action workspace, and strictly non-synthetic session.
+- **Autonomy Levels 4 and 5:** Remain permanently `DISABLED` and `NOT_IMPLEMENTED`.
+- **Non-Operational Boundary:** Zero execution endpoints added or enabled.
+
+### 5. Regression Test Results
+- **Dedicated Suite:** `TestV3Prompt38ESessionWorkspaceAndErrorDisclosure` in `backend/test_v3_autonomy.py` validates:
+  1. Policy evaluation does not invent `session_default`.
+  2. Missing authoritative session fails closed explicitly and safely before policy evaluation.
+  3. Missing action workspace (None) is rejected by `preview_action_impact()`.
+  4. Empty action workspace (`""`/whitespace) is rejected by `preview_action_impact()`.
+  5. Missing action workspace (None) is rejected by `check_action_policy()`.
+  6. Empty action workspace (`""`/whitespace) is rejected by `check_action_policy()`.
+  7. Workspace mismatch fails closed across both preview and policy check tools.
+  8. Valid matching workspace and supported session scope succeed across both inspection tools.
+  9. Exceptions from `preview_action_impact()` do not expose raw internal details or database paths.
+  10. Exceptions from `check_action_policy()` do not expose raw internal details or SQL traces.
+  11. Exceptions from `propose_action()` do not expose raw internal details or storage errors.
+  12. Existing Prompt 38A–38D identity, cost, plant, tenant, workspace, and session protections remain fully intact.
+- **Test Executions:**
+  1. `backend/test_v3_autonomy.py`: 111 passed, 0 failed.
+  2. `backend/test_v3_action_api.py backend/test_v3_authorization.py backend/test_v3_mission_architecture.py backend/test_v3_security.py backend/test_v3_policy_engine.py`: 139 passed, 0 failed.
+  Total: 250 automated tests passing across all test suites.
+
+### 6. Non-Operational Execution Boundary Confirmation
+- Autonomy Levels 4 and 5 remain `DISABLED` and `NOT_IMPLEMENTED`.
+- SageCommand V3 maintains strict read/propose-only autonomy boundaries. No autonomous physical execution pathways exist.
+
+
 

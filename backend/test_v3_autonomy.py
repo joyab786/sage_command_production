@@ -65,6 +65,7 @@ from data.schemas.action_contract import (
     RiskLevel,
 )
 from services.action_store import action_store
+from services.action_validator import action_validator
 from data.schemas.authorization_contract import AuthzDecisionEffect, AuthorizationDecision
 from repositories.autonomy_repository import AutonomyRepositoryError
 
@@ -3596,7 +3597,358 @@ class TestV3ActionToolIdentityAndScopePrompt38D(unittest.TestCase):
         self.assertEqual(dec.reason_code, AutonomyReasonCode.POLICY_REVIEW_REQUIRED)
 
 
+
+class TestV3Prompt38ESessionWorkspaceAndErrorDisclosure(unittest.TestCase):
+    """
+    Prompt 38E Regression Tests:
+    1. Policy evaluation does not invent session_default.
+    2. Missing authoritative session is handled explicitly and safely.
+    3. Missing action workspace is rejected by preview_action_impact.
+    4. Empty action workspace is rejected by preview_action_impact.
+    5. Missing action workspace is rejected by check_action_policy.
+    6. Empty action workspace is rejected by check_action_policy.
+    7. Workspace mismatch still fails closed.
+    8. Valid matching workspace and supported session scope still work.
+    9. Exceptions from preview do not expose raw internal details.
+    10. Exceptions from policy checking do not expose raw internal details.
+    11. Exceptions from action proposal do not expose raw internal details.
+    12. Existing Prompt 38A-38D identity, cost, plant, tenant, workspace, and session protections remain intact.
+    """
+
+    def setUp(self):
+        self.repo = autonomy_repository
+        self.service = autonomy_service
+        action_store.clear()
+
+    def tearDown(self):
+        action_store.clear()
+
+    def _create_identity(
+        self,
+        user_id="user_p38e",
+        tenant_id="tenant_p38e",
+        workspace_id="ws_p38e",
+        session_id="session_p38e",
+        roles=None,
+        plants=None,
+        clearance=2,
+    ):
+        return Identity(
+            user_id=user_id,
+            tenant_id=tenant_id,
+            workspace_id=workspace_id,
+            session_id=session_id,
+            roles=roles or ["operator", "manager"],
+            assigned_plants=plants if plants is not None else ["plant_01"],
+            clearance_level=clearance,
+        )
+
+    def _create_stored_action(
+        self,
+        action_id,
+        tenant_id="tenant_p38e",
+        workspace_id="ws_p38e",
+        session_id="session_p38e",
+        plant_id="plant_01",
+        cost=150.0,
+        risk_level=RiskLevel.LOW,
+    ):
+        target = ActionTarget(
+            resource_type=ResourceType.SKU,
+            resource_id="SKU-38E-01",
+            tenant_id=tenant_id,
+            workspace_id=workspace_id,
+            plant_id=plant_id,
+        )
+        reason = ActionReason(
+            reason_code="OPERATIONAL_RECOVERY",
+            summary="Prompt 38E test action",
+            justification="Scope and error safety testing",
+        )
+        cost_est = CostEstimate(value=cost, currency="USD") if cost is not None else None
+        action = Action(
+            action_id=action_id,
+            tenant_id=tenant_id,
+            workspace_id=workspace_id,
+            session_id=session_id,
+            action_type=ActionType.REORDER_INVENTORY,
+            version="1.0",
+            target=target,
+            parameters={"sku_id": "SKU-38E-01", "quantity": 25},
+            reason=reason,
+            system_risk_level=risk_level,
+            requires_approval=False,
+            estimated_cost=cost_est,
+            estimated_duration_minutes=20,
+            status=ActionStatus.PROPOSED,
+        )
+        action_store.save(action)
+        return action
+
+    # 1. Policy evaluation does not invent session_default
+    def test_policy_evaluation_does_not_invent_session_default(self):
+        """Policy evaluation derives session truthful to identity/action, never inventing session_default."""
+        act_id = f"act_no_default_sess_{uuid.uuid4().hex[:6]}"
+        self._create_stored_action(act_id, session_id="session_truthful_99")
+        identity = self._create_identity(session_id="session_truthful_99")
+        subject_id = f"agent_38e_{uuid.uuid4().hex[:6]}"
+
+        captured_contexts = []
+        original_evaluate = policy_service.evaluate
+
+        def capturing_evaluate(action, context, persist_decision=True):
+            captured_contexts.append(context)
+            return original_evaluate(action=action, context=context, persist_decision=persist_decision)
+
+        with patch.object(policy_service, "evaluate", side_effect=capturing_evaluate):
+            with active_autonomy_context(subject_id=subject_id, identity=identity):
+                res = check_action_policy.invoke({"action_id": act_id})
+                self.assertIn("POLICY EVALUATION RESULT", res)
+
+        self.assertEqual(len(captured_contexts), 1)
+        ctx = captured_contexts[0]
+        self.assertEqual(ctx.session_id, "session_truthful_99")
+        self.assertNotEqual(ctx.session_id, "session_default")
+        self.assertNotIn("session_default", str(ctx.model_dump()))
+
+    # 2. Missing authoritative session is handled explicitly and safely
+    def test_missing_authoritative_session_fails_closed_explicitly(self):
+        """When neither stored action nor trusted identity provides a session, policy check fails closed without inventing a default."""
+        act_id = f"act_no_sess_anywhere_{uuid.uuid4().hex[:6]}"
+        self._create_stored_action(act_id, session_id=None)
+        identity = self._create_identity(session_id=None)
+        subject_id = f"agent_38e_{uuid.uuid4().hex[:6]}"
+
+        with patch.object(policy_service, "evaluate", wraps=policy_service.evaluate) as mock_eval:
+            with active_autonomy_context(subject_id=subject_id, identity=identity):
+                res = check_action_policy.invoke({"action_id": act_id})
+                self.assertIn("ACTION POLICY CHECK BLOCKED: Missing authoritative session scope", res)
+                self.assertNotIn("POLICY EVALUATION RESULT", res)
+                self.assertNotIn("session_default", res)
+                mock_eval.assert_not_called()
+
+    # 3. Missing action workspace is rejected by preview_action_impact
+    def test_missing_action_workspace_rejected_by_preview(self):
+        """preview_action_impact rejects stored actions that lack a workspace (None)."""
+        act_id = f"act_missing_ws_prev_{uuid.uuid4().hex[:6]}"
+        action = self._create_stored_action(act_id)
+        action.workspace_id = None
+        action_store.save(action)
+
+        identity = self._create_identity()
+        subject_id = f"agent_38e_{uuid.uuid4().hex[:6]}"
+
+        with active_autonomy_context(subject_id=subject_id, identity=identity):
+            res = preview_action_impact.invoke({"action_id": act_id})
+            self.assertIn("ACTION PREVIEW BLOCKED: Missing stored action workspace scope", res)
+            self.assertNotIn("SIMULATION PREVIEW", res)
+
+    # 4. Empty action workspace is rejected by preview_action_impact
+    def test_empty_action_workspace_rejected_by_preview(self):
+        """preview_action_impact rejects stored actions that have an empty or whitespace workspace string."""
+        act_id = f"act_empty_ws_prev_{uuid.uuid4().hex[:6]}"
+        action = self._create_stored_action(act_id)
+        action.workspace_id = "   "
+        action_store.save(action)
+
+        identity = self._create_identity()
+        subject_id = f"agent_38e_{uuid.uuid4().hex[:6]}"
+
+        with active_autonomy_context(subject_id=subject_id, identity=identity):
+            res = preview_action_impact.invoke({"action_id": act_id})
+            self.assertIn("ACTION PREVIEW BLOCKED: Missing stored action workspace scope", res)
+            self.assertNotIn("SIMULATION PREVIEW", res)
+
+    # 5. Missing action workspace is rejected by check_action_policy
+    def test_missing_action_workspace_rejected_by_policy_check(self):
+        """check_action_policy rejects stored actions that lack a workspace (None)."""
+        act_id = f"act_missing_ws_pol_{uuid.uuid4().hex[:6]}"
+        action = self._create_stored_action(act_id)
+        action.workspace_id = None
+        action_store.save(action)
+
+        identity = self._create_identity()
+        subject_id = f"agent_38e_{uuid.uuid4().hex[:6]}"
+
+        with active_autonomy_context(subject_id=subject_id, identity=identity):
+            res = check_action_policy.invoke({"action_id": act_id})
+            self.assertIn("ACTION POLICY CHECK BLOCKED: Missing stored action workspace scope", res)
+            self.assertNotIn("POLICY EVALUATION RESULT", res)
+
+    # 6. Empty action workspace is rejected by check_action_policy
+    def test_empty_action_workspace_rejected_by_policy_check(self):
+        """check_action_policy rejects stored actions that have an empty or whitespace workspace string."""
+        act_id = f"act_empty_ws_pol_{uuid.uuid4().hex[:6]}"
+        action = self._create_stored_action(act_id)
+        action.workspace_id = ""
+        action_store.save(action)
+
+        identity = self._create_identity()
+        subject_id = f"agent_38e_{uuid.uuid4().hex[:6]}"
+
+        with active_autonomy_context(subject_id=subject_id, identity=identity):
+            res = check_action_policy.invoke({"action_id": act_id})
+            self.assertIn("ACTION POLICY CHECK BLOCKED: Missing stored action workspace scope", res)
+            self.assertNotIn("POLICY EVALUATION RESULT", res)
+
+    # 7. Workspace mismatch still fails closed
+    def test_workspace_mismatch_fails_closed(self):
+        """Both preview and policy check fail closed when stored action workspace does not match caller workspace."""
+        act_id = f"act_ws_mismatch_{uuid.uuid4().hex[:6]}"
+        self._create_stored_action(act_id, workspace_id="ws_finance")
+
+        identity = self._create_identity(workspace_id="ws_operations")
+        subject_id = f"agent_38e_{uuid.uuid4().hex[:6]}"
+
+        with active_autonomy_context(subject_id=subject_id, identity=identity):
+            res_prev = preview_action_impact.invoke({"action_id": act_id})
+            self.assertIn("ACTION PREVIEW BLOCKED: Workspace scope mismatch", res_prev)
+
+            res_pol = check_action_policy.invoke({"action_id": act_id})
+            self.assertIn("ACTION POLICY CHECK BLOCKED: Workspace scope mismatch", res_pol)
+
+    # 8. Valid matching workspace and supported session scope still work
+    def test_valid_matching_workspace_and_supported_session_scope_succeeds(self):
+        """Both preview and policy check succeed with valid matching workspace and explicit supported session."""
+        act_id = f"act_valid_scope_{uuid.uuid4().hex[:6]}"
+        self._create_stored_action(act_id, workspace_id="ws_valid_scope", session_id="session_valid_scope")
+
+        identity = self._create_identity(workspace_id="ws_valid_scope", session_id="session_valid_scope")
+        subject_id = f"agent_38e_{uuid.uuid4().hex[:6]}"
+
+        with active_autonomy_context(subject_id=subject_id, identity=identity):
+            res_prev = preview_action_impact.invoke({"action_id": act_id})
+            self.assertIn("SIMULATION PREVIEW", res_prev)
+            self.assertIn("pending_inbound_quantity", res_prev)
+
+            res_pol = check_action_policy.invoke({"action_id": act_id})
+            self.assertIn("POLICY EVALUATION RESULT", res_pol)
+            self.assertIn("Decision:", res_pol)
+
+    # 9. Exceptions from preview do not expose raw internal details
+    def test_exceptions_from_preview_do_not_expose_raw_internal_details(self):
+        """preview_action_impact catches exceptions, logs diagnostics, and returns a safe non-disclosing error."""
+        act_id = f"act_prev_err_{uuid.uuid4().hex[:6]}"
+        self._create_stored_action(act_id)
+        identity = self._create_identity()
+        subject_id = f"agent_38e_{uuid.uuid4().hex[:6]}"
+
+        secret_internal_detail = "DB_INTERNAL_CORRUPTION: /data/secure_vault.sqlite connection reset by host 10.0.0.42"
+
+        with patch.object(action_validator, "generate_simulation", side_effect=RuntimeError(secret_internal_detail)):
+            with active_autonomy_context(subject_id=subject_id, identity=identity):
+                res = preview_action_impact.invoke({"action_id": act_id})
+                self.assertIn("ACTION PREVIEW FAILED: An internal error occurred while generating action preview.", res)
+                self.assertNotIn(secret_internal_detail, res)
+                self.assertNotIn("secure_vault.sqlite", res)
+                self.assertNotIn("10.0.0.42", res)
+                self.assertNotIn("SIMULATION PREVIEW", res)
+
+    # 10. Exceptions from policy checking do not expose raw internal details
+    def test_exceptions_from_policy_checking_do_not_expose_raw_internal_details(self):
+        """check_action_policy catches exceptions, logs diagnostics, and returns a safe non-disclosing error."""
+        act_id = f"act_pol_err_{uuid.uuid4().hex[:6]}"
+        self._create_stored_action(act_id)
+        identity = self._create_identity()
+        subject_id = f"agent_38e_{uuid.uuid4().hex[:6]}"
+
+        secret_sql_trace = "sqlite3.OperationalError: table internal_policies locked by transaction 0xbeefcafe"
+
+        with patch.object(policy_service, "evaluate", side_effect=Exception(secret_sql_trace)):
+            with active_autonomy_context(subject_id=subject_id, identity=identity):
+                res = check_action_policy.invoke({"action_id": act_id})
+                self.assertIn("ACTION POLICY CHECK FAILED: An internal error occurred while evaluating action policy.", res)
+                self.assertNotIn(secret_sql_trace, res)
+                self.assertNotIn("internal_policies locked", res)
+                self.assertNotIn("0xbeefcafe", res)
+                self.assertNotIn("POLICY EVALUATION RESULT", res)
+
+    # 11. Exceptions from action proposal do not expose raw internal details
+    def test_exceptions_from_action_proposal_do_not_expose_raw_internal_details(self):
+        """propose_action catches exceptions, logs diagnostics, and returns a safe non-disclosing error."""
+        identity = self._create_identity()
+        subject_id = f"agent_38e_{uuid.uuid4().hex[:6]}"
+
+        # Grant capability
+        grant = AutonomyGrant(
+            grant_id=f"grant_{uuid.uuid4().hex[:8]}",
+            subject_type=SubjectType.AGENT,
+            subject_id=subject_id,
+            autonomy_level=AutonomyLevel.RECOMMEND,
+            tenant_id=identity.tenant_id,
+            workspace_id=identity.workspace_id,
+            plant_id="plant_01",
+            data_mode="REAL",
+            permitted_capabilities=["PROPOSE_ACTION"],
+            created_by="admin_38e",
+        )
+        self.repo.save_grant(grant)
+
+        secret_infrastructure_error = "CRITICAL_STORAGE_EXCEPTION: /mnt/storage/action_store.db write failed with code EIO"
+
+        with patch.object(action_store, "save", side_effect=Exception(secret_infrastructure_error)):
+            with active_autonomy_context(subject_id=subject_id, identity=identity):
+                res = propose_action.invoke({
+                    "action_type": "REORDER_INVENTORY",
+                    "resource_type": "SKU",
+                    "resource_id": "SKU-ERR-TEST",
+                    "plant_id": "plant_01",
+                    "parameters": {"sku_id": "SKU-ERR-TEST", "quantity": 10},
+                    "reason": "Safe error handling test",
+                })
+                self.assertIn("ACTION PROPOSAL FAILED: An internal error occurred while processing the action proposal.", res)
+                self.assertNotIn(secret_infrastructure_error, res)
+                self.assertNotIn("/mnt/storage", res)
+                self.assertNotIn("action_store.db", res)
+                self.assertNotIn("ACTION PROPOSED SUCCESSFULLY", res)
+
+    # 12. Existing Prompt 38A-38D identity, cost, plant, tenant, workspace, and session protections remain intact
+    def test_existing_prompt_38a_38d_protections_remain_intact(self):
+        """Verifies that Prompt 38A, 38B, 38C, and 38D foundational security boundaries remain operational."""
+        # Levels 4 and 5 remain disabled
+        self.assertFalse(AutonomyLevel.LEVEL_4_SUPERVISED_EXECUTION.is_operational)
+        self.assertFalse(AutonomyLevel.LEVEL_5_BOUNDED_AUTONOMY.is_operational)
+
+        # Plant authorization remains fail-closed
+        identity_wrong_plant = self._create_identity(plants=["plant_01"])
+        subject_id = f"agent_38e_{uuid.uuid4().hex[:6]}"
+        with active_autonomy_context(subject_id=subject_id, identity=identity_wrong_plant):
+            res_plant = propose_action.invoke({
+                "action_type": "REORDER_INVENTORY",
+                "resource_type": "SKU",
+                "resource_id": "SKU-38E-PLANT",
+                "plant_id": "plant_99",
+                "parameters": {"sku_id": "SKU-38E-PLANT", "quantity": 5},
+                "reason": "Plant isolation check",
+            })
+            self.assertIn("ACTION PROPOSAL BLOCKED: Unauthorized plant scope", res_plant)
+
+        # Missing workspace fails closed
+        identity_no_ws = self._create_identity()
+        identity_no_ws.workspace_id = None
+        with active_autonomy_context(subject_id=subject_id, identity=identity_no_ws):
+            res_ws = propose_action.invoke({
+                "action_type": "REORDER_INVENTORY",
+                "resource_type": "SKU",
+                "resource_id": "SKU-38E-WS",
+                "plant_id": "plant_01",
+                "parameters": {"sku_id": "SKU-38E-WS", "quantity": 5},
+                "reason": "Workspace isolation check",
+            })
+            self.assertIn("ACTION PROPOSAL BLOCKED: Authenticated identity lacks required workspace scope", res_ws)
+
+        # Tenant isolation in preview
+        act_id = f"act_tenant_iso_{uuid.uuid4().hex[:6]}"
+        self._create_stored_action(act_id, tenant_id="tenant_secret_x")
+        identity_tenant_a = self._create_identity(tenant_id="tenant_p38e")
+        with active_autonomy_context(subject_id=subject_id, identity=identity_tenant_a):
+            res_tenant = preview_action_impact.invoke({"action_id": act_id})
+            self.assertIn("ACTION PREVIEW BLOCKED: Action", res_tenant)
+            self.assertIn("not found", res_tenant)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 

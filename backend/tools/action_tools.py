@@ -5,8 +5,12 @@ Enables LangGraph agents to propose, validate, and simulate structured actions
 without directly generating or executing raw operational SQL statements.
 """
 
+import logging
 from typing import Dict, Any, Optional
 from langchain_core.tools import tool
+
+logger = logging.getLogger("sagecommand.action_tools")
+
 
 try:
     from core.auth import Identity
@@ -280,7 +284,8 @@ def propose_action(
         )
 
     except Exception as e:
-        return f"Failed to propose action: {str(e)}"
+        logger.error("Internal error proposing action: %s", type(e).__name__, exc_info=True)
+        return "ACTION PROPOSAL FAILED: An internal error occurred while processing the action proposal."
 
 
 @tool
@@ -333,11 +338,18 @@ def preview_action_impact(
         if not action:
             return f"ACTION PREVIEW BLOCKED: Action '{action_id}' not found."
 
-        # Validate workspace scope
+        # Validate workspace scope (Prompt 38E: mandatory matching)
         if not auth_workspace or not str(auth_workspace).strip():
             return "ACTION PREVIEW BLOCKED: Authenticated identity lacks required workspace scope."
-        if action.workspace_id and str(action.workspace_id).strip() != str(auth_workspace).strip():
-            return f"ACTION PREVIEW BLOCKED: Workspace scope mismatch. Action '{action_id}' does not belong to workspace '{auth_workspace}'."
+        clean_auth_workspace = str(auth_workspace).strip()
+
+        act_workspace = getattr(action, "workspace_id", None)
+        if not act_workspace or not str(act_workspace).strip():
+            return f"ACTION PREVIEW BLOCKED: Missing stored action workspace scope. Action '{action_id}' lacks a valid workspace."
+        clean_act_workspace = str(act_workspace).strip()
+
+        if clean_act_workspace != clean_auth_workspace:
+            return f"ACTION PREVIEW BLOCKED: Workspace scope mismatch. Action '{action_id}' does not belong to workspace '{clean_auth_workspace}'."
 
         # Validate session scope for session-bound actions
         act_session = getattr(action, "session_id", None)
@@ -374,7 +386,8 @@ def preview_action_impact(
             f"Note: This was a simulated preview. Live state has not been modified."
         )
     except Exception as e:
-        return f"Failed to preview action impact: {str(e)}"
+        logger.error("Internal error previewing action impact: %s", type(e).__name__, exc_info=True)
+        return "ACTION PREVIEW FAILED: An internal error occurred while generating action preview."
 
 
 @tool
@@ -441,26 +454,39 @@ def check_action_policy(
         if not action:
             return f"ACTION POLICY CHECK BLOCKED: Action '{action_id}' not found."
 
-        # Validate workspace scope
+        # Validate workspace scope (Prompt 38E: mandatory matching)
         if not auth_workspace or not str(auth_workspace).strip():
             return "ACTION POLICY CHECK BLOCKED: Authenticated identity lacks required workspace scope."
-        if action.workspace_id and str(action.workspace_id).strip() != str(auth_workspace).strip():
-            return f"ACTION POLICY CHECK BLOCKED: Workspace scope mismatch. Action '{action_id}' does not belong to workspace '{auth_workspace}'."
+        clean_auth_workspace = str(auth_workspace).strip()
 
-        # Validate session scope for session-bound actions
+        act_workspace = getattr(action, "workspace_id", None)
+        if not act_workspace or not str(act_workspace).strip():
+            return f"ACTION POLICY CHECK BLOCKED: Missing stored action workspace scope. Action '{action_id}' lacks a valid workspace."
+        clean_act_workspace = str(act_workspace).strip()
+
+        if clean_act_workspace != clean_auth_workspace:
+            return f"ACTION POLICY CHECK BLOCKED: Workspace scope mismatch. Action '{action_id}' does not belong to workspace '{clean_auth_workspace}'."
+
+        # Validate session scope (Prompt 38E: explicit truthful session representation, no session_default)
         act_session = getattr(action, "session_id", None)
-        if act_session and str(act_session).strip():
-            clean_act_sess = str(act_session).strip()
-            if not auth_session or not str(auth_session).strip():
+        clean_act_sess = str(act_session).strip() if (act_session and str(act_session).strip()) else None
+        clean_auth_sess = str(auth_session).strip() if (auth_session and str(auth_session).strip()) else None
+
+        if clean_act_sess:
+            if not clean_auth_sess:
                 return (
                     f"ACTION POLICY CHECK BLOCKED: Session mismatch. "
                     f"Action '{action_id}' is session-bound, but authenticated identity has no active session."
                 )
-            if str(auth_session).strip() != clean_act_sess:
+            if clean_auth_sess != clean_act_sess:
                 return (
                     f"ACTION POLICY CHECK BLOCKED: Session mismatch. "
                     f"Action '{action_id}' belongs to session '{clean_act_sess}', not '{auth_session}'."
                 )
+
+        effective_session = clean_act_sess or clean_auth_sess
+        if not effective_session:
+            return "ACTION POLICY CHECK BLOCKED: Missing authoritative session scope. Policy evaluation requires a valid session context."
 
         # Validate plant scope
         act_plant = action.target.plant_id if action.target else None
@@ -473,8 +499,8 @@ def check_action_policy(
         # Build PolicyEvaluationContext strictly from trusted identity and authoritative action data
         context = PolicyEvaluationContext(
             tenant_id=auth_tenant,
-            workspace_id=action.workspace_id,
-            session_id=action.session_id or (auth_session or "session_default"),
+            workspace_id=clean_act_workspace,
+            session_id=effective_session,
             user_id=auth_ident.user_id,
             plant_id=act_plant,
             roles=list(auth_ident.roles or []),
@@ -494,5 +520,6 @@ def check_action_policy(
             f"Reason Codes: {', '.join(decision.reason_codes)}"
         )
     except Exception as e:
-        return f"Failed to check action policy: {str(e)}"
+        logger.error("Internal error checking action policy: %s", type(e).__name__, exc_info=True)
+        return "ACTION POLICY CHECK FAILED: An internal error occurred while evaluating action policy."
 
