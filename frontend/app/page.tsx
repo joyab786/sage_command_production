@@ -27,6 +27,8 @@ import DecisionEngineModal from "./components/DecisionEngineModal";
 import EvidenceExplainabilityModal from "./components/EvidenceExplainabilityModal";
 import ConfidenceUncertaintyModal from "./components/ConfidenceUncertaintyModal";
 import AutonomyModal from "./components/AutonomyModal";
+import OutcomeLearningModal from "./components/OutcomeLearningModal";
+
 
 
 export default function ObsidianCommandCenter() {
@@ -100,6 +102,10 @@ export default function ObsidianCommandCenter() {
 
   // --- AUTONOMY LEVELS & GUARDED DELEGATION STATE (Prompt 38) ---
   const [showAutonomyModal, setShowAutonomyModal] = useState(false);
+
+  // --- CLOSED-LOOP OUTCOME LEARNING STATE (Prompt 39) ---
+  const [showOutcomeLearningModal, setShowOutcomeLearningModal] = useState(false);
+
 
 
   // --- SECURITY INTRUSION ALERT STATE ---
@@ -432,7 +438,9 @@ export default function ObsidianCommandCenter() {
         onExplainabilityClick={() => setShowEvidenceExplainabilityModal(true)}
         onConfidenceClick={() => setShowConfidenceModal(true)}
         onAutonomyClick={() => setShowAutonomyModal(true)}
+        onOutcomeLearningClick={() => setShowOutcomeLearningModal(true)}
         onHardwareVisionClick={() => imageInputRef.current?.click()}
+
         onCoreScanClick={triggerScan}
         onRoleChange={setUserRole}
       />
@@ -592,6 +600,12 @@ export default function ObsidianCommandCenter() {
         isOpen={showAutonomyModal}
         onClose={() => setShowAutonomyModal(false)}
       />
+
+      <OutcomeLearningModal
+        isOpen={showOutcomeLearningModal}
+        onClose={() => setShowOutcomeLearningModal(false)}
+      />
     </div>
+
   );
 }

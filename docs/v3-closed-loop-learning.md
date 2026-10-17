@@ -496,3 +496,74 @@ To protect legitimate callbacks running longer than the initial lease:
 - **Crash Recovery:** If a worker crashes or is cancelled, the heartbeat terminates immediately. Once `lease_expires_at` elapses, background sweepers or queue workers reclaim the delivery under a new claim token.
 - **At-Least-Once Delivery Truthfulness:** If a subscriber performs non-idempotent external actions before crashing prior to SQLite commit, the delivery will eventually be retried. SageCommand does not claim impossible distributed exactly-once side effects; subscribers rely on `delivery.idempotency_key` for deduplication.
 
+---
+
+## 17. Outcome Evaluation, Prediction Accuracy & Governed Feedback (Prompt 39)
+
+### 17.1 Conceptual Distinctions & Mission Scope
+Prompt 39 elevates SageCommand's Closed-Loop Learning from merely recording verification feedback toward an evidence-driven, governed operational evaluation layer.
+Four critical operational concepts remain strictly segregated:
+1. **Recording Verification Feedback:** Capturing that an operational event triggered a verification run and preserving the run ID and finding references (`verification_feedback_records`).
+2. **Evaluating Outcomes:** Comparing a previously recorded, immutable expectation against an eligible, verified observation deterministically (`prediction_outcome_evaluations`).
+3. **Using Historical Context:** Exposing properly scoped, aggregate historical prediction performance and directional tendencies as read-only decision support for future planning (`GovernedLearningContext`).
+4. **Training or Modifying Models:** Modifying neural network weights, fine-tuning LLMs, altering policy rules, or updating machine parameters. **This remains STRICTLY OUT OF SCOPE in Prompt 39.**
+
+### 17.2 Architecture & Lifecycle Flow
+```mermaid
+flowchart TD
+    PO[Operational Observation / Prediction] --> PS[Immutable PredictionSnapshot]
+    PS --> GP[Governed Operational Process]
+    GP --> EV[Continuous Verification Engine]
+    EV --> OE[Authoritative Outcome Evidence]
+    OE --> OO[ObservedOutcome Record]
+    OO --> EP[13-Point Eligibility Policy Engine]
+    EP -->|Ineligible / Unverified| DV[DEFERRED / REJECTED Evaluation]
+    EP -->|Eligible & Verified| EVR[Deterministic Evaluator]
+    EVR --> AR[Append-Only PredictionOutcomeEvaluation]
+    AR --> AG[Bounded Metrics Aggregator]
+    AG --> CTX[Governed Read-Only Learning Context]
+    CTX --> DS[Future Decision-Support Processes]
+    AR --> EB[Canonical EventBus: prediction.evaluated]
+    EB --> LG[Loop Guard: Drop closed_loop_evaluator]
+```
+
+### 17.3 Deterministic 13-Point Outcome Eligibility Policy
+An outcome is never evaluated or promoted to learning context via LLM guesswork. Before evaluation, the system deterministically validates:
+1. **Prediction Existence:** Prediction snapshot must exist within the caller's tenant and workspace.
+2. **Authorized Scope:** Requesting identity must possess assigned plant access and tenant authorization.
+3. **Schema & Domain Validity:** Supported prediction type (`DEMAND_FORECAST`, `RECOVERY_DURATION`, `MAINTENANCE_RISK`, `OPERATIONAL_COST`, `MISSION_CRITERION`, `ENERGY_CONSUMPTION`, `PRODUCTION_THROUGHPUT`).
+4. **Temporal Ordering:** Prediction must be recorded BEFORE the outcome's observation timestamp (subject to configured 60-second clock skew tolerance). Rejects post-hoc predictions.
+5. **Target Linkage:** Outcome must reference the prediction or share the identical canonical target reference.
+6. **Multi-Scope Alignment:** Tenant, workspace, and plant scopes must match between prediction and outcome.
+7. **Source Evidence Accessibility:** Referenced verification runs or telemetry sources must exist and resolve.
+8. **Authoritative Verification State:** Distinguishes `OBSERVED`, `VERIFIED`, `UNVERIFIED`, `INDETERMINATE`, and `REJECTED`. Only `VERIFIED` outcomes qualify as eligible for learning.
+9. **Evaluation Window Bounds:** Observation time must fall within `evaluation_window_start` and `evaluation_window_end` if specified.
+10. **Data Mode Compatibility:** Real outcomes cannot evaluate simulation predictions; simulation data cannot contaminate real-world learning (`REAL`, `SIMULATION`, `HYBRID`).
+11. **Evidence Invalidation:** Invalidation flags (`is_invalidated=True`) immediately disqualify the outcome.
+12. **Idempotency & Deduplication:** Prevents duplicate authoritative evaluations across redeliveries or concurrent workers.
+13. **Resource & Payload Limits:** Validates payload sizes against configured `SAGE_OUTCOME_EVALUATION_MAX_PAYLOAD_BYTES`.
+
+### 17.4 Mathematical Evaluation & Honest Uncertainty
+For supported numeric domains:
+- Absolute error: $e_{\mathrm{abs}} = |y - \hat{y}|$
+- Signed error: $e_{\mathrm{signed}} = y - \hat{y}$
+- Relative error: $e_{\mathrm{rel}} = \frac{|y - \hat{y}|}{|y|}$ (when $y \neq 0$; explicitly `None` when $y = 0$).
+- Directional bias: `OVER_PREDICTED` ($\hat{y} > y$), `UNDER_PREDICTED` ($\hat{y} < y$), `MATCHED` ($\hat{y} = y$).
+- Categorical / Boolean: Exact match comparisons only; numeric formulas are never misapplied to categories.
+
+### 17.5 Bounded Aggregate Metrics & Minimum Sample Thresholding
+Historical aggregates (`AggregateMetricsSummary`):
+- `sample_status`: Reports `INSUFFICIENT_DATA` when eligible evaluations are below configured `min_sample_threshold` (default 5).
+- MAE, RMSE, MAPE, signed mean error (bias), and exact match rate.
+- Never combines incompatible prediction types, units, plants, or data modes.
+
+### 17.6 Governed Read-Only Decision-Support Context
+`GovernedLearningContext` supplies future estimators with historical empirical accuracy:
+- Mean absolute error and historical bias.
+- Explicit limitations and data freshness indicators.
+- Strictly read-only: Historical context is evidence for human or decision-support context, NEVER an execution grant or automatic policy override.
+
+### 17.7 Persistence & Idempotency Invariants
+- Stored in SQLite WAL tables: `prediction_snapshots`, `observed_outcomes`, `prediction_outcome_evaluations`.
+- Idempotency enforced by unique `idempotency_key` and partial unique index on canonical pairs where `prior_evaluation_id IS NULL AND reevaluation_reason IS NULL`.
+- Re-evaluations create append-only records linking to `prior_evaluation_id`. Historical records are never overwritten.

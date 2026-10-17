@@ -186,3 +186,42 @@ class VerificationFeedbackRecord(BaseModel):
     @classmethod
     def validate_f_id(cls, v: str) -> str:
         return validate_identifier(v, "feedback_id")
+
+
+# =============================================================================
+# 4. PROMPT 39 OUTCOME LEARNING CONTRACTS RE-EXPORT
+# =============================================================================
+try:
+    from data.schemas.outcome_learning_contract import (
+        PredictionType,
+        OutcomeVerificationStatus,
+        OutcomeEligibilityStatus,
+        OutcomeEligibilityReason,
+        EvaluationStatus,
+        DirectionalBias,
+        DataMode,
+        PredictionSnapshot,
+        ObservedOutcome,
+        PredictionOutcomeEvaluation,
+        AggregateMetricsSummary,
+        GovernedLearningContext,
+        EVALUATION_POLICY_VERSION,
+        METRIC_IMPLEMENTATION_VERSION,
+    )
+except (ImportError, ModuleNotFoundError):
+    from backend.data.schemas.outcome_learning_contract import (
+        PredictionType,
+        OutcomeVerificationStatus,
+        OutcomeEligibilityStatus,
+        OutcomeEligibilityReason,
+        EvaluationStatus,
+        DirectionalBias,
+        DataMode,
+        PredictionSnapshot,
+        ObservedOutcome,
+        PredictionOutcomeEvaluation,
+        AggregateMetricsSummary,
+        GovernedLearningContext,
+        EVALUATION_POLICY_VERSION,
+        METRIC_IMPLEMENTATION_VERSION,
+    )

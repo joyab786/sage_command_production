@@ -224,6 +224,15 @@ CANONICAL_PERMISSIONS: List[Permission] = [
     Permission(permission_id="autonomy.grant", resource="autonomy", action="grant", description="Create, update, suspend, or revoke autonomy grants", is_sensitive=True),
     Permission(permission_id="autonomy.admin", resource="autonomy", action="admin", description="Full administrative authority over autonomy grants and profiles", is_sensitive=True),
 
+    # Closed-Loop Outcome Learning Foundation (Prompt 39)
+    Permission(permission_id="learning.prediction.record", resource="learning", action="prediction.record", description="Record immutable prediction snapshot"),
+    Permission(permission_id="learning.prediction.read", resource="learning", action="prediction.read", description="Read prediction snapshots"),
+    Permission(permission_id="learning.outcome.record", resource="learning", action="outcome.record", description="Record observed outcome"),
+    Permission(permission_id="learning.outcome.read", resource="learning", action="outcome.read", description="Read observed outcomes"),
+    Permission(permission_id="learning.evaluation.evaluate", resource="learning", action="evaluation.evaluate", description="Evaluate prediction against observed outcome"),
+    Permission(permission_id="learning.evaluation.read", resource="learning", action="evaluation.read", description="Read outcome evaluations, aggregate metrics, and learning context"),
+
+
     # System Administration (Strictly Non-Operational)
     Permission(permission_id="user.manage", resource="user", action="manage", description="Create, update, or suspend user identities", is_sensitive=True),
     Permission(permission_id="system.config", resource="system", action="config", description="Configure platform infrastructure and endpoints", is_sensitive=True),
@@ -261,7 +270,7 @@ SYSTEM_ROLES: List[Role] = [
         role_id="VIEWER",
         name="Viewer",
         scope_type=RoleScopeType.SYSTEM,
-        permissions=["telemetry.read", "database.read", "action.read", "policy.read", "transaction.read", "ontology.read", "knowledge_graph.read", "digital_twin.read", "data_quality.read", "incidents.read", "rca.read", "blast_radius.read", "demand_forecasting.read", "supplier_risk.read", "sensor_fusion.read", "what_if_simulation.read", "optimization.read", "decision_engine.read", "evidence_explainability.read", "confidence_uncertainty.read", "sop_rag.read", "memory.read", "mission.read", "mission.verification.read", "events.read", "events.dispatch.read", "autonomy.read"],
+        permissions=["telemetry.read", "database.read", "action.read", "policy.read", "transaction.read", "ontology.read", "knowledge_graph.read", "digital_twin.read", "data_quality.read", "incidents.read", "rca.read", "blast_radius.read", "demand_forecasting.read", "supplier_risk.read", "sensor_fusion.read", "what_if_simulation.read", "optimization.read", "decision_engine.read", "evidence_explainability.read", "confidence_uncertainty.read", "sop_rag.read", "memory.read", "mission.read", "mission.verification.read", "events.read", "events.dispatch.read", "autonomy.read", "learning.prediction.read", "learning.outcome.read", "learning.evaluation.read"],
         inherits_from=[],
         description="Read-only observer access to telemetry, action states, and policy rules.",
         is_system_role=True
@@ -270,7 +279,7 @@ SYSTEM_ROLES: List[Role] = [
         role_id="ANALYST",
         name="Analyst",
         scope_type=RoleScopeType.SYSTEM,
-        permissions=["sql.analyze", "action.simulate", "transaction.validate", "digital_twin.scenario", "data_quality.assess", "demand_forecasting.analyze", "demand_forecasting.evaluate", "supplier_risk.analyze", "supplier_risk.history", "sensor_fusion.analyze", "sensor_fusion.evaluate", "what_if_simulation.analyze", "what_if_simulation.evaluate", "optimization.analyze", "optimization.evaluate", "decision_engine.evaluate", "evidence_explainability.explain", "evidence_explainability.validate", "confidence_uncertainty.assess", "confidence_uncertainty.validate", "sop_rag.query", "mission.validate", "mission.verification.request", "autonomy.evaluate"],
+        permissions=["sql.analyze", "action.simulate", "transaction.validate", "digital_twin.scenario", "data_quality.assess", "demand_forecasting.analyze", "demand_forecasting.evaluate", "supplier_risk.analyze", "supplier_risk.history", "sensor_fusion.analyze", "sensor_fusion.evaluate", "what_if_simulation.analyze", "what_if_simulation.evaluate", "optimization.analyze", "optimization.evaluate", "decision_engine.evaluate", "evidence_explainability.explain", "evidence_explainability.validate", "confidence_uncertainty.assess", "confidence_uncertainty.validate", "sop_rag.query", "mission.validate", "mission.verification.request", "autonomy.evaluate", "learning.evaluation.evaluate"],
         inherits_from=["VIEWER"],
         description="Analytical access including query analysis, simulation preview, and data exploration.",
         is_system_role=True
@@ -285,7 +294,7 @@ SYSTEM_ROLES: List[Role] = [
             "incidents.create", "incidents.acknowledge", "incidents.transition", "incidents.update",
             "incidents.assign", "incidents.evidence.write", "incidents.notes.write", "rca.analyze",
             "blast_radius.analyze", "sop_rag.ingest", "memory.write", "mission.create", "mission.update", "mission.cancel", "mission.verification.cancel",
-            "events.record"
+            "events.record", "learning.outcome.record"
         ],
         inherits_from=["ANALYST"],
         description="Line operator authorized to propose and execute structured operational actions on assigned plant lines.",
@@ -322,7 +331,7 @@ SYSTEM_ROLES: List[Role] = [
         role_id="PLANT_MANAGER",
         name="Plant Manager",
         scope_type=RoleScopeType.PLANT,
-        permissions=["action.approve", "production.schedule", "transaction.rollback", "ontology.manage", "knowledge_graph.manage", "digital_twin.manage", "data_quality.manage", "incidents.admin", "rca.admin", "blast_radius.admin", "sop_rag.ingest", "sop_rag.admin", "memory.verify", "memory.admin", "mission.review", "mission.admin", "mission.verification.cancel", "autonomy.grant"],
+        permissions=["action.approve", "production.schedule", "transaction.rollback", "ontology.manage", "knowledge_graph.manage", "digital_twin.manage", "data_quality.manage", "incidents.admin", "rca.admin", "blast_radius.admin", "sop_rag.ingest", "sop_rag.admin", "memory.verify", "memory.admin", "mission.review", "mission.admin", "mission.verification.cancel", "autonomy.grant", "learning.prediction.record"],
         inherits_from=["OPERATOR", "SAFETY_MANAGER", "SUPPLY_CHAIN_MANAGER"],
         description="Senior plant authority responsible for approving high-risk actions, production schedules, and transaction rollbacks.",
         is_system_role=True
@@ -346,7 +355,8 @@ SYSTEM_ROLES: List[Role] = [
             "mission.read", "mission.create", "mission.update", "mission.validate", "mission.review", "mission.cancel", "mission.admin",
             "mission.verification.read", "mission.verification.request", "mission.verification.cancel",
             "events.record", "events.read", "events.dispatch.read",
-            "autonomy.read", "autonomy.grant", "autonomy.admin"
+            "autonomy.read", "autonomy.grant", "autonomy.admin",
+            "learning.prediction.record", "learning.prediction.read", "learning.outcome.record", "learning.outcome.read", "learning.evaluation.evaluate", "learning.evaluation.read"
         ],
         inherits_from=["VIEWER"],
         description="Platform administrator. Strictly non-operational; cannot propose or approve factory actions.",

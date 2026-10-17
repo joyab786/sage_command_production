@@ -1,7 +1,7 @@
 "use client";
 import React from "react";
 import { motion } from "framer-motion";
-import { Activity, Terminal, Database, Search, FileText, Layers, Network, Box, ShieldAlert, Compass, ShieldCheck } from "lucide-react";
+import { Activity, Terminal, Database, Search, FileText, Layers, Network, Box, ShieldAlert, Compass, ShieldCheck, Scale } from "lucide-react";
 
 
 interface OmniHeaderProps {
@@ -33,10 +33,12 @@ interface OmniHeaderProps {
   onExplainabilityClick?: () => void;
   onConfidenceClick?: () => void;
   onAutonomyClick?: () => void;
+  onOutcomeLearningClick?: () => void;
   onHardwareVisionClick: () => void;
   onCoreScanClick: () => void;
   onRoleChange: (role: "operator" | "manager") => void;
 }
+
 
 export default function OmniHeader({
   systemStatus,
@@ -67,10 +69,12 @@ export default function OmniHeader({
   onExplainabilityClick,
   onConfidenceClick,
   onAutonomyClick,
+  onOutcomeLearningClick,
   onHardwareVisionClick,
   onCoreScanClick,
   onRoleChange,
 }: OmniHeaderProps) {
+
 
   const isOnline = systemStatus === "ONLINE";
 
@@ -301,6 +305,17 @@ export default function OmniHeader({
           icon={<ShieldCheck className="w-3 h-3 text-cyan-300" />}
           label="Autonomy"
         />
+
+        {/* Closed-Loop Outcome Learning (Prompt 39) */}
+        <HeaderButton
+          onClick={onOutcomeLearningClick || (() => {})}
+          active={false}
+          activeClass=""
+          className="border-emerald-500/30 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20"
+          icon={<Scale className="w-3 h-3 text-emerald-300" />}
+          label="Learning"
+        />
+
 
 
         {/* Hardware Vision */}

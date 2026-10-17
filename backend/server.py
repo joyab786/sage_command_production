@@ -52,13 +52,17 @@ try:
     from api.mission_routes import router as mission_router
     from api.verification_routes import router as verification_router, feedback_router
     from api.autonomy_routes import router as autonomy_router
+    from api.outcome_learning_routes import router as outcome_learning_router
+    from services.outcome_learning_event_handler import outcome_learning_event_handler
     from services.event_bus import get_event_bus
     from services.verification_trigger_coordinator import get_verification_trigger_coordinator
     from core.config import (
         SAGE_CLOSED_LOOP_ENABLED,
         SAGE_VERIFICATION_EVENT_TRIGGER_ENABLED,
         SAGE_CLOSED_LOOP_SUBSCRIPTION_SCOPES,
+        SAGE_OUTCOME_EVALUATION_ENABLED,
     )
+
 
 except (ImportError, ModuleNotFoundError):
     from backend.core.config import SAGE_ALLOWED_ORIGINS, IS_PRODUCTION
@@ -103,13 +107,17 @@ except (ImportError, ModuleNotFoundError):
     from backend.api.mission_routes import router as mission_router
     from backend.api.verification_routes import router as verification_router, feedback_router
     from backend.api.autonomy_routes import router as autonomy_router
+    from backend.api.outcome_learning_routes import router as outcome_learning_router
+    from backend.services.outcome_learning_event_handler import outcome_learning_event_handler
     from backend.services.event_bus import get_event_bus
     from backend.services.verification_trigger_coordinator import get_verification_trigger_coordinator
     from backend.core.config import (
         SAGE_CLOSED_LOOP_ENABLED,
         SAGE_VERIFICATION_EVENT_TRIGGER_ENABLED,
         SAGE_CLOSED_LOOP_SUBSCRIPTION_SCOPES,
+        SAGE_OUTCOME_EVALUATION_ENABLED,
     )
+
 
 
 app = FastAPI(title="SageCommand V3 Industrial Operations AI OS")
@@ -183,6 +191,11 @@ async def startup_event():
     else:
         print(" [Server Startup] Closed-loop event-triggered verification is disabled by configuration.")
 
+    if SAGE_OUTCOME_EVALUATION_ENABLED:
+        print(" [Server Startup] Registering Closed-Loop Outcome Learning Event Handler...")
+        outcome_learning_event_handler.register_subscriptions()
+
+
 @app.on_event("shutdown")
 async def shutdown_event():
     """Gracefully shuts down background services."""
@@ -227,6 +240,8 @@ app.include_router(mission_router)
 app.include_router(verification_router)
 app.include_router(feedback_router)
 app.include_router(autonomy_router)
+app.include_router(outcome_learning_router)
+
 
 
 # BOOT SEQUENCE
