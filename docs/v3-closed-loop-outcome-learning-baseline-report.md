@@ -67,6 +67,7 @@ Prompt 39 builds directly upon the established Prompt 37 Closed-Loop Learning Fo
 7. **Feedback Loop Guard:** Canonical events emitted by the evaluator use provenance `closed_loop_evaluator`. The event listener explicitly drops these events to break recursion loops.
 8. **Administrative Revalidation Authorization Boundary:** Revalidation endpoint `POST /api/v3/learning/evaluations/revalidate` and service method require dedicated sensitive permission `learning.evaluation.revalidate`, granted exclusively to `ADMINISTRATOR`. Ordinary evaluators, operators, and viewers are blocked (403 Forbidden). Scope restrictions (tenant, workspace, plant) are strictly enforced, and administrative privilege cannot bypass authoritative verification requirements.
 9. **Fail-Closed Plant Scope Enforcement:** Empty or missing plant assignment lists (`assigned_plants=[]` or `None`) are strictly denied rather than falling back to wildcard access. Explicit wildcard `["*"]` is required to access all plants. Unauthorized plant revalidation attempts produce zero mutations.
+10. **Persistence Query Boundary Plant Scope Enforcement:** Revalidation queries never fetch records outside caller's authorized plant scope even temporarily before in-memory filtering. Multi-plant callers query each authorized plant separately at persistence boundary (`AND plant_id = ?`) and combine deterministically with overall limit enforcement.
 
 ---
 
@@ -74,13 +75,13 @@ Prompt 39 builds directly upon the established Prompt 37 Closed-Loop Learning Fo
 
 ### 1. Focused Prompt 39 Test Suite
 Command: `python -m pytest backend/test_v3_closed_loop_outcome_evaluation.py -q`
-- **Total Tests:** 126
-- **Passed:** 126 (100%)
+- **Total Tests:** 136
+- **Passed:** 136 (100%)
 - **Failed:** 0
 - **Skipped:** 0
-- **Execution Time:** ~16.8 seconds
+- **Execution Time:** ~20.4 seconds
 
-Coverage across Groups A–I:
+Coverage across Groups A–M:
 - Group A: Prediction Contract (Tests 1–10) — Valid numeric/categorical snapshots, type validation, unit validation, evaluation window, scope check, immutability, timing order.
 - Group B: Outcome Integrity & Scope (Tests 11–24) — Unverified vs verified semantics, missing/invalidated evidence, future-dated events, cross-tenant/workspace/plant isolation, client-forged verifications, data-mode mismatch.
 - Group C: Evaluation Correctness & Metrics (Tests 25–38) — Absolute error, signed error, relative error, zero-denominator safety, unit mismatch, missing numeric values, exact match, directional bias (`OVER_PREDICTED`, `UNDER_PREDICTED`, `MATCHED`), evaluation window boundaries, immutability after evaluation.
@@ -93,6 +94,7 @@ Coverage across Groups A–I:
 - Group J: Prompt 39 Security Regression (Tests 91–109) — Fabricated verification reference rejection, random reference learning-ineligibility, valid run/finding resolution, non-existent run/finding handling, cross-tenant/workspace/plant reference isolation, diagnostic-only exclusion, failed/invalidated evidence exclusion, admin evidence requirement, non-privileged reference validation, unrelated finding rejection, API forged status rejection, metrics and governed context pollution guards, EventBus redelivery verification, historical revalidation remediation.
 - Group K: Prompt 39 Correction 2 Security Regression (Tests 110–119) — Dedicated permission enforcement, ordinary evaluator prohibition (403), operator prohibition (403), viewer prohibition (403), authorized administrator revalidation, unauthorized eligibility mutation prevention, denied request mutation immunity, tenant/workspace/plant scope isolation, preservation of ordinary prediction evaluation, EventBus administrative privilege exclusion, administrative verification proof requirement.
 - Group L: Prompt 39 Correction 3 Security Regression (Tests 120–126) — Empty plant assignment revalidation rejection, missing/None plant assignment fail-closed, single-plant admin cross-plant prohibition, explicit wildcard admin behavior preservation, denied plant revalidation mutation immunity, tenant and workspace scope preservation with plant boundaries, regression compatibility for existing authorized revalidation and ordinary prediction evaluation.
+- Group M: Prompt 39 Correction 4 Security Regression (Tests 127–136) — Identity assigned only to `plant_01` never queries all plants at persistence boundary, query for unauthorized plant denied before repo is queried, empty/missing assignments denied before repo query, authorized wildcard bounded query preservation, multi-plant assignments query only authorized plants, overall limit enforcement across plants, deterministic ordering and deduplication, denied requests zero mutation guarantee, tenant/workspace isolation preservation, and regression compatibility for authoritative verification and ordinary evaluation.
 
 ### 2. Regression Test Suites
 - **Existing Closed-Loop Learning Suite:** `pytest backend/test_v3_closed_loop_learning.py -q`
@@ -101,6 +103,8 @@ Coverage across Groups A–I:
   - **Results:** 128 passed, 0 failed (100% green)
 - **Autonomy Governance Suite:** `pytest backend/test_v3_autonomy.py -q`
   - **Results:** 111 passed, 0 failed (100% green)
+- **Security & Authorization Suites:** `pytest backend/test_v3_security.py backend/test_v3_security_integration.py backend/test_v3_authorization.py -q`
+  - **Results:** 49 passed, 0 failed (100% green)
 
 ### 3. Frontend Build & TypeScript Validation
 Command: `npm run build` in `frontend/`

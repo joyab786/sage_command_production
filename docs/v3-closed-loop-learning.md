@@ -590,3 +590,8 @@ To prevent unauthorized manipulation of historical metrics:
    - Empty or missing plant assignments (`assigned_plants=[]` or `None`) never silently fall back to wildcard access.
    - Wildcard plant access is honored ONLY when `"*"` is explicitly present in the authoritative identity.
    - Unassigned identities or identities requesting an unauthorized plant are denied fail-closed before any database query or mutation occurs.
+6. **Persistence Query Boundary Plant Scope Enforcement (Prompt 39 Correction 4):**
+   - Plant authorization strictly constrains the persistence query itself, not merely filtering records after retrieval.
+   - Explicit `plant_id` requests validate access before querying only that specific plant (`AND plant_id = ?`).
+   - Requests without a specified plant query only explicitly assigned plants individually at the repository boundary, combining results deterministically (`evaluated_at DESC, evaluation_id ASC`) with overall `limit` enforcement.
+   - Cross-plant records outside caller's authorized plant scope are never fetched into memory, preventing data exposure at the persistence query boundary.

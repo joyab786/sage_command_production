@@ -1027,18 +1027,54 @@ class OutcomeEvaluationService:
                 f"Authorization denied for historical revalidation: {reason_msg}"
             )
 
-        # 2. Scope checks
-        assigned_plants = getattr(identity, "assigned_plants", None)
-        if assigned_plants is None:
-            assigned_plants = []
+        # 2. Scope checks and persistence query boundary enforcement
+        raw_assigned_plants = getattr(identity, "assigned_plants", None)
+        if raw_assigned_plants is None:
+            assigned_plants: List[str] = []
+        elif isinstance(raw_assigned_plants, str):
+            assigned_plants = [raw_assigned_plants]
+        else:
+            try:
+                assigned_plants = list(raw_assigned_plants)
+            except Exception:
+                assigned_plants = []
 
-        clean_plant_id = plant_id.strip() if plant_id and plant_id.strip() else None
+        clean_plant_id = plant_id.strip() if plant_id and isinstance(plant_id, str) and plant_id.strip() else None
+        has_wildcard = any(isinstance(p, str) and p.strip() == "*" for p in assigned_plants)
+        distinct_assigned_plants = sorted(list(set(
+            p.strip() for p in assigned_plants
+            if isinstance(p, str) and p.strip() and p.strip() != "*"
+        )))
 
         if clean_plant_id:
-            self._validate_plant_access(identity, clean_plant_id)
+            # 1. If plant_id is explicitly requested, validate access first, then query only that plant.
+            try:
+                self._validate_plant_access(identity, clean_plant_id)
+            except OutcomeEvaluationScopeMismatchError as exc:
+                self._log_audit_event(
+                    "HISTORICAL_REVALIDATION_PLANT_SCOPE_DENIED",
+                    identity,
+                    {
+                        "requested_plant_id": clean_plant_id,
+                        "assigned_plants": assigned_plants,
+                        "reason": str(exc),
+                    },
+                )
+                raise
+            evals = self.repository.list_evaluations(
+                tenant_id=identity.tenant_id,
+                workspace_id=identity.workspace_id,
+                plant_id=clean_plant_id,
+                eligible_only=True,
+                limit=limit,
+            )
+            # Ensure deterministic order and enforce limit
+            evals.sort(key=lambda ev: ev.evaluation_id or "")
+            evals.sort(key=lambda ev: ev.evaluated_at or "", reverse=True)
+            evals = evals[:limit]
         else:
-            # If no plant is explicitly requested, caller must possess explicit plant assignments or authorized wildcard
-            if not assigned_plants or len(assigned_plants) == 0:
+            # 2. If no plant is requested, caller must possess explicit plant assignments or authorized wildcard
+            if not has_wildcard and not distinct_assigned_plants:
                 self._log_audit_event(
                     "HISTORICAL_REVALIDATION_PLANT_SCOPE_DENIED",
                     identity,
@@ -1050,16 +1086,41 @@ class OutcomeEvaluationService:
                     f"Plant scope denied: identity '{identity.user_id}' has no assigned plants or wildcard access."
                 )
 
-        evals = self.repository.list_evaluations(
-            tenant_id=identity.tenant_id,
-            workspace_id=identity.workspace_id,
-            plant_id=clean_plant_id,
-            eligible_only=True,
-            limit=limit,
-        )
+            if has_wildcard:
+                # Explicit authorized wildcard ("*"): preserve existing bounded all-plants query
+                evals = self.repository.list_evaluations(
+                    tenant_id=identity.tenant_id,
+                    workspace_id=identity.workspace_id,
+                    plant_id=None,
+                    eligible_only=True,
+                    limit=limit,
+                )
+                evals.sort(key=lambda ev: ev.evaluation_id or "")
+                evals.sort(key=lambda ev: ev.evaluated_at or "", reverse=True)
+                evals = evals[:limit]
+            else:
+                # Explicit plant assignments: query each authorized plant separately at persistence boundary
+                seen_eval_ids = set()
+                combined_evals: List[PredictionOutcomeEvaluation] = []
+                for p_id in distinct_assigned_plants:
+                    self._validate_plant_access(identity, p_id)
+                    p_evals = self.repository.list_evaluations(
+                        tenant_id=identity.tenant_id,
+                        workspace_id=identity.workspace_id,
+                        plant_id=p_id,
+                        eligible_only=True,
+                        limit=limit,
+                    )
+                    for ev in p_evals:
+                        if ev.plant_id == p_id and ev.evaluation_id not in seen_eval_ids:
+                            seen_eval_ids.add(ev.evaluation_id)
+                            combined_evals.append(ev)
 
-        if "*" not in assigned_plants:
-            evals = [ev for ev in evals if ev.plant_id in assigned_plants]
+                # Deterministic ordering across all plants: primary evaluated_at DESC, secondary evaluation_id ASC
+                combined_evals.sort(key=lambda ev: ev.evaluation_id or "")
+                combined_evals.sort(key=lambda ev: ev.evaluated_at or "", reverse=True)
+                # Enforce overall limit across all assigned plants, not independently per plant
+                evals = combined_evals[:limit]
 
         total_checked = len(evals)
         corrected_count = 0
@@ -1146,9 +1207,11 @@ class OutcomeEvaluationService:
         assigned = getattr(identity, "assigned_plants", None)
         if assigned is None:
             assigned = []
-        if "*" in assigned:
+        clean_assigned = [p.strip() for p in assigned if isinstance(p, str) and p.strip()]
+        if "*" in clean_assigned:
             return
-        if not assigned or plant_id not in assigned:
+        target_plant = plant_id.strip() if plant_id and isinstance(plant_id, str) else plant_id
+        if not clean_assigned or target_plant not in clean_assigned:
             raise OutcomeEvaluationScopeMismatchError(
                 f"Plant access denied: plant '{plant_id}' is not in assigned plants {assigned}."
             )

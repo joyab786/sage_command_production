@@ -4794,3 +4794,451 @@ def test_126_existing_authorized_revalidation_and_ordinary_evaluation_continue_w
     report = service.revalidate_historical_evaluations(admin_identity, plant_id="plant_01")
     assert report["plant_id"] == "plant_01"
     assert report["tenant_id"] == admin_identity.tenant_id
+
+
+# =============================================================================
+# GROUP M: ENFORCE PLANT SCOPE AT THE PERSISTENCE QUERY BOUNDARY (Prompt 39 Correction 4)
+# =============================================================================
+
+def _create_scoped_test_eval(
+    repo,
+    eval_id: str,
+    plant_id: str,
+    evaluated_at: str,
+    tenant_id: str = "tenant_alpha",
+    workspace_id: str = "workspace_prod",
+    eligible: bool = True,
+):
+    """Helper to record a prediction outcome evaluation with specific plant and timestamp."""
+    ev = PredictionOutcomeEvaluation(
+        evaluation_id=eval_id,
+        schema_version="3.0.0",
+        tenant_id=tenant_id,
+        workspace_id=workspace_id,
+        plant_id=plant_id,
+        idempotency_key=f"idem_{eval_id}",
+        prediction_id=f"pred_{eval_id}",
+        outcome_id=f"outc_{eval_id}",
+        evaluation_status=EvaluationStatus.EVALUATED,
+        eligibility_reason="ELIGIBLE",
+        evaluation_policy_version="1.0.0",
+        metric_implementation_version="1.0.0",
+        prediction_type=PredictionType.DEMAND_FORECAST,
+        target_reference=f"target_{eval_id}",
+        predicted_value=100.0,
+        observed_value=105.0,
+        unit="units",
+        comparison_semantics="NUMERIC_ERROR",
+        absolute_error=5.0,
+        verification_reference=f"vref_{eval_id}",
+        eligible_for_learning=eligible,
+        provenance="test",
+        evaluated_at=evaluated_at,
+    )
+    repo.record_evaluation(ev)
+    return ev
+
+
+def test_127_identity_assigned_only_to_plant_01_never_causes_query_for_all_plants(temp_db):
+    """127. An identity assigned only to plant_01 never causes a query for all plants at the boundary."""
+    repo, service = temp_db
+    _create_scoped_test_eval(repo, "eval_127_p1", "plant_01", "2026-10-18T10:00:00Z")
+    _create_scoped_test_eval(repo, "eval_127_p2", "plant_02", "2026-10-18T10:00:00Z")
+
+    admin_p1 = Identity(
+        user_id="user_admin_p1_boundary",
+        tenant_id="tenant_alpha",
+        workspace_id="workspace_prod",
+        roles=["ADMINISTRATOR"],
+        permissions=["learning.evaluation.revalidate"],
+        assigned_plants=["plant_01"],
+        clearance_level=3,
+        is_server_authoritative=True,
+    )
+
+    captured_calls = []
+    orig_list_evaluations = repo.list_evaluations
+
+    def spy_list_evaluations(*args, **kwargs):
+        captured_calls.append({"args": args, "kwargs": kwargs})
+        return orig_list_evaluations(*args, **kwargs)
+
+    service.repository.list_evaluations = spy_list_evaluations
+
+    # Call historical revalidation without explicit plant_id
+    service.revalidate_historical_evaluations(admin_p1)
+
+    # Must invoke list_evaluations with plant_id="plant_01" and NEVER with plant_id=None or any other plant
+    assert len(captured_calls) == 1
+    assert captured_calls[0]["kwargs"].get("plant_id") == "plant_01"
+    assert captured_calls[0]["kwargs"].get("tenant_id") == "tenant_alpha"
+    assert captured_calls[0]["kwargs"].get("workspace_id") == "workspace_prod"
+
+
+def test_128_query_for_plant_02_denied_to_plant_01_identity_before_repo_queried(temp_db):
+    """128. A query for plant_02 is denied to an identity assigned only to plant_01, before repository is queried."""
+    repo, service = temp_db
+    admin_p1 = Identity(
+        user_id="user_admin_p1_deny_early",
+        tenant_id="tenant_alpha",
+        workspace_id="workspace_prod",
+        roles=["ADMINISTRATOR"],
+        permissions=["learning.evaluation.revalidate"],
+        assigned_plants=["plant_01"],
+        clearance_level=3,
+        is_server_authoritative=True,
+    )
+
+    captured_calls = []
+    orig_list_evaluations = repo.list_evaluations
+
+    def spy_list_evaluations(*args, **kwargs):
+        captured_calls.append({"args": args, "kwargs": kwargs})
+        return orig_list_evaluations(*args, **kwargs)
+
+    service.repository.list_evaluations = spy_list_evaluations
+
+    with pytest.raises(OutcomeEvaluationScopeMismatchError):
+        service.revalidate_historical_evaluations(admin_p1, plant_id="plant_02")
+
+    # The repository must NEVER have been called at all
+    assert len(captured_calls) == 0
+
+
+def test_129_empty_and_missing_assignments_denied_before_repo_queried(temp_db):
+    """129. Empty and missing assignments are denied before the repository is queried."""
+    repo, service = temp_db
+    admin_empty = Identity(
+        user_id="user_admin_empty_early",
+        tenant_id="tenant_alpha",
+        workspace_id="workspace_prod",
+        roles=["ADMINISTRATOR"],
+        permissions=["learning.evaluation.revalidate"],
+        assigned_plants=[],
+        clearance_level=3,
+        is_server_authoritative=True,
+    )
+    admin_none = Identity(
+        user_id="user_admin_none_early",
+        tenant_id="tenant_alpha",
+        workspace_id="workspace_prod",
+        roles=["ADMINISTRATOR"],
+        permissions=["learning.evaluation.revalidate"],
+        assigned_plants=None,
+        clearance_level=3,
+        is_server_authoritative=True,
+    )
+
+    captured_calls = []
+    orig_list_evaluations = repo.list_evaluations
+
+    def spy_list_evaluations(*args, **kwargs):
+        captured_calls.append({"args": args, "kwargs": kwargs})
+        return orig_list_evaluations(*args, **kwargs)
+
+    service.repository.list_evaluations = spy_list_evaluations
+
+    # 1. Empty assignments without plant_id
+    with pytest.raises(OutcomeEvaluationScopeMismatchError):
+        service.revalidate_historical_evaluations(admin_empty)
+
+    # 2. Empty assignments with explicit plant_id
+    with pytest.raises(OutcomeEvaluationScopeMismatchError):
+        service.revalidate_historical_evaluations(admin_empty, plant_id="plant_01")
+
+    # 3. Missing assignments without plant_id
+    with pytest.raises(OutcomeEvaluationScopeMismatchError):
+        service.revalidate_historical_evaluations(admin_none)
+
+    # 4. Missing assignments with explicit plant_id
+    with pytest.raises(OutcomeEvaluationScopeMismatchError):
+        service.revalidate_historical_evaluations(admin_none, plant_id="plant_01")
+
+    # No queries issued
+    assert len(captured_calls) == 0
+
+
+def test_130_explicit_authorized_wildcard_uses_bounded_all_plants_query(temp_db):
+    """130. An explicitly authorized wildcard still uses the bounded all-plants query."""
+    repo, service = temp_db
+    admin_wildcard = Identity(
+        user_id="user_admin_wildcard_boundary",
+        tenant_id="tenant_alpha",
+        workspace_id="workspace_prod",
+        roles=["ADMINISTRATOR"],
+        permissions=["learning.evaluation.revalidate"],
+        assigned_plants=["*"],
+        clearance_level=3,
+        is_server_authoritative=True,
+    )
+
+    captured_calls = []
+    orig_list_evaluations = repo.list_evaluations
+
+    def spy_list_evaluations(*args, **kwargs):
+        captured_calls.append({"args": args, "kwargs": kwargs})
+        return orig_list_evaluations(*args, **kwargs)
+
+    service.repository.list_evaluations = spy_list_evaluations
+
+    service.revalidate_historical_evaluations(admin_wildcard)
+
+    assert len(captured_calls) == 1
+    assert captured_calls[0]["kwargs"].get("plant_id") is None
+    assert captured_calls[0]["kwargs"].get("tenant_id") == "tenant_alpha"
+    assert captured_calls[0]["kwargs"].get("workspace_id") == "workspace_prod"
+
+
+def test_131_multi_plant_assignments_query_only_authorized_plants(temp_db):
+    """131. Multi-plant assignments query only authorized plants."""
+    repo, service = temp_db
+    admin_multi = Identity(
+        user_id="user_admin_multi_boundary",
+        tenant_id="tenant_alpha",
+        workspace_id="workspace_prod",
+        roles=["ADMINISTRATOR"],
+        permissions=["learning.evaluation.revalidate"],
+        assigned_plants=["plant_01", "plant_02"],
+        clearance_level=3,
+        is_server_authoritative=True,
+    )
+
+    captured_calls = []
+    orig_list_evaluations = repo.list_evaluations
+
+    def spy_list_evaluations(*args, **kwargs):
+        captured_calls.append({"args": args, "kwargs": kwargs})
+        return orig_list_evaluations(*args, **kwargs)
+
+    service.repository.list_evaluations = spy_list_evaluations
+
+    service.revalidate_historical_evaluations(admin_multi)
+
+    # Must query plant_01 and plant_02, and NEVER plant_id=None or plant_03
+    assert len(captured_calls) == 2
+    queried_plants = [c["kwargs"].get("plant_id") for c in captured_calls]
+    assert queried_plants == ["plant_01", "plant_02"]
+
+
+def test_132_revalidation_enforces_overall_limit_across_all_assigned_plants(temp_db):
+    """132. The overall result respects the requested limit across assigned plants."""
+    repo, service = temp_db
+    admin_multi = Identity(
+        user_id="user_admin_limit_boundary",
+        tenant_id="tenant_alpha",
+        workspace_id="workspace_prod",
+        roles=["ADMINISTRATOR"],
+        permissions=["learning.evaluation.revalidate"],
+        assigned_plants=["plant_01", "plant_02"],
+        clearance_level=3,
+        is_server_authoritative=True,
+    )
+
+    # Seed 5 records in plant_01 and 5 in plant_02 (total 10)
+    for i in range(5):
+        _create_scoped_test_eval(repo, f"eval_lim_p1_{i}", "plant_01", f"2026-10-18T10:0{i}:00Z")
+    for i in range(5):
+        _create_scoped_test_eval(repo, f"eval_lim_p2_{i}", "plant_02", f"2026-10-18T11:0{i}:00Z")
+
+    # Request limit=3
+    report = service.revalidate_historical_evaluations(admin_multi, limit=3)
+    assert report["total_checked"] == 3
+
+
+def test_133_combining_results_preserves_deterministic_ordering_and_deduplicates(temp_db):
+    """133. Combining results preserves deterministic ordering and avoids duplicate evaluation IDs."""
+    repo, service = temp_db
+    admin_multi = Identity(
+        user_id="user_admin_order_boundary",
+        tenant_id="tenant_alpha",
+        workspace_id="workspace_prod",
+        roles=["ADMINISTRATOR"],
+        permissions=["learning.evaluation.revalidate"],
+        assigned_plants=["plant_01", "plant_02"],
+        clearance_level=3,
+        is_server_authoritative=True,
+    )
+
+    # Insert items with timestamps across plants
+    ev1 = _create_scoped_test_eval(repo, "eval_order_b", "plant_01", "2026-10-18T08:00:00Z")
+    ev2 = _create_scoped_test_eval(repo, "eval_order_a", "plant_02", "2026-10-18T12:00:00Z")  # Newer
+    ev3 = _create_scoped_test_eval(repo, "eval_order_c", "plant_01", "2026-10-18T10:00:00Z")
+    ev4 = _create_scoped_test_eval(repo, "eval_order_d", "plant_02", "2026-10-18T10:00:00Z")  # Same timestamp as ev3
+
+    # Spy on get_observed_outcome to record the order in which evaluations were checked
+    checked_outcomes = []
+    orig_get_outcome = repo.get_observed_outcome
+
+    def spy_get_outcome(*args, **kwargs):
+        outcome_id = kwargs.get("outcome_id") or (args[2] if len(args) > 2 else None)
+        checked_outcomes.append(outcome_id)
+        return orig_get_outcome(*args, **kwargs)
+
+    service.repository.get_observed_outcome = spy_get_outcome
+
+    report = service.revalidate_historical_evaluations(admin_multi)
+
+    # Expected order: evaluated_at DESC:
+    # 1. eval_order_a (12:00:00Z) -> outc_eval_order_a
+    # 2. eval_order_c and eval_order_d (10:00:00Z, tie broken by eval_id ASC -> eval_order_c then eval_order_d)
+    # 3. eval_order_b (08:00:00Z) -> outc_eval_order_b
+    assert checked_outcomes == [
+        "outc_eval_order_a",
+        "outc_eval_order_c",
+        "outc_eval_order_d",
+        "outc_eval_order_b",
+    ]
+
+    # Test deduplication: if repository returns duplicate evaluation ID across plants
+    dup_eval = _create_scoped_test_eval(repo, "eval_order_dup", "plant_01", "2026-10-18T13:00:00Z")
+    orig_list = repo.list_evaluations
+
+    def mock_list_with_dups(*args, **kwargs):
+        res = orig_list(*args, **kwargs)
+        # In plant_02 query, duplicate eval_order_dup as well
+        if kwargs.get("plant_id") == "plant_02":
+            # Clone with plant_02 plant_id but duplicate evaluation_id
+            fake_dup = (
+                dup_eval.model_copy(update={"plant_id": "plant_02"})
+                if hasattr(dup_eval, "model_copy")
+                else dup_eval.copy(update={"plant_id": "plant_02"})
+            )
+            return res + [fake_dup]
+        return res
+
+    service.repository.list_evaluations = mock_list_with_dups
+    checked_outcomes.clear()
+    report_dup = service.revalidate_historical_evaluations(admin_multi)
+    # outc_eval_order_dup should appear exactly once
+    assert checked_outcomes.count("outc_eval_order_dup") == 1
+
+
+def test_134_denied_requests_do_not_mutate_evaluation_records(temp_db):
+    """134. Denied requests do not mutate evaluation records."""
+    repo, service = temp_db
+    ev = _create_scoped_test_eval(repo, "eval_unmutated_134", "plant_02", "2026-10-18T10:00:00Z", eligible=True)
+
+    admin_p1 = Identity(
+        user_id="user_admin_p1_nomut",
+        tenant_id="tenant_alpha",
+        workspace_id="workspace_prod",
+        roles=["ADMINISTRATOR"],
+        permissions=["learning.evaluation.revalidate"],
+        assigned_plants=["plant_01"],
+        clearance_level=3,
+        is_server_authoritative=True,
+    )
+
+    with pytest.raises(OutcomeEvaluationScopeMismatchError):
+        service.revalidate_historical_evaluations(admin_p1, plant_id="plant_02")
+
+    loaded = repo.get_evaluation("tenant_alpha", "workspace_prod", "eval_unmutated_134")
+    assert loaded.eligible_for_learning is True
+
+
+def test_135_tenant_and_workspace_isolation_remains_intact(temp_db):
+    """135. Tenant and workspace isolation remains intact."""
+    repo, service = temp_db
+    # Seed evaluation in tenant_beta
+    _create_scoped_test_eval(
+        repo,
+        "eval_beta_iso",
+        "plant_01",
+        "2026-10-18T10:00:00Z",
+        tenant_id="tenant_beta",
+        workspace_id="workspace_staging",
+    )
+    # Seed evaluation in tenant_alpha
+    _create_scoped_test_eval(
+        repo,
+        "eval_alpha_iso",
+        "plant_01",
+        "2026-10-18T10:00:00Z",
+        tenant_id="tenant_alpha",
+        workspace_id="workspace_prod",
+    )
+
+    admin_alpha = Identity(
+        user_id="user_admin_alpha_iso",
+        tenant_id="tenant_alpha",
+        workspace_id="workspace_prod",
+        roles=["ADMINISTRATOR"],
+        permissions=["learning.evaluation.revalidate"],
+        assigned_plants=["plant_01"],
+        clearance_level=3,
+        is_server_authoritative=True,
+    )
+
+    captured_calls = []
+    orig_list = repo.list_evaluations
+
+    def spy_list(*args, **kwargs):
+        captured_calls.append({"args": args, "kwargs": kwargs})
+        return orig_list(*args, **kwargs)
+
+    service.repository.list_evaluations = spy_list
+
+    report = service.revalidate_historical_evaluations(admin_alpha)
+
+    assert report["tenant_id"] == "tenant_alpha"
+    assert report["workspace_id"] == "workspace_prod"
+    assert len(captured_calls) == 1
+    assert captured_calls[0]["kwargs"].get("tenant_id") == "tenant_alpha"
+    assert captured_calls[0]["kwargs"].get("workspace_id") == "workspace_prod"
+
+    # Evaluation in tenant_beta remains untouched
+    beta_rec = repo.get_evaluation("tenant_beta", "workspace_staging", "eval_beta_iso")
+    assert beta_rec is not None
+    assert beta_rec.eligible_for_learning is True
+
+
+def test_136_existing_authoritative_verification_and_evaluation_flow_intact(temp_db, test_identity, admin_identity):
+    """136. The existing authoritative verification checks and ordinary evaluation flow continue working."""
+    repo, service = temp_db
+    t1 = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    t2 = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    # 1. Ordinary evaluation flow succeeds
+    pred = PredictionSnapshot(
+        prediction_id="pred_136_ok",
+        prediction_type=PredictionType.DEMAND_FORECAST,
+        target_reference="sku_136_ok",
+        predicted_at=t1,
+        expected_value=50.0,
+        expected_unit="units",
+        prediction_provenance="service",
+        tenant_id=test_identity.tenant_id,
+        workspace_id=test_identity.workspace_id,
+        plant_id="plant_01",
+    )
+    service.record_prediction_snapshot(test_identity, pred)
+
+    outc = ObservedOutcome(
+        outcome_id="outc_136_ok",
+        prediction_id="pred_136_ok",
+        target_reference="sku_136_ok",
+        outcome_type="DEMAND",
+        observed_at=t2,
+        observed_value=50.0,
+        unit="units",
+        provenance="sensor",
+        verification_status=OutcomeVerificationStatus.OBSERVED,
+        tenant_id=test_identity.tenant_id,
+        workspace_id=test_identity.workspace_id,
+        plant_id="plant_01",
+    )
+    service.record_observed_outcome(test_identity, outc)
+
+    ev = service.evaluate_prediction_outcome(test_identity, "pred_136_ok", "outc_136_ok")
+    assert ev.evaluation_status == EvaluationStatus.EVALUATED
+    assert ev.absolute_error == 0.0
+
+    # 2. Historical revalidation catches unverified outcomes and corrects them
+    # Seed an evaluation whose outcome is missing/unverified
+    _create_scoped_test_eval(repo, "eval_136_unverified", "plant_01", "2026-10-18T10:00:00Z", eligible=True)
+    report = service.revalidate_historical_evaluations(admin_identity, plant_id="plant_01")
+    assert report["corrected_count"] >= 1
+    assert "eval_136_unverified" in report["corrected_evaluation_ids"]
+    corrected = repo.get_evaluation(admin_identity.tenant_id, admin_identity.workspace_id, "eval_136_unverified")
+    assert corrected.eligible_for_learning is False
+
