@@ -26,7 +26,7 @@ Prompt 39 builds directly upon the established Prompt 37 Closed-Loop Learning Fo
 1. **Canonical Event System (`backend/data/schemas/event_contract.py`):** Reused `CanonicalEvent`, `EventCategory`, `EventSeverity`, `EventLifecycle`, and `EventReferences`. Emitted canonical `prediction.evaluated` events directly into the existing `EventBus`.
 2. **Canonical EventBus & Delivery Subsystem (`backend/services/event_bus.py`, `backend/repositories/event_delivery_repository.py`):** Utilized existing subscription matching, tenant isolation cache, at-least-once delivery, heartbeat lease renewal, and dead-letter handling. Zero secondary message buses introduced.
 3. **Continuous Verification Engine (`backend/services/verification_service.py`, `backend/repositories/verification_repository.py`):** Outcomes link directly to authoritative `VerificationRun` and `VerificationFinding` IDs. Non-verified outcomes remain explicitly `OBSERVED` or `UNVERIFIED` and cannot qualify as learning evidence.
-4. **Identity & Authorization Subsystem (`backend/core/auth.py`, `backend/services/authorization_service.py`):** Reused `Identity`, `Role`, `Permission`, and registered 6 granular canonical permissions (`learning.prediction.record`, `learning.prediction.read`, `learning.outcome.record`, `learning.outcome.read`, `learning.evaluation.evaluate`, `learning.evaluation.read`). Client-forged scopes and clearances are rejected.
+4. **Identity & Authorization Subsystem (`backend/core/auth.py`, `backend/services/authorization_service.py`):** Reused `Identity`, `Role`, `Permission`, and registered 7 granular canonical permissions (`learning.prediction.record`, `learning.prediction.read`, `learning.outcome.record`, `learning.outcome.read`, `learning.evaluation.evaluate`, `learning.evaluation.read`, `learning.evaluation.revalidate`). Client-forged scopes and clearances are rejected.
 5. **Database Storage Conventions:** Extended the established SQLite WAL pattern with thread-safe connection pooling, busy timeout (30s), parameterized SQL, and scope-isolated queries in `sage_verification.sqlite`.
 6. **Governance & Audit Infrastructure (`backend/governance/audit.py`):** Integrated structured security audit logging (`PREDICTION_SNAPSHOT_RECORDED`, `OUTCOME_OBSERVED`, `OUTCOME_EVALUATION_COMPLETED`, etc.).
 
@@ -51,6 +51,7 @@ Prompt 39 builds directly upon the established Prompt 37 Closed-Loop Learning Fo
 | **Data-Mode Separation** | `IMPLEMENTED` | `REAL`, `SIMULATION`, and `HYBRID` modes are strictly isolated. Simulation results cannot enter real-world learning context or metrics. |
 | **Frontend UI Integration** | `IMPLEMENTED` | `OutcomeLearningModal.tsx` wired into Command Center header and page, providing governed view of predictions, verified outcomes, error metrics, and sample thresholds. |
 | **Audit Logging** | `IMPLEMENTED` | Emits structured security audit events with caller identity, tenant, plant, and timestamps. |
+| **Administrative Historical Revalidation** | `IMPLEMENTED` | `revalidate_historical_evaluations` restricted to sensitive permission `learning.evaluation.revalidate` and `ADMINISTRATOR` role. Remediates untrusted records without privilege bypass of verification evidence. |
 | **Documentation** | `IMPLEMENTED` | Updated `docs/v3-closed-loop-learning.md` with complete Section 17 architecture, lifecycle flow, contracts, and invariants. |
 
 ---
@@ -64,6 +65,7 @@ Prompt 39 builds directly upon the established Prompt 37 Closed-Loop Learning Fo
 5. **SQL Injection Prevention:** Parameterized SQL queries used across all repository methods. Static AST analysis (Test 85) verifies zero f-string or string-interpolated SQL statements in `execute()` calls.
 6. **Execution Isolation:** Static AST analysis (Test 86, 87, 88) verifies that outcome learning contains zero imports of `ExecutionGateway` or `ActionTool`, zero calls to `approve_action` or `approve_execution`, and zero physical SCADA/PLC/actuator commands.
 7. **Feedback Loop Guard:** Canonical events emitted by the evaluator use provenance `closed_loop_evaluator`. The event listener explicitly drops these events to break recursion loops.
+8. **Administrative Revalidation Authorization Boundary:** Revalidation endpoint `POST /api/v3/learning/evaluations/revalidate` and service method require dedicated sensitive permission `learning.evaluation.revalidate`, granted exclusively to `ADMINISTRATOR`. Ordinary evaluators, operators, and viewers are blocked (403 Forbidden). Scope restrictions (tenant, workspace, plant) are strictly enforced, and administrative privilege cannot bypass authoritative verification requirements.
 
 ---
 
@@ -71,11 +73,11 @@ Prompt 39 builds directly upon the established Prompt 37 Closed-Loop Learning Fo
 
 ### 1. Focused Prompt 39 Test Suite
 Command: `python -m pytest backend/test_v3_closed_loop_outcome_evaluation.py -q`
-- **Total Tests:** 90
-- **Passed:** 90 (100%)
+- **Total Tests:** 119
+- **Passed:** 119 (100%)
 - **Failed:** 0
 - **Skipped:** 0
-- **Execution Time:** ~13.5 seconds
+- **Execution Time:** ~15.9 seconds
 
 Coverage across Groups A–I:
 - Group A: Prediction Contract (Tests 1–10) — Valid numeric/categorical snapshots, type validation, unit validation, evaluation window, scope check, immutability, timing order.
@@ -87,6 +89,8 @@ Coverage across Groups A–I:
 - Group G: EventBus Integration & Loop Guard (Tests 67–74) — Canonical event validation, persist-before-publish invariant, publish failure recovery, redelivery deduplication, loop guard dropping evaluator provenance, cross-tenant event isolation, permanent invalid input handling.
 - Group H: Concurrency & Consistency (Tests 75–80) — Multi-threaded concurrent evaluations (8 threads producing 1 DB row), concurrent conflicting writes rejection, stale evaluation references, thread-safe bulk inserts, concurrent metric queries during writes, crash/retry determinism.
 - Group I: Security, Scope Isolation & Architectural Boundaries (Tests 81–90) — Cross-tenant API rejection, cross-workspace API rejection, cross-plant query rejection, unauthorized outcome submission (403), AST parameterized SQL verification, AST zero ExecutionGateway / ActionTool verification, AST zero approve_action verification, AST zero physical PLC/SCADA commands verification, secret scanner rejection of bearer tokens, honest `INSUFFICIENT_DATA` metrics on empty data.
+- Group J: Prompt 39 Security Regression (Tests 91–109) — Fabricated verification reference rejection, random reference learning-ineligibility, valid run/finding resolution, non-existent run/finding handling, cross-tenant/workspace/plant reference isolation, diagnostic-only exclusion, failed/invalidated evidence exclusion, admin evidence requirement, non-privileged reference validation, unrelated finding rejection, API forged status rejection, metrics and governed context pollution guards, EventBus redelivery verification, historical revalidation remediation.
+- Group K: Prompt 39 Correction 2 Security Regression (Tests 110–119) — Dedicated permission enforcement, ordinary evaluator prohibition (403), operator prohibition (403), viewer prohibition (403), authorized administrator revalidation, unauthorized eligibility mutation prevention, denied request mutation immunity, tenant/workspace/plant scope isolation, preservation of ordinary prediction evaluation, EventBus administrative privilege exclusion, administrative verification proof requirement.
 
 ### 2. Regression Test Suites
 - **Existing Closed-Loop Learning Suite:** `pytest backend/test_v3_closed_loop_learning.py -q`

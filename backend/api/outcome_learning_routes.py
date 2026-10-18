@@ -413,7 +413,7 @@ async def list_evaluations(
 async def revalidate_historical_evaluations(
     plant_id: Optional[str] = Query(None),
     limit: int = Query(500, ge=1, le=1000),
-    user: Identity = Depends(require_permission("learning.evaluation.evaluate")),
+    user: Identity = Depends(require_permission("learning.evaluation.revalidate")),
 ):
     """
     Explicit remediation and revalidation endpoint for historical evaluations.

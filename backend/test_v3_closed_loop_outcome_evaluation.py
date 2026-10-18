@@ -204,6 +204,7 @@ def admin_identity():
             "learning.outcome.read",
             "learning.evaluation.evaluate",
             "learning.evaluation.read",
+            "learning.evaluation.revalidate",
         ],
         assigned_plants=["*"],
         clearance_level=3,
@@ -4143,3 +4144,393 @@ def test_109_historical_revalidation_remediates_untrusted_evaluations(temp_db, t
     remediated = repo.get_evaluation(admin_identity.tenant_id, admin_identity.workspace_id, "eval_legacy_untrusted_01")
     assert remediated.eligible_for_learning is False
     assert "HISTORICAL_REVALIDATION" in remediated.learning_ineligibility_reason
+
+
+# =============================================================================
+# GROUP K: PROMPT 39 CORRECTION 2 SECURITY REGRESSION (110-119)
+# Authoritative Revalidation Administrative Authorization Hardening
+# =============================================================================
+
+def test_110_ordinary_evaluator_cannot_invoke_historical_revalidation(temp_db, test_identity, client):
+    """110. An ordinary user with learning.evaluation.evaluate cannot invoke historical revalidation."""
+    repo, service = temp_db
+
+    # 1. Service layer check: raises OutcomeEvaluationScopeMismatchError
+    with pytest.raises(OutcomeEvaluationScopeMismatchError) as exc_info:
+        service.revalidate_historical_evaluations(test_identity)
+    assert "Authorization denied" in str(exc_info.value) or "INSUFFICIENT_ROLE_PERMISSIONS" in str(exc_info.value)
+
+    # 2. API layer check: returns 403 Forbidden
+    app.dependency_overrides[get_current_identity] = lambda: test_identity
+    try:
+        res = client.post("/api/v3/learning/evaluations/revalidate")
+        assert res.status_code == 403
+        data = res.json()
+        assert "learning.evaluation.revalidate" in str(data) or data.get("detail", {}).get("reason_code") == "INSUFFICIENT_ROLE_PERMISSIONS"
+    finally:
+        app.dependency_overrides.pop(get_current_identity, None)
+
+
+def test_111_operator_cannot_invoke_historical_revalidation(temp_db, client):
+    """111. An operator cannot invoke historical revalidation."""
+    repo, service = temp_db
+    op_identity = Identity(
+        user_id="user_op_line1",
+        tenant_id="tenant_alpha",
+        workspace_id="workspace_prod",
+        roles=["OPERATOR"],
+        permissions=["learning.outcome.record"],
+        assigned_plants=["plant_01"],
+        clearance_level=1,
+        is_server_authoritative=True,
+    )
+
+    # 1. Service layer check: rejected fail-closed
+    with pytest.raises(OutcomeEvaluationScopeMismatchError):
+        service.revalidate_historical_evaluations(op_identity)
+
+    # 2. API layer check: returns 403 Forbidden
+    app.dependency_overrides[get_current_identity] = lambda: op_identity
+    try:
+        res = client.post("/api/v3/learning/evaluations/revalidate")
+        assert res.status_code == 403
+    finally:
+        app.dependency_overrides.pop(get_current_identity, None)
+
+
+def test_112_readonly_learning_user_cannot_invoke_historical_revalidation(temp_db, client):
+    """112. A user with read-only learning permissions cannot invoke historical revalidation."""
+    repo, service = temp_db
+    viewer_identity = Identity(
+        user_id="user_viewer_01",
+        tenant_id="tenant_alpha",
+        workspace_id="workspace_prod",
+        roles=["VIEWER"],
+        permissions=[
+            "learning.prediction.read",
+            "learning.outcome.read",
+            "learning.evaluation.read",
+        ],
+        assigned_plants=["plant_01"],
+        clearance_level=1,
+        is_server_authoritative=True,
+    )
+
+    # 1. Service layer check: rejected fail-closed
+    with pytest.raises(OutcomeEvaluationScopeMismatchError):
+        service.revalidate_historical_evaluations(viewer_identity)
+
+    # 2. API layer check: returns 403 Forbidden
+    app.dependency_overrides[get_current_identity] = lambda: viewer_identity
+    try:
+        res = client.post("/api/v3/learning/evaluations/revalidate")
+        assert res.status_code == 403
+    finally:
+        app.dependency_overrides.pop(get_current_identity, None)
+
+
+def test_113_authorized_administrator_can_invoke_historical_revalidation(temp_db, admin_identity, client):
+    """113. An authorized administrator can invoke historical revalidation."""
+    repo, service = temp_db
+
+    # 1. Service layer invocation succeeds
+    report = service.revalidate_historical_evaluations(admin_identity)
+    assert "total_checked" in report
+    assert "corrected_count" in report
+    assert report["tenant_id"] == admin_identity.tenant_id
+
+    # 2. API layer invocation succeeds
+    app.dependency_overrides[get_current_identity] = lambda: admin_identity
+    try:
+        res = client.post("/api/v3/learning/evaluations/revalidate")
+        assert res.status_code == 200
+        data = res.json()
+        assert "total_checked" in data
+        assert "corrected_count" in data
+    finally:
+        app.dependency_overrides.pop(get_current_identity, None)
+
+
+def test_114_unauthorized_user_cannot_disable_learning_eligibility_through_endpoint(temp_db, test_identity, admin_identity, client):
+    """114. An unauthorized user cannot disable learning eligibility through the endpoint."""
+    repo, service = temp_db
+    t1 = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    t2 = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    # Authoritative run and genuine verified evaluation
+    seed_authoritative_run(
+        service,
+        tenant_id=admin_identity.tenant_id,
+        workspace_id=admin_identity.workspace_id,
+        plant_id="plant_01",
+        verification_id="vrun_auth_persist_01",
+        target_id="sku_persist_target",
+        status=VerificationStatus.VERIFIED,
+    )
+
+    pred = PredictionSnapshot(
+        prediction_id="pred_persist_01",
+        prediction_type=PredictionType.DEMAND_FORECAST,
+        target_reference="sku_persist_target",
+        predicted_at=t1,
+        expected_value=100.0,
+        expected_unit="units",
+        prediction_provenance="service",
+        tenant_id=admin_identity.tenant_id,
+        workspace_id=admin_identity.workspace_id,
+        plant_id="plant_01",
+    )
+    service.record_prediction_snapshot(admin_identity, pred)
+
+    outc = ObservedOutcome(
+        outcome_id="outc_persist_01",
+        prediction_id="pred_persist_01",
+        target_reference="sku_persist_target",
+        outcome_type="DEMAND",
+        observed_at=t2,
+        observed_value=102.0,
+        unit="units",
+        provenance="sensor",
+        verification_status=OutcomeVerificationStatus.VERIFIED,
+        verification_reference="vrun_auth_persist_01",
+        tenant_id=admin_identity.tenant_id,
+        workspace_id=admin_identity.workspace_id,
+        plant_id="plant_01",
+    )
+    service.record_observed_outcome(admin_identity, outc)
+    eval_rec = service.evaluate_prediction_outcome(admin_identity, "pred_persist_01", "outc_persist_01")
+    assert eval_rec.eligible_for_learning is True
+
+    # Unauthorized caller attempts to hit revalidation endpoint
+    app.dependency_overrides[get_current_identity] = lambda: test_identity
+    try:
+        res = client.post("/api/v3/learning/evaluations/revalidate")
+        assert res.status_code == 403
+    finally:
+        app.dependency_overrides.pop(get_current_identity, None)
+
+    # Verify evaluation eligibility was NOT altered or disabled
+    persisted = repo.get_evaluation(admin_identity.tenant_id, admin_identity.workspace_id, eval_rec.evaluation_id)
+    assert persisted.eligible_for_learning is True
+
+
+def test_115_denied_request_causes_no_evaluation_record_mutation(temp_db, test_identity, admin_identity):
+    """115. A denied request causes no evaluation-record mutation."""
+    repo, service = temp_db
+    t1 = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    t2 = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    eval_unauth = PredictionOutcomeEvaluation(
+        evaluation_id="eval_immutable_on_deny",
+        schema_version="3.0.0",
+        tenant_id=admin_identity.tenant_id,
+        workspace_id=admin_identity.workspace_id,
+        plant_id="plant_01",
+        idempotency_key="idem_immutable_on_deny",
+        prediction_id="pred_deny_mut",
+        outcome_id="outc_deny_mut",
+        evaluation_status=EvaluationStatus.EVALUATED,
+        eligibility_reason="ELIGIBLE",
+        evaluation_policy_version="1.0.0",
+        metric_implementation_version="1.0.0",
+        prediction_type=PredictionType.DEMAND_FORECAST,
+        target_reference="sku_deny_target",
+        predicted_value=100.0,
+        observed_value=105.0,
+        unit="units",
+        comparison_semantics="NUMERIC_ERROR",
+        absolute_error=5.0,
+        verification_reference="vrun_unverified_unmutated",
+        eligible_for_learning=True,
+        provenance="test",
+    )
+    repo.record_evaluation(eval_unauth)
+
+    before = repo.get_evaluation(admin_identity.tenant_id, admin_identity.workspace_id, "eval_immutable_on_deny")
+    assert before.eligible_for_learning is True
+
+    # Unauthorized call fails
+    with pytest.raises(OutcomeEvaluationScopeMismatchError):
+        service.revalidate_historical_evaluations(test_identity)
+
+    # Record must remain completely unmutated
+    after = repo.get_evaluation(admin_identity.tenant_id, admin_identity.workspace_id, "eval_immutable_on_deny")
+    assert after.eligible_for_learning is True
+    assert after.learning_ineligibility_reason == before.learning_ineligibility_reason
+
+
+def test_116_authorized_revalidation_remains_tenant_workspace_plant_scoped(temp_db, admin_identity):
+    """116. Authorized revalidation remains tenant, workspace, and plant scoped."""
+    repo, service = temp_db
+
+    # 1. Admin assigned exclusively to plant_01 attempts to revalidate plant_02
+    plant_scoped_admin = Identity(
+        user_id="user_admin_plant_01",
+        tenant_id="tenant_alpha",
+        workspace_id="workspace_prod",
+        roles=["ADMINISTRATOR"],
+        permissions=[
+            "learning.prediction.record", "learning.prediction.read",
+            "learning.outcome.record", "learning.outcome.read",
+            "learning.evaluation.evaluate", "learning.evaluation.read",
+            "learning.evaluation.revalidate",
+        ],
+        assigned_plants=["plant_01"],
+        clearance_level=3,
+        is_server_authoritative=True,
+    )
+
+    # Access to plant_02 is forbidden
+    with pytest.raises(OutcomeEvaluationScopeMismatchError) as exc_plant:
+        service.revalidate_historical_evaluations(plant_scoped_admin, plant_id="plant_02")
+    assert "plant_02" in str(exc_plant.value) or "PLANT_SCOPE_DENIED" in str(exc_plant.value)
+
+    # 2. Cross-tenant attempt
+    cross_tenant_admin = Identity(
+        user_id="user_admin_tenant_other",
+        tenant_id="tenant_beta",
+        workspace_id="workspace_prod",
+        roles=["ADMINISTRATOR"],
+        permissions=["learning.evaluation.revalidate"],
+        assigned_plants=["*"],
+        clearance_level=3,
+        is_server_authoritative=True,
+    )
+    # Revalidating with cross_tenant_admin only searches tenant_beta
+    report = service.revalidate_historical_evaluations(cross_tenant_admin)
+    assert report["tenant_id"] == "tenant_beta"
+    assert report["total_checked"] == 0  # No access to tenant_alpha records
+
+
+def test_117_existing_prediction_evaluation_continues_with_intended_permissions(temp_db, test_identity, client):
+    """117. Existing prediction-evaluation endpoints continue to work for their intended permissions."""
+    repo, service = temp_db
+    t1 = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    t2 = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    pred_id = f"pred_eval_perm_{uuid.uuid4().hex[:8]}"
+    outc_id = f"outc_eval_perm_{uuid.uuid4().hex[:8]}"
+    target_ref = f"sku_eval_perm_{uuid.uuid4().hex[:8]}"
+
+    pred = PredictionSnapshot(
+        prediction_id=pred_id,
+        prediction_type=PredictionType.DEMAND_FORECAST,
+        target_reference=target_ref,
+        predicted_at=t1,
+        expected_value=250.0,
+        expected_unit="units",
+        prediction_provenance="service",
+        tenant_id=test_identity.tenant_id,
+        workspace_id=test_identity.workspace_id,
+        plant_id="plant_01",
+    )
+    service.record_prediction_snapshot(test_identity, pred)
+
+    outc = ObservedOutcome(
+        outcome_id=outc_id,
+        prediction_id=pred_id,
+        target_reference=target_ref,
+        outcome_type="DEMAND",
+        observed_at=t2,
+        observed_value=245.0,
+        unit="units",
+        provenance="sensor",
+        verification_status=OutcomeVerificationStatus.OBSERVED,
+        tenant_id=test_identity.tenant_id,
+        workspace_id=test_identity.workspace_id,
+        plant_id="plant_01",
+    )
+    service.record_observed_outcome(test_identity, outc)
+
+    # Ordinary evaluation succeeds for user with learning.evaluation.evaluate
+    eval_rec = service.evaluate_prediction_outcome(test_identity, pred_id, outc_id)
+    assert eval_rec.evaluation_status == EvaluationStatus.EVALUATED
+    assert eval_rec.absolute_error == 5.0
+    # Because outcome was OBSERVED, learning eligibility is False (as expected)
+    assert eval_rec.eligible_for_learning is False
+
+
+def test_118_eventbus_processing_does_not_acquire_administrative_permission_implicitly(temp_db):
+    """118. EventBus processing does not acquire the administrative permission implicitly."""
+    repo, service = temp_db
+    handler = OutcomeLearningEventHandler(service=service, enabled=True)
+
+    # EventBus handler identity permissions inspection
+    sample_event = CanonicalEvent(
+        tenant_id="tenant_alpha",
+        workspace_id="workspace_prod",
+        plant_id="plant_01",
+        category=EventCategory.QUALITY,
+        event_type="outcome.observed",
+        occurred_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        observed_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        provenance="sensor",
+        payload={"prediction_id": "p1", "outcome_id": "o1"},
+    )
+    # The internal identity constructed by handler must NOT have learning.evaluation.revalidate
+    handler_identity = Identity(
+        user_id=f"system:outcome_evaluator:{sample_event.tenant_id}",
+        tenant_id=sample_event.tenant_id,
+        workspace_id=sample_event.workspace_id,
+        roles=["SYSTEM_VERIFIER", "ANALYST"],
+        permissions=[
+            "learning.prediction.read",
+            "learning.outcome.read",
+            "learning.evaluation.evaluate",
+            "learning.evaluation.read",
+        ],
+        assigned_plants=[sample_event.plant_id],
+        clearance_level=3,
+        is_server_authoritative=True,
+    )
+    assert "learning.evaluation.revalidate" not in handler_identity.permissions
+    assert "ADMINISTRATOR" not in handler_identity.roles
+
+    # Handler identity calling revalidation directly is denied
+    with pytest.raises(OutcomeEvaluationScopeMismatchError):
+        service.revalidate_historical_evaluations(handler_identity)
+
+
+def test_119_privileged_caller_without_evidence_cannot_make_outcome_learning_eligible(temp_db, admin_identity):
+    """119. A privileged caller without genuine verification evidence still cannot make an outcome learning-eligible."""
+    repo, service = temp_db
+    now_str = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    outc = ObservedOutcome(
+        outcome_id="outc_admin_fake_eligible_test",
+        target_reference="sku_admin_fake",
+        outcome_type="DEMAND",
+        observed_at=now_str,
+        observed_value=500.0,
+        provenance="admin_override_attempt",
+        verification_status=OutcomeVerificationStatus.VERIFIED,
+        verification_reference="vrun_fabricated_admin_token_999",
+        tenant_id=admin_identity.tenant_id,
+        workspace_id=admin_identity.workspace_id,
+        plant_id="plant_01",
+    )
+    # Even though caller is ADMINISTRATOR, lack of backing verification run downgrades to OBSERVED
+    saved = service.record_observed_outcome(admin_identity, outc)
+    assert saved.verification_status == OutcomeVerificationStatus.OBSERVED
+    assert saved.verification_reference is None
+
+    # Prediction snapshot
+    t_past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    pred = PredictionSnapshot(
+        prediction_id="pred_admin_fake_eligible_test",
+        prediction_type=PredictionType.DEMAND_FORECAST,
+        target_reference="sku_admin_fake",
+        predicted_at=t_past,
+        expected_value=500.0,
+        expected_unit="units",
+        prediction_provenance="service",
+        tenant_id=admin_identity.tenant_id,
+        workspace_id=admin_identity.workspace_id,
+        plant_id="plant_01",
+    )
+    service.record_prediction_snapshot(admin_identity, pred)
+
+    # Evaluation produces eligible_for_learning=False
+    eval_rec = service.evaluate_prediction_outcome(admin_identity, "pred_admin_fake_eligible_test", "outc_admin_fake_eligible_test")
+    assert eval_rec.eligible_for_learning is False
+    assert eval_rec.learning_ineligibility_reason == "OUTCOME_NOT_VERIFIED"

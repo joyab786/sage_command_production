@@ -91,6 +91,12 @@ try:
         OutcomeEvaluationIdempotencyConflictError,
         OutcomeEvaluationScopeMismatchError,
     )
+    from data.schemas.authorization_contract import (
+        AuthorizationScope,
+        AuthorizationContext,
+        AuthzDecisionEffect,
+    )
+    from services.authorization_service import authorization_service
 except (ImportError, ModuleNotFoundError):
     from backend.core.config import (
         SAGE_OUTCOME_EVALUATION_ENABLED,
@@ -149,6 +155,12 @@ except (ImportError, ModuleNotFoundError):
         OutcomeEvaluationIdempotencyConflictError,
         OutcomeEvaluationScopeMismatchError,
     )
+    from backend.data.schemas.authorization_contract import (
+        AuthorizationScope,
+        AuthorizationContext,
+        AuthzDecisionEffect,
+    )
+    from backend.services.authorization_service import authorization_service
 
 logger = logging.getLogger("outcome_evaluation_service")
 
@@ -987,6 +999,35 @@ class OutcomeEvaluationService:
         persisted verification records. Fails closed and corrects any evaluations backed
         by unverified or missing verification evidence, emitting structured security audit logs.
         """
+        # 1. Enforce dedicated administrative permission
+        scope = AuthorizationScope(
+            tenant_id=identity.tenant_id,
+            workspace_id=identity.workspace_id,
+            session_id=identity.session_id,
+            plant_id=plant_id,
+        )
+        authz_ctx = AuthorizationContext(
+            identity=identity.to_user_identity(),
+            required_permission="learning.evaluation.revalidate",
+            scope=scope,
+        )
+        authz_dec = authorization_service.evaluate(authz_ctx)
+        if not authz_dec or authz_dec.effect != AuthzDecisionEffect.ALLOW:
+            reason_msg = authz_dec.reason if authz_dec else "Authorization returned no ALLOW decision"
+            self._log_audit_event(
+                "HISTORICAL_REVALIDATION_AUTHORIZATION_DENIED",
+                identity,
+                {
+                    "required_permission": "learning.evaluation.revalidate",
+                    "reason_code": authz_dec.reason_code.value if authz_dec else "DENY",
+                    "reason": reason_msg,
+                },
+            )
+            raise OutcomeEvaluationScopeMismatchError(
+                f"Authorization denied for historical revalidation: {reason_msg}"
+            )
+
+        # 2. Scope checks
         if plant_id:
             self._validate_plant_access(identity, plant_id)
 
@@ -997,6 +1038,10 @@ class OutcomeEvaluationService:
             eligible_only=True,
             limit=limit,
         )
+
+        assigned_plants = getattr(identity, "assigned_plants", ["*"]) or ["*"]
+        if "*" not in assigned_plants:
+            evals = [ev for ev in evals if ev.plant_id in assigned_plants]
 
         total_checked = len(evals)
         corrected_count = 0

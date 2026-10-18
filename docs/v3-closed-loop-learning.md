@@ -567,3 +567,22 @@ Historical aggregates (`AggregateMetricsSummary`):
 - Stored in SQLite WAL tables: `prediction_snapshots`, `observed_outcomes`, `prediction_outcome_evaluations`.
 - Idempotency enforced by unique `idempotency_key` and partial unique index on canonical pairs where `prior_evaluation_id IS NULL AND reevaluation_reason IS NULL`.
 - Re-evaluations create append-only records linking to `prior_evaluation_id`. Historical records are never overwritten.
+
+### 17.8 Administrative Historical Revalidation & Privilege Boundary
+Historical evaluations determine learning eligibility and directly feed governed metrics and downstream learning context.
+To prevent unauthorized manipulation of historical metrics:
+1. **Dedicated Permission (`learning.evaluation.revalidate`):**
+   - Marked sensitive (`is_sensitive=True`).
+   - Distinct from ordinary prediction-outcome evaluation (`learning.evaluation.evaluate`).
+   - Ordinary evaluation permission allows computing error metrics for prediction-outcome pairs, but does NOT grant authority to administratively mutate historical `eligible_for_learning` flags across the repository.
+2. **Authorized Role (`ADMINISTRATOR`):**
+   - Granted exclusively to canonical `ADMINISTRATOR` (Platform Administrator).
+   - Excluded from `OPERATOR`, `MAINTENANCE_ENGINEER`, `ANALYST`, `VIEWER`, and internal `OutcomeLearningEventHandler` identities.
+3. **Audit & Scope Protections:**
+   - Both API and service operations enforce tenant, workspace, and plant scope matching.
+   - Any revalidation attempt triggers structured security audit events: `HISTORICAL_REVALIDATION_AUTHORIZATION_DENIED` on forbidden attempts, and `HISTORICAL_EVALUATION_REVALIDATION_CORRECTION` on remediated records.
+   - Denied requests fail closed and produce zero mutations to evaluation records.
+4. **Distinction Between Revalidation Permission and Authoritative Proof:**
+   - Administrative authorization permits invoking the revalidation procedure.
+   - It does NOT by itself prove or establish that an outcome was verified.
+   - Revalidation strictly grounds eligibility decisions in persisted Verification Engine records (`VerificationRun` or `VerificationFinding`). Privileged callers cannot override or bypass canonical verification evidence.

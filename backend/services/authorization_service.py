@@ -231,6 +231,7 @@ CANONICAL_PERMISSIONS: List[Permission] = [
     Permission(permission_id="learning.outcome.read", resource="learning", action="outcome.read", description="Read observed outcomes"),
     Permission(permission_id="learning.evaluation.evaluate", resource="learning", action="evaluation.evaluate", description="Evaluate prediction against observed outcome"),
     Permission(permission_id="learning.evaluation.read", resource="learning", action="evaluation.read", description="Read outcome evaluations, aggregate metrics, and learning context"),
+    Permission(permission_id="learning.evaluation.revalidate", resource="learning", action="evaluation.revalidate", description="Administratively revalidate historical outcome evaluations and learning eligibility", is_sensitive=True),
 
 
     # System Administration (Strictly Non-Operational)
@@ -356,7 +357,7 @@ SYSTEM_ROLES: List[Role] = [
             "mission.verification.read", "mission.verification.request", "mission.verification.cancel",
             "events.record", "events.read", "events.dispatch.read",
             "autonomy.read", "autonomy.grant", "autonomy.admin",
-            "learning.prediction.record", "learning.prediction.read", "learning.outcome.record", "learning.outcome.read", "learning.evaluation.evaluate", "learning.evaluation.read"
+            "learning.prediction.record", "learning.prediction.read", "learning.outcome.record", "learning.outcome.read", "learning.evaluation.evaluate", "learning.evaluation.read", "learning.evaluation.revalidate"
         ],
         inherits_from=["VIEWER"],
         description="Platform administrator. Strictly non-operational; cannot propose or approve factory actions.",
