@@ -1028,18 +1028,36 @@ class OutcomeEvaluationService:
             )
 
         # 2. Scope checks
-        if plant_id:
-            self._validate_plant_access(identity, plant_id)
+        assigned_plants = getattr(identity, "assigned_plants", None)
+        if assigned_plants is None:
+            assigned_plants = []
+
+        clean_plant_id = plant_id.strip() if plant_id and plant_id.strip() else None
+
+        if clean_plant_id:
+            self._validate_plant_access(identity, clean_plant_id)
+        else:
+            # If no plant is explicitly requested, caller must possess explicit plant assignments or authorized wildcard
+            if not assigned_plants or len(assigned_plants) == 0:
+                self._log_audit_event(
+                    "HISTORICAL_REVALIDATION_PLANT_SCOPE_DENIED",
+                    identity,
+                    {
+                        "reason": "Identity has no assigned plants or authorized wildcard",
+                    },
+                )
+                raise OutcomeEvaluationScopeMismatchError(
+                    f"Plant scope denied: identity '{identity.user_id}' has no assigned plants or wildcard access."
+                )
 
         evals = self.repository.list_evaluations(
             tenant_id=identity.tenant_id,
             workspace_id=identity.workspace_id,
-            plant_id=plant_id,
+            plant_id=clean_plant_id,
             eligible_only=True,
             limit=limit,
         )
 
-        assigned_plants = getattr(identity, "assigned_plants", ["*"]) or ["*"]
         if "*" not in assigned_plants:
             evals = [ev for ev in evals if ev.plant_id in assigned_plants]
 
@@ -1098,7 +1116,7 @@ class OutcomeEvaluationService:
         return {
             "tenant_id": identity.tenant_id,
             "workspace_id": identity.workspace_id,
-            "plant_id": plant_id,
+            "plant_id": clean_plant_id,
             "total_checked": total_checked,
             "corrected_count": corrected_count,
             "corrected_evaluation_ids": corrected_eval_ids,
@@ -1125,10 +1143,12 @@ class OutcomeEvaluationService:
 
     def _validate_plant_access(self, identity: Identity, plant_id: str):
         """Validates plant against caller's assigned plants."""
-        assigned = getattr(identity, "assigned_plants", ["*"]) or ["*"]
+        assigned = getattr(identity, "assigned_plants", None)
+        if assigned is None:
+            assigned = []
         if "*" in assigned:
             return
-        if plant_id not in assigned:
+        if not assigned or plant_id not in assigned:
             raise OutcomeEvaluationScopeMismatchError(
                 f"Plant access denied: plant '{plant_id}' is not in assigned plants {assigned}."
             )

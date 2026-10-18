@@ -586,3 +586,7 @@ To prevent unauthorized manipulation of historical metrics:
    - Administrative authorization permits invoking the revalidation procedure.
    - It does NOT by itself prove or establish that an outcome was verified.
    - Revalidation strictly grounds eligibility decisions in persisted Verification Engine records (`VerificationRun` or `VerificationFinding`). Privileged callers cannot override or bypass canonical verification evidence.
+5. **Fail-Closed Plant Scope Enforcement:**
+   - Empty or missing plant assignments (`assigned_plants=[]` or `None`) never silently fall back to wildcard access.
+   - Wildcard plant access is honored ONLY when `"*"` is explicitly present in the authoritative identity.
+   - Unassigned identities or identities requesting an unauthorized plant are denied fail-closed before any database query or mutation occurs.

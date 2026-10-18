@@ -96,7 +96,7 @@ class UserIdentity(BaseModel):
     session_id: Optional[str] = Field(default=None, description="Optional session correlation identifier")
     status: UserStatus = Field(default=UserStatus.ACTIVE, description="Account lifecycle status")
     roles: List[str] = Field(default_factory=list, description="List of role IDs assigned to user")
-    assigned_plants: List[str] = Field(
+    assigned_plants: Optional[List[str]] = Field(
         default_factory=lambda: ["*"],
         description="Assigned plant identifiers or '*' for all plants"
     )

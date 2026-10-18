@@ -4534,3 +4534,263 @@ def test_119_privileged_caller_without_evidence_cannot_make_outcome_learning_eli
     eval_rec = service.evaluate_prediction_outcome(admin_identity, "pred_admin_fake_eligible_test", "outc_admin_fake_eligible_test")
     assert eval_rec.eligible_for_learning is False
     assert eval_rec.learning_ineligibility_reason == "OUTCOME_NOT_VERIFIED"
+
+
+# =============================================================================
+# GROUP L: PROMPT 39 CORRECTION 3 SECURITY REGRESSION (120-126)
+# Fail-Closed Plant Scope Enforcement for Historical Revalidation
+# =============================================================================
+
+def test_120_admin_with_empty_plant_assignment_cannot_revalidate_all_plants(temp_db, client):
+    """120. An administrator with assigned_plants=[] cannot revalidate all plants."""
+    repo, service = temp_db
+    admin_empty_plants = Identity(
+        user_id="user_admin_empty_plants",
+        tenant_id="tenant_alpha",
+        workspace_id="workspace_prod",
+        roles=["ADMINISTRATOR"],
+        permissions=["learning.evaluation.revalidate"],
+        assigned_plants=[],  # Explicitly empty assignment
+        clearance_level=3,
+        is_server_authoritative=True,
+    )
+
+    # 1. Service layer check: fail-closed denied
+    with pytest.raises(OutcomeEvaluationScopeMismatchError) as exc_info:
+        service.revalidate_historical_evaluations(admin_empty_plants)
+    assert "Plant scope denied" in str(exc_info.value) or "no assigned plants" in str(exc_info.value)
+
+    # 2. API layer check: returns 403 Forbidden
+    app.dependency_overrides[get_current_identity] = lambda: admin_empty_plants
+    try:
+        res = client.post("/api/v3/learning/evaluations/revalidate")
+        assert res.status_code == 403
+    finally:
+        app.dependency_overrides.pop(get_current_identity, None)
+
+
+def test_121_admin_with_missing_plant_assignment_denied_fail_closed(temp_db, client):
+    """121. An administrator with missing plant assignments is denied rather than treated as wildcard."""
+    repo, service = temp_db
+    admin_missing_plants = Identity(
+        user_id="user_admin_missing_plants",
+        tenant_id="tenant_alpha",
+        workspace_id="workspace_prod",
+        roles=["ADMINISTRATOR"],
+        permissions=["learning.evaluation.revalidate"],
+        assigned_plants=None,  # Missing/None assignment
+        clearance_level=3,
+        is_server_authoritative=True,
+    )
+
+    # 1. Calling without plant_id: denied
+    with pytest.raises(OutcomeEvaluationScopeMismatchError):
+        service.revalidate_historical_evaluations(admin_missing_plants)
+
+    # 2. Calling with explicit plant_id: also denied because caller has no plant access
+    with pytest.raises(OutcomeEvaluationScopeMismatchError):
+        service.revalidate_historical_evaluations(admin_missing_plants, plant_id="plant_01")
+
+    # 3. API layer check: returns 403 Forbidden
+    app.dependency_overrides[get_current_identity] = lambda: admin_missing_plants
+    try:
+        res = client.post("/api/v3/learning/evaluations/revalidate")
+        assert res.status_code == 403
+    finally:
+        app.dependency_overrides.pop(get_current_identity, None)
+
+
+def test_122_admin_assigned_to_plant_01_cannot_revalidate_plant_02(temp_db, client):
+    """122. An administrator assigned only to plant_01 cannot revalidate plant_02."""
+    repo, service = temp_db
+    admin_p1_only = Identity(
+        user_id="user_admin_p1_only",
+        tenant_id="tenant_alpha",
+        workspace_id="workspace_prod",
+        roles=["ADMINISTRATOR"],
+        permissions=["learning.evaluation.revalidate"],
+        assigned_plants=["plant_01"],
+        clearance_level=3,
+        is_server_authoritative=True,
+    )
+
+    # 1. Service layer check: requesting plant_02 is denied
+    with pytest.raises(OutcomeEvaluationScopeMismatchError) as exc_info:
+        service.revalidate_historical_evaluations(admin_p1_only, plant_id="plant_02")
+    assert "plant_02" in str(exc_info.value) or "Plant access denied" in str(exc_info.value)
+
+    # 2. API layer check: requesting plant_02 returns 403 Forbidden
+    app.dependency_overrides[get_current_identity] = lambda: admin_p1_only
+    try:
+        res = client.post("/api/v3/learning/evaluations/revalidate?plant_id=plant_02")
+        assert res.status_code == 403
+    finally:
+        app.dependency_overrides.pop(get_current_identity, None)
+
+
+def test_123_explicit_wildcard_admin_retains_intended_behavior(temp_db, client):
+    """123. An explicitly authorized wildcard administrator retains intended behavior."""
+    repo, service = temp_db
+    wildcard_admin = Identity(
+        user_id="user_admin_wildcard_explicit",
+        tenant_id="tenant_alpha",
+        workspace_id="workspace_prod",
+        roles=["ADMINISTRATOR"],
+        permissions=["learning.evaluation.revalidate"],
+        assigned_plants=["*"],  # Explicit wildcard
+        clearance_level=3,
+        is_server_authoritative=True,
+    )
+
+    # 1. Service layer without plant_id succeeds
+    report = service.revalidate_historical_evaluations(wildcard_admin)
+    assert "total_checked" in report
+    assert report["tenant_id"] == "tenant_alpha"
+
+    # 2. Service layer with explicit plant_id succeeds
+    report_p1 = service.revalidate_historical_evaluations(wildcard_admin, plant_id="plant_01")
+    assert report_p1["plant_id"] == "plant_01"
+
+    # 3. API layer succeeds with 200 OK
+    app.dependency_overrides[get_current_identity] = lambda: wildcard_admin
+    try:
+        res = client.post("/api/v3/learning/evaluations/revalidate")
+        assert res.status_code == 200
+        assert res.json()["tenant_id"] == "tenant_alpha"
+    finally:
+        app.dependency_overrides.pop(get_current_identity, None)
+
+
+def test_124_denied_empty_or_mismatched_plant_revalidation_causes_no_mutation(temp_db, admin_identity):
+    """124. Denied revalidation performs no evaluation-record mutation."""
+    repo, service = temp_db
+
+    eval_unmutated = PredictionOutcomeEvaluation(
+        evaluation_id="eval_unmutated_plant_scope",
+        schema_version="3.0.0",
+        tenant_id=admin_identity.tenant_id,
+        workspace_id=admin_identity.workspace_id,
+        plant_id="plant_02",
+        idempotency_key="idem_unmutated_plant_scope",
+        prediction_id="pred_plant_scope_01",
+        outcome_id="outc_plant_scope_01",
+        evaluation_status=EvaluationStatus.EVALUATED,
+        eligibility_reason="ELIGIBLE",
+        evaluation_policy_version="1.0.0",
+        metric_implementation_version="1.0.0",
+        prediction_type=PredictionType.DEMAND_FORECAST,
+        target_reference="sku_plant_scope_target",
+        predicted_value=100.0,
+        observed_value=105.0,
+        unit="units",
+        comparison_semantics="NUMERIC_ERROR",
+        absolute_error=5.0,
+        verification_reference="vrun_fake_ref",
+        eligible_for_learning=True,
+        provenance="test",
+    )
+    repo.record_evaluation(eval_unmutated)
+
+    # 1. Admin with empty assigned_plants attempts revalidation
+    admin_empty = Identity(
+        user_id="user_admin_empty_mut",
+        tenant_id=admin_identity.tenant_id,
+        workspace_id=admin_identity.workspace_id,
+        roles=["ADMINISTRATOR"],
+        permissions=["learning.evaluation.revalidate"],
+        assigned_plants=[],
+        clearance_level=3,
+        is_server_authoritative=True,
+    )
+    with pytest.raises(OutcomeEvaluationScopeMismatchError):
+        service.revalidate_historical_evaluations(admin_empty)
+
+    # Record remains unchanged
+    rec1 = repo.get_evaluation(admin_identity.tenant_id, admin_identity.workspace_id, "eval_unmutated_plant_scope")
+    assert rec1.eligible_for_learning is True
+
+    # 2. Admin assigned only to plant_01 attempts revalidation of plant_02
+    admin_p1 = Identity(
+        user_id="user_admin_p1_mut",
+        tenant_id=admin_identity.tenant_id,
+        workspace_id=admin_identity.workspace_id,
+        roles=["ADMINISTRATOR"],
+        permissions=["learning.evaluation.revalidate"],
+        assigned_plants=["plant_01"],
+        clearance_level=3,
+        is_server_authoritative=True,
+    )
+    with pytest.raises(OutcomeEvaluationScopeMismatchError):
+        service.revalidate_historical_evaluations(admin_p1, plant_id="plant_02")
+
+    # Record still remains unchanged
+    rec2 = repo.get_evaluation(admin_identity.tenant_id, admin_identity.workspace_id, "eval_unmutated_plant_scope")
+    assert rec2.eligible_for_learning is True
+
+
+def test_125_tenant_and_workspace_isolation_preserved_with_plant_scoping(temp_db):
+    """125. Tenant and workspace isolation still hold alongside plant scoping."""
+    repo, service = temp_db
+
+    admin_alpha = Identity(
+        user_id="user_admin_alpha_scoped",
+        tenant_id="tenant_alpha",
+        workspace_id="workspace_prod",
+        roles=["ADMINISTRATOR"],
+        permissions=["learning.evaluation.revalidate"],
+        assigned_plants=["*"],
+        clearance_level=3,
+        is_server_authoritative=True,
+    )
+
+    # Revalidation is strictly bounded to caller's tenant and workspace
+    rep = service.revalidate_historical_evaluations(admin_alpha)
+    assert rep["tenant_id"] == "tenant_alpha"
+    assert rep["workspace_id"] == "workspace_prod"
+
+
+def test_126_existing_authorized_revalidation_and_ordinary_evaluation_continue_working(temp_db, test_identity, admin_identity):
+    """126. Existing authorized revalidation and ordinary prediction evaluation continue to work."""
+    repo, service = temp_db
+    t1 = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    t2 = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    # 1. Ordinary evaluation by test_identity (with assigned_plants=["plant_01", "plant_02"]) succeeds
+    pred = PredictionSnapshot(
+        prediction_id="pred_regress_p126",
+        prediction_type=PredictionType.DEMAND_FORECAST,
+        target_reference="sku_regress_p126",
+        predicted_at=t1,
+        expected_value=100.0,
+        expected_unit="units",
+        prediction_provenance="service",
+        tenant_id=test_identity.tenant_id,
+        workspace_id=test_identity.workspace_id,
+        plant_id="plant_01",
+    )
+    service.record_prediction_snapshot(test_identity, pred)
+
+    outc = ObservedOutcome(
+        outcome_id="outc_regress_p126",
+        prediction_id="pred_regress_p126",
+        target_reference="sku_regress_p126",
+        outcome_type="DEMAND",
+        observed_at=t2,
+        observed_value=98.0,
+        unit="units",
+        provenance="sensor",
+        verification_status=OutcomeVerificationStatus.OBSERVED,
+        tenant_id=test_identity.tenant_id,
+        workspace_id=test_identity.workspace_id,
+        plant_id="plant_01",
+    )
+    service.record_observed_outcome(test_identity, outc)
+
+    ev = service.evaluate_prediction_outcome(test_identity, "pred_regress_p126", "outc_regress_p126")
+    assert ev.evaluation_status == EvaluationStatus.EVALUATED
+    assert ev.absolute_error == 2.0
+
+    # 2. Authorized revalidation with explicit wildcard admin succeeds
+    report = service.revalidate_historical_evaluations(admin_identity, plant_id="plant_01")
+    assert report["plant_id"] == "plant_01"
+    assert report["tenant_id"] == admin_identity.tenant_id

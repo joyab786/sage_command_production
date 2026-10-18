@@ -68,7 +68,7 @@ class Identity(BaseModel):
     session_id: Optional[str] = Field(default=None)
     authentication_method: str = Field(default="dev_auth")
     status: str = Field(default="ACTIVE")
-    assigned_plants: List[str] = Field(default_factory=lambda: ["*"])
+    assigned_plants: Optional[List[str]] = Field(default_factory=lambda: ["*"])
     clearance_level: int = Field(default=1)
     is_server_authoritative: bool = Field(default=False)
 
@@ -87,7 +87,7 @@ class Identity(BaseModel):
             session_id=self.session_id,
             status=user_status,
             roles=[r.upper() for r in self.roles],
-            assigned_plants=self.assigned_plants,
+            assigned_plants=self.assigned_plants or [],
             clearance_level=self.clearance_level
         )
 

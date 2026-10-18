@@ -66,6 +66,7 @@ Prompt 39 builds directly upon the established Prompt 37 Closed-Loop Learning Fo
 6. **Execution Isolation:** Static AST analysis (Test 86, 87, 88) verifies that outcome learning contains zero imports of `ExecutionGateway` or `ActionTool`, zero calls to `approve_action` or `approve_execution`, and zero physical SCADA/PLC/actuator commands.
 7. **Feedback Loop Guard:** Canonical events emitted by the evaluator use provenance `closed_loop_evaluator`. The event listener explicitly drops these events to break recursion loops.
 8. **Administrative Revalidation Authorization Boundary:** Revalidation endpoint `POST /api/v3/learning/evaluations/revalidate` and service method require dedicated sensitive permission `learning.evaluation.revalidate`, granted exclusively to `ADMINISTRATOR`. Ordinary evaluators, operators, and viewers are blocked (403 Forbidden). Scope restrictions (tenant, workspace, plant) are strictly enforced, and administrative privilege cannot bypass authoritative verification requirements.
+9. **Fail-Closed Plant Scope Enforcement:** Empty or missing plant assignment lists (`assigned_plants=[]` or `None`) are strictly denied rather than falling back to wildcard access. Explicit wildcard `["*"]` is required to access all plants. Unauthorized plant revalidation attempts produce zero mutations.
 
 ---
 
@@ -73,11 +74,11 @@ Prompt 39 builds directly upon the established Prompt 37 Closed-Loop Learning Fo
 
 ### 1. Focused Prompt 39 Test Suite
 Command: `python -m pytest backend/test_v3_closed_loop_outcome_evaluation.py -q`
-- **Total Tests:** 119
-- **Passed:** 119 (100%)
+- **Total Tests:** 126
+- **Passed:** 126 (100%)
 - **Failed:** 0
 - **Skipped:** 0
-- **Execution Time:** ~15.9 seconds
+- **Execution Time:** ~16.8 seconds
 
 Coverage across Groups A–I:
 - Group A: Prediction Contract (Tests 1–10) — Valid numeric/categorical snapshots, type validation, unit validation, evaluation window, scope check, immutability, timing order.
@@ -91,6 +92,7 @@ Coverage across Groups A–I:
 - Group I: Security, Scope Isolation & Architectural Boundaries (Tests 81–90) — Cross-tenant API rejection, cross-workspace API rejection, cross-plant query rejection, unauthorized outcome submission (403), AST parameterized SQL verification, AST zero ExecutionGateway / ActionTool verification, AST zero approve_action verification, AST zero physical PLC/SCADA commands verification, secret scanner rejection of bearer tokens, honest `INSUFFICIENT_DATA` metrics on empty data.
 - Group J: Prompt 39 Security Regression (Tests 91–109) — Fabricated verification reference rejection, random reference learning-ineligibility, valid run/finding resolution, non-existent run/finding handling, cross-tenant/workspace/plant reference isolation, diagnostic-only exclusion, failed/invalidated evidence exclusion, admin evidence requirement, non-privileged reference validation, unrelated finding rejection, API forged status rejection, metrics and governed context pollution guards, EventBus redelivery verification, historical revalidation remediation.
 - Group K: Prompt 39 Correction 2 Security Regression (Tests 110–119) — Dedicated permission enforcement, ordinary evaluator prohibition (403), operator prohibition (403), viewer prohibition (403), authorized administrator revalidation, unauthorized eligibility mutation prevention, denied request mutation immunity, tenant/workspace/plant scope isolation, preservation of ordinary prediction evaluation, EventBus administrative privilege exclusion, administrative verification proof requirement.
+- Group L: Prompt 39 Correction 3 Security Regression (Tests 120–126) — Empty plant assignment revalidation rejection, missing/None plant assignment fail-closed, single-plant admin cross-plant prohibition, explicit wildcard admin behavior preservation, denied plant revalidation mutation immunity, tenant and workspace scope preservation with plant boundaries, regression compatibility for existing authorized revalidation and ordinary prediction evaluation.
 
 ### 2. Regression Test Suites
 - **Existing Closed-Loop Learning Suite:** `pytest backend/test_v3_closed_loop_learning.py -q`
