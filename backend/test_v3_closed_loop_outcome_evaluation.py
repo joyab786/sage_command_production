@@ -76,6 +76,17 @@ try:
     )
     from services.outcome_learning_event_handler import OutcomeLearningEventHandler
     from services.event_bus import EventBus
+    from data.schemas.verification_contract import (
+        VerificationRun,
+        VerificationFinding,
+        VerificationStatus,
+        VerificationTargetType,
+        TriggerType,
+        EvidenceAssessment,
+        ScopeStatus,
+        QualityStatus,
+        VerificationProvenance,
+    )
 except (ImportError, ModuleNotFoundError):
     from backend.server import app
     from backend.core.auth import Identity, get_current_identity
@@ -122,6 +133,17 @@ except (ImportError, ModuleNotFoundError):
     )
     from backend.services.outcome_learning_event_handler import OutcomeLearningEventHandler
     from backend.services.event_bus import EventBus
+    from backend.data.schemas.verification_contract import (
+        VerificationRun,
+        VerificationFinding,
+        VerificationStatus,
+        VerificationTargetType,
+        TriggerType,
+        EvidenceAssessment,
+        ScopeStatus,
+        QualityStatus,
+        VerificationProvenance,
+    )
 
 
 # =============================================================================
@@ -193,6 +215,77 @@ def admin_identity():
 def client():
     """FastAPI TestClient."""
     return TestClient(app)
+
+
+def seed_authoritative_run(
+    service: OutcomeEvaluationService,
+    tenant_id: str = "tenant_alpha",
+    workspace_id: str = "workspace_prod",
+    plant_id: str = "plant_01",
+    verification_id: Optional[str] = None,
+    target_id: Optional[str] = None,
+    status: VerificationStatus = VerificationStatus.VERIFIED,
+    is_diagnostic: bool = False,
+    is_invalidated: bool = False,
+    rule_id: str = "RULE_EVIDENCE_VALIDATED_V1",
+    finding_id: Optional[str] = None,
+) -> VerificationRun:
+    """Helper to seed an authoritative VerificationRun and VerificationFinding in the Verification Engine."""
+    v_id = verification_id or f"vrun_{uuid.uuid4().hex[:12]}"
+    f_id = finding_id or f"vf_{uuid.uuid4().hex[:12]}"
+    t_id = target_id or "default_target"
+    finding = VerificationFinding(
+        finding_id=f_id,
+        target_type=VerificationTargetType.CRITERION,
+        target_id=t_id,
+        status=status,
+        evidence_references=["ev_1"],
+        evidence_assessments=[
+            EvidenceAssessment(
+                evidence_id="ev_1",
+                source_type="TELEMETRY",
+                integrity_status="INVALID" if is_invalidated else "VALID",
+                scope_status=ScopeStatus.REJECTED if is_invalidated else ScopeStatus.AUTHORIZED,
+                quality_status=QualityStatus.INVALID if is_invalidated else QualityStatus.VALID,
+            )
+        ],
+        rule_id=rule_id,
+        rule_version="1.0.0",
+        explanation="Authoritative test finding",
+        limitations=[],
+    )
+    run = VerificationRun(
+        verification_id=v_id,
+        mission_id="m_test_mission",
+        mission_revision=1,
+        verification_scope="FULL_MISSION",
+        status=status if not is_diagnostic else VerificationStatus.NOT_VERIFIED,
+        requested_by="test_user",
+        tenant_id=tenant_id,
+        workspace_id=workspace_id,
+        plant_id=plant_id,
+        trigger_type=TriggerType.MANUAL,
+        rule_set_version="1.0.0",
+        summary="Test verification run" + (" INVALIDATED" if is_invalidated else ""),
+        target_count=1,
+        verified_count=1 if status == VerificationStatus.VERIFIED and not is_diagnostic else 0,
+        failed_count=1 if status == VerificationStatus.FAILED else 0,
+        indeterminate_count=1 if status == VerificationStatus.INDETERMINATE else 0,
+        findings=[finding],
+        provenance=VerificationProvenance(
+            verification_id=v_id,
+            mission_id="m_test_mission",
+            mission_revision=1,
+            rule_set_version="1.0.0",
+            evaluator_version="1.0.0",
+            evidence_ids=["ev_1"],
+        ),
+        is_diagnostic=is_diagnostic,
+        diagnostic_status=VerificationStatus.VERIFIED if is_diagnostic else None,
+        diagnostic_outcome="CONFIRMED" if is_diagnostic else None,
+    )
+    service.verification_repository.save_run_atomic(run)
+    return run
 
 
 # =============================================================================
@@ -499,6 +592,15 @@ def test_13_valid_verified_outcome(temp_db, test_identity, admin_identity):
         plant_id="plant_01",
     )
     service.record_prediction_snapshot(test_identity, pred)
+
+    seed_authoritative_run(
+        service,
+        tenant_id=admin_identity.tenant_id,
+        workspace_id=admin_identity.workspace_id,
+        plant_id="plant_01",
+        verification_id="vrun_998811",
+        target_id="sku_widget_c",
+    )
 
     outc = ObservedOutcome(
         outcome_id="outc_ver_01",
@@ -1333,6 +1435,17 @@ def test_37_diagnostic_verification_cannot_masquerade_as_authoritative(temp_db, 
     )
     service.record_prediction_snapshot(test_identity, pred)
 
+    seed_authoritative_run(
+        service,
+        tenant_id=admin_identity.tenant_id,
+        workspace_id=admin_identity.workspace_id,
+        plant_id="plant_01",
+        verification_id="vrun_diag_01",
+        target_id="line_diag",
+        is_diagnostic=True,
+        rule_id="RULE_EVIDENCE_EXISTS_V1",
+    )
+
     outc = ObservedOutcome(
         outcome_id="outc_diag_01",
         target_reference="line_diag",
@@ -1737,6 +1850,14 @@ def test_47_correct_mean_absolute_error(temp_db, test_identity, admin_identity):
 
     # Insert 5 pairs: errors = 2, 4, 6, 8, 10 -> MAE = 30 / 5 = 6.0
     for i, err in enumerate([2.0, 4.0, 6.0, 8.0, 10.0]):
+        seed_authoritative_run(
+            service,
+            tenant_id=admin_identity.tenant_id,
+            workspace_id=admin_identity.workspace_id,
+            plant_id="plant_01",
+            verification_id=f"v_{i}",
+            target_id=f"cost_mae_{i}",
+        )
         pred = PredictionSnapshot(
             prediction_id=f"pred_mae_{i}",
             prediction_type=PredictionType.OPERATIONAL_COST,
@@ -1782,6 +1903,14 @@ def test_48_correct_root_mean_squared_error(temp_db, test_identity, admin_identi
 
     # Errors: 3, 4 -> err^2 = 9, 16 -> sum = 25 -> mean = 12.5 -> sqrt(12.5) = 3.5355
     for i, err in enumerate([3.0, 4.0]):
+        seed_authoritative_run(
+            service,
+            tenant_id=admin_identity.tenant_id,
+            workspace_id=admin_identity.workspace_id,
+            plant_id="plant_01",
+            verification_id=f"v_{i}",
+            target_id=f"line_rmse_{i}",
+        )
         pred = PredictionSnapshot(
             prediction_id=f"pred_rmse_{i}",
             prediction_type=PredictionType.RECOVERY_DURATION,
@@ -1825,6 +1954,14 @@ def test_49_correct_signed_mean_bias(temp_db, test_identity, admin_identity):
 
     # y = 110, y_hat = 100 -> signed = +10; y = 104, y_hat = 100 -> signed = +4 -> mean = +7.0
     for i, act in enumerate([110.0, 104.0]):
+        seed_authoritative_run(
+            service,
+            tenant_id=admin_identity.tenant_id,
+            workspace_id=admin_identity.workspace_id,
+            plant_id="plant_01",
+            verification_id=f"v_{i}",
+            target_id=f"line_bias_{i}",
+        )
         pred = PredictionSnapshot(
             prediction_id=f"pred_bias_{i}",
             prediction_type=PredictionType.PRODUCTION_THROUGHPUT,
@@ -1941,6 +2078,23 @@ def test_52_incompatible_prediction_types_not_combined(temp_db, test_identity, a
     service.record_prediction_snapshot(test_identity, pred1)
     service.record_prediction_snapshot(test_identity, pred2)
 
+    seed_authoritative_run(
+        service,
+        tenant_id=admin_identity.tenant_id,
+        workspace_id=admin_identity.workspace_id,
+        plant_id="plant_01",
+        verification_id="v1",
+        target_id="sku_dom_1",
+    )
+    seed_authoritative_run(
+        service,
+        tenant_id=admin_identity.tenant_id,
+        workspace_id=admin_identity.workspace_id,
+        plant_id="plant_01",
+        verification_id="v2",
+        target_id="sku_dom_2",
+    )
+
     outc1 = ObservedOutcome(
         outcome_id="outc_dom_1",
         target_reference="sku_dom_1",
@@ -2032,6 +2186,23 @@ def test_54_simulation_and_real_outcomes_not_silently_mixed(temp_db, test_identi
     )
     service.record_prediction_snapshot(test_identity, pred_real)
     service.record_prediction_snapshot(test_identity, pred_sim)
+
+    seed_authoritative_run(
+        service,
+        tenant_id=admin_identity.tenant_id,
+        workspace_id=admin_identity.workspace_id,
+        plant_id="plant_01",
+        verification_id="v1",
+        target_id="sku_r",
+    )
+    seed_authoritative_run(
+        service,
+        tenant_id=admin_identity.tenant_id,
+        workspace_id=admin_identity.workspace_id,
+        plant_id="plant_01",
+        verification_id="v2",
+        target_id="sku_s",
+    )
 
     outc_real = ObservedOutcome(
         outcome_id="outc_r",
@@ -2164,6 +2335,15 @@ def test_58_eligible_evaluation_retrievable_within_scope(temp_db, test_identity,
         plant_id="plant_01",
     )
     service.record_prediction_snapshot(test_identity, pred)
+
+    seed_authoritative_run(
+        service,
+        tenant_id=admin_identity.tenant_id,
+        workspace_id=admin_identity.workspace_id,
+        plant_id="plant_01",
+        verification_id="v1",
+        target_id="line_ctx",
+    )
 
     outc = ObservedOutcome(
         outcome_id="outc_ctx_1",
@@ -2780,6 +2960,15 @@ def test_79_concurrent_metric_queries_return_consistent_results(temp_db, test_id
     )
     service.record_prediction_snapshot(test_identity, pred)
 
+    seed_authoritative_run(
+        service,
+        tenant_id=admin_identity.tenant_id,
+        workspace_id=admin_identity.workspace_id,
+        plant_id="plant_01",
+        verification_id="v1",
+        target_id="sku_cm",
+    )
+
     outc = ObservedOutcome(
         outcome_id="outc_conc_m",
         target_reference="sku_cm",
@@ -3009,3 +3198,948 @@ def test_90_no_fabricated_metrics_on_failure(temp_db, test_identity):
     assert metrics.root_mean_squared_error is None
     assert metrics.signed_mean_error is None
     assert metrics.sample_status == "INSUFFICIENT_DATA"
+
+
+# =============================================================================
+# GROUP J: PROMPT 39 SECURITY REGRESSION (91-109)
+# Authoritative Outcome Verification & Learning-Eligibility Hardening
+# =============================================================================
+
+def test_91_fabricated_non_empty_verification_reference_cannot_produce_verified_outcome(temp_db, test_identity):
+    """91. A fabricated non-empty verification reference cannot produce a verified outcome."""
+    repo, service = temp_db
+    now_str = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    outc = ObservedOutcome(
+        outcome_id="outc_fab_ref_01",
+        target_reference="sku_fab_target",
+        outcome_type="DEMAND",
+        observed_at=now_str,
+        observed_value=100.0,
+        provenance="sensor",
+        verification_status=OutcomeVerificationStatus.VERIFIED,
+        verification_reference="vrun_fabricated_fake_reference_99999",
+        tenant_id=test_identity.tenant_id,
+        workspace_id=test_identity.workspace_id,
+        plant_id="plant_01",
+    )
+    saved = service.record_observed_outcome(test_identity, outc)
+
+    # Must be downgraded to OBSERVED, reference cleared, and ineligible
+    assert saved.verification_status == OutcomeVerificationStatus.OBSERVED
+    assert saved.verification_reference is None
+
+    retrieved = service.get_observed_outcome(test_identity, "outc_fab_ref_01")
+    assert retrieved.verification_status == OutcomeVerificationStatus.OBSERVED
+    assert retrieved.verification_reference is None
+
+
+def test_92_random_reference_with_verified_status_not_learning_eligible(temp_db, test_identity):
+    """92. A random reference with VERIFIED status is not learning-eligible."""
+    repo, service = temp_db
+    t1 = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    t2 = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    pred = PredictionSnapshot(
+        prediction_id="pred_rand_ref_01",
+        prediction_type=PredictionType.DEMAND_FORECAST,
+        target_reference="sku_rand_ref",
+        predicted_at=t1,
+        expected_value=100.0,
+        prediction_provenance="service",
+        tenant_id=test_identity.tenant_id,
+        workspace_id=test_identity.workspace_id,
+        plant_id="plant_01",
+    )
+    service.record_prediction_snapshot(test_identity, pred)
+
+    outc = ObservedOutcome(
+        outcome_id="outc_rand_ref_01",
+        prediction_id="pred_rand_ref_01",
+        target_reference="sku_rand_ref",
+        outcome_type="DEMAND",
+        observed_at=t2,
+        observed_value=105.0,
+        provenance="sensor",
+        verification_status=OutcomeVerificationStatus.VERIFIED,
+        verification_reference="vrun_random_token_xyz_8877",
+        tenant_id=test_identity.tenant_id,
+        workspace_id=test_identity.workspace_id,
+        plant_id="plant_01",
+    )
+    service.record_observed_outcome(test_identity, outc)
+
+    ev = service.evaluate_prediction_outcome(test_identity, "pred_rand_ref_01", "outc_rand_ref_01")
+    assert ev.eligible_for_learning is False
+    assert ev.learning_ineligibility_reason == "OUTCOME_NOT_VERIFIED"
+
+
+def test_93_valid_reference_to_authoritative_in_scope_record_follows_workflow(temp_db, test_identity, admin_identity):
+    """93. A valid reference to an authoritative, in-scope verification record follows the intended workflow."""
+    repo, service = temp_db
+    t1 = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    t2 = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    # Seed authoritative verification run in Verification Engine
+    seed_authoritative_run(
+        service,
+        tenant_id=test_identity.tenant_id,
+        workspace_id=test_identity.workspace_id,
+        plant_id="plant_01",
+        verification_id="vrun_auth_valid_01",
+        target_id="sku_auth_valid",
+        status=VerificationStatus.VERIFIED,
+    )
+
+    pred = PredictionSnapshot(
+        prediction_id="pred_auth_valid_01",
+        prediction_type=PredictionType.DEMAND_FORECAST,
+        target_reference="sku_auth_valid",
+        predicted_at=t1,
+        expected_value=200.0,
+        prediction_provenance="service",
+        tenant_id=test_identity.tenant_id,
+        workspace_id=test_identity.workspace_id,
+        plant_id="plant_01",
+    )
+    service.record_prediction_snapshot(test_identity, pred)
+
+    outc = ObservedOutcome(
+        outcome_id="outc_auth_valid_01",
+        prediction_id="pred_auth_valid_01",
+        target_reference="sku_auth_valid",
+        outcome_type="DEMAND",
+        observed_at=t2,
+        observed_value=210.0,
+        provenance="sensor",
+        verification_status=OutcomeVerificationStatus.VERIFIED,
+        verification_reference="vrun_auth_valid_01",
+        tenant_id=admin_identity.tenant_id,
+        workspace_id=admin_identity.workspace_id,
+        plant_id="plant_01",
+    )
+    saved_outc = service.record_observed_outcome(admin_identity, outc)
+    assert saved_outc.verification_status == OutcomeVerificationStatus.VERIFIED
+    assert saved_outc.verification_reference == "vrun_auth_valid_01"
+
+    ev = service.evaluate_prediction_outcome(test_identity, "pred_auth_valid_01", "outc_auth_valid_01")
+    assert ev.evaluation_status == EvaluationStatus.EVALUATED
+    assert ev.eligible_for_learning is True
+    assert ev.learning_ineligibility_reason is None
+    assert ev.absolute_error == 10.0
+
+
+def test_94_reference_to_nonexistent_run_remains_unverified(temp_db, test_identity):
+    """94. A reference to a nonexistent run is rejected or remains explicitly unverified."""
+    repo, service = temp_db
+    now_str = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    outc = ObservedOutcome(
+        outcome_id="outc_nonexist_run",
+        target_reference="sku_nonexist_run",
+        outcome_type="DEMAND",
+        observed_at=now_str,
+        observed_value=50.0,
+        provenance="sensor",
+        verification_status=OutcomeVerificationStatus.VERIFIED,
+        verification_reference="vrun_0000000000000000",
+        tenant_id=test_identity.tenant_id,
+        workspace_id=test_identity.workspace_id,
+        plant_id="plant_01",
+    )
+    saved = service.record_observed_outcome(test_identity, outc)
+    assert saved.verification_status == OutcomeVerificationStatus.OBSERVED
+    assert saved.verification_reference is None
+
+
+def test_95_reference_to_nonexistent_finding_remains_unverified(temp_db, test_identity):
+    """95. A reference to a nonexistent finding is rejected or remains explicitly unverified."""
+    repo, service = temp_db
+    now_str = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    outc = ObservedOutcome(
+        outcome_id="outc_nonexist_find",
+        target_reference="sku_nonexist_find",
+        outcome_type="DEMAND",
+        observed_at=now_str,
+        observed_value=50.0,
+        provenance="sensor",
+        verification_status=OutcomeVerificationStatus.VERIFIED,
+        verification_reference="vf_000000000000",
+        tenant_id=test_identity.tenant_id,
+        workspace_id=test_identity.workspace_id,
+        plant_id="plant_01",
+    )
+    saved = service.record_observed_outcome(test_identity, outc)
+    assert saved.verification_status == OutcomeVerificationStatus.OBSERVED
+    assert saved.verification_reference is None
+
+
+def test_96_cross_tenant_verification_reference_rejected_without_leakage(temp_db, test_identity):
+    """96. A cross-tenant verification reference is rejected without leaking whether the other tenant's record exists."""
+    repo, service = temp_db
+    now_str = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    # Seed authoritative run under tenant_beta
+    seed_authoritative_run(
+        service,
+        tenant_id="tenant_beta",
+        workspace_id="workspace_prod",
+        plant_id="plant_01",
+        verification_id="vrun_tenant_beta_secret",
+        target_id="sku_cross_t",
+        status=VerificationStatus.VERIFIED,
+    )
+
+    # Caller belongs to tenant_alpha (test_identity.tenant_id)
+    outc = ObservedOutcome(
+        outcome_id="outc_cross_tenant_01",
+        target_reference="sku_cross_t",
+        outcome_type="DEMAND",
+        observed_at=now_str,
+        observed_value=50.0,
+        provenance="sensor",
+        verification_status=OutcomeVerificationStatus.VERIFIED,
+        verification_reference="vrun_tenant_beta_secret",
+        tenant_id=test_identity.tenant_id,
+        workspace_id=test_identity.workspace_id,
+        plant_id="plant_01",
+    )
+    saved = service.record_observed_outcome(test_identity, outc)
+
+    # Must be safely downgraded with zero leakage
+    assert saved.verification_status == OutcomeVerificationStatus.OBSERVED
+    assert saved.verification_reference is None
+
+    # Check direct internal lookup with cross-tenant reference fails closed without disclosure
+    cross_outc = ObservedOutcome(
+        outcome_id="outc_cross_tenant_check",
+        target_reference="sku_cross_t",
+        outcome_type="DEMAND",
+        observed_at=now_str,
+        observed_value=50.0,
+        provenance="sensor",
+        verification_status=OutcomeVerificationStatus.VERIFIED,
+        verification_reference="vrun_tenant_beta_secret",
+        tenant_id=test_identity.tenant_id,
+        workspace_id=test_identity.workspace_id,
+        plant_id="plant_01",
+    )
+    is_valid, reason, rec = service._validate_authoritative_verification(test_identity, cross_outc)
+    assert is_valid is False
+    assert reason == "VERIFICATION_RECORD_NOT_FOUND"  # Generic not found, no disclosure of tenant_beta record
+    assert rec is None
+
+
+def test_97_cross_workspace_verification_reference_rejected(temp_db, test_identity):
+    """97. A cross-workspace verification reference is rejected."""
+    repo, service = temp_db
+    now_str = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    # Seed authoritative run in workspace_dev
+    seed_authoritative_run(
+        service,
+        tenant_id=test_identity.tenant_id,
+        workspace_id="workspace_dev",
+        plant_id="plant_01",
+        verification_id="vrun_dev_ws_01",
+        target_id="sku_cross_ws",
+        status=VerificationStatus.VERIFIED,
+    )
+
+    # Caller submits outcome in workspace_prod
+    outc = ObservedOutcome(
+        outcome_id="outc_cross_ws_01",
+        target_reference="sku_cross_ws",
+        outcome_type="DEMAND",
+        observed_at=now_str,
+        observed_value=50.0,
+        provenance="sensor",
+        verification_status=OutcomeVerificationStatus.VERIFIED,
+        verification_reference="vrun_dev_ws_01",
+        tenant_id=test_identity.tenant_id,
+        workspace_id=test_identity.workspace_id,  # workspace_prod
+        plant_id="plant_01",
+    )
+    saved = service.record_observed_outcome(test_identity, outc)
+    assert saved.verification_status == OutcomeVerificationStatus.OBSERVED
+    assert saved.verification_reference is None
+
+
+def test_98_cross_plant_verification_reference_rejected(temp_db, test_identity):
+    """98. A cross-plant verification reference is rejected."""
+    repo, service = temp_db
+    now_str = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    # Seed authoritative run in plant_02
+    seed_authoritative_run(
+        service,
+        tenant_id=test_identity.tenant_id,
+        workspace_id=test_identity.workspace_id,
+        plant_id="plant_02",
+        verification_id="vrun_plant_02_01",
+        target_id="sku_cross_plant",
+        status=VerificationStatus.VERIFIED,
+    )
+
+    # Caller submits outcome for plant_01
+    outc = ObservedOutcome(
+        outcome_id="outc_cross_plant_01",
+        target_reference="sku_cross_plant",
+        outcome_type="DEMAND",
+        observed_at=now_str,
+        observed_value=50.0,
+        provenance="sensor",
+        verification_status=OutcomeVerificationStatus.VERIFIED,
+        verification_reference="vrun_plant_02_01",
+        tenant_id=test_identity.tenant_id,
+        workspace_id=test_identity.workspace_id,
+        plant_id="plant_01",
+    )
+    saved = service.record_observed_outcome(test_identity, outc)
+    assert saved.verification_status == OutcomeVerificationStatus.OBSERVED
+    assert saved.verification_reference is None
+
+
+def test_99_diagnostic_only_verification_cannot_establish_learning_eligibility(temp_db, test_identity, admin_identity):
+    """99. A diagnostic-only verification cannot establish learning eligibility."""
+    repo, service = temp_db
+    t1 = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    t2 = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    # Seed diagnostic verification run (e.g., rule RULE_EVIDENCE_EXISTS_V1)
+    seed_authoritative_run(
+        service,
+        tenant_id=test_identity.tenant_id,
+        workspace_id=test_identity.workspace_id,
+        plant_id="plant_01",
+        verification_id="vrun_diag_only_01",
+        target_id="sku_diag_target",
+        status=VerificationStatus.VERIFIED,
+        is_diagnostic=True,
+        rule_id="RULE_EVIDENCE_EXISTS_V1",
+    )
+
+    pred = PredictionSnapshot(
+        prediction_id="pred_diag_test",
+        prediction_type=PredictionType.DEMAND_FORECAST,
+        target_reference="sku_diag_target",
+        predicted_at=t1,
+        expected_value=100.0,
+        prediction_provenance="service",
+        tenant_id=test_identity.tenant_id,
+        workspace_id=test_identity.workspace_id,
+        plant_id="plant_01",
+    )
+    service.record_prediction_snapshot(test_identity, pred)
+
+    outc = ObservedOutcome(
+        outcome_id="outc_diag_test",
+        prediction_id="pred_diag_test",
+        target_reference="sku_diag_target",
+        outcome_type="DEMAND",
+        observed_at=t2,
+        observed_value=105.0,
+        provenance="sensor",
+        verification_status=OutcomeVerificationStatus.VERIFIED,
+        verification_reference="vrun_diag_only_01",
+        tenant_id=admin_identity.tenant_id,
+        workspace_id=admin_identity.workspace_id,
+        plant_id="plant_01",
+    )
+    saved = service.record_observed_outcome(admin_identity, outc)
+    assert saved.is_diagnostic is True
+
+    ev = service.evaluate_prediction_outcome(test_identity, "pred_diag_test", "outc_diag_test")
+    assert ev.eligible_for_learning is False
+    assert ev.learning_ineligibility_reason == "DIAGNOSTIC_VERIFICATION_ONLY"
+
+
+def test_100_failed_rejected_indeterminate_or_invalidated_cannot_establish_learning(temp_db, test_identity, admin_identity):
+    """100. A failed, rejected, indeterminate, or invalidated verification cannot establish learning eligibility."""
+    repo, service = temp_db
+    t1 = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    t2 = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    # Case A: FAILED run
+    seed_authoritative_run(
+        service,
+        tenant_id=test_identity.tenant_id,
+        workspace_id=test_identity.workspace_id,
+        plant_id="plant_01",
+        verification_id="vrun_failed_01",
+        target_id="sku_failed_target",
+        status=VerificationStatus.FAILED,
+    )
+    # Case B: INDETERMINATE run
+    seed_authoritative_run(
+        service,
+        tenant_id=test_identity.tenant_id,
+        workspace_id=test_identity.workspace_id,
+        plant_id="plant_01",
+        verification_id="vrun_indet_01",
+        target_id="sku_indet_target",
+        status=VerificationStatus.INDETERMINATE,
+    )
+    # Case C: Invalidated / Rejected evidence run
+    seed_authoritative_run(
+        service,
+        tenant_id=test_identity.tenant_id,
+        workspace_id=test_identity.workspace_id,
+        plant_id="plant_01",
+        verification_id="vrun_inval_01",
+        target_id="sku_inval_target",
+        status=VerificationStatus.VERIFIED,
+        is_invalidated=True,
+    )
+
+    for case_id, ref, target in [
+        ("failed", "vrun_failed_01", "sku_failed_target"),
+        ("indet", "vrun_indet_01", "sku_indet_target"),
+        ("inval", "vrun_inval_01", "sku_inval_target"),
+    ]:
+        pred = PredictionSnapshot(
+            prediction_id=f"pred_bad_{case_id}",
+            prediction_type=PredictionType.DEMAND_FORECAST,
+            target_reference=target,
+            predicted_at=t1,
+            expected_value=100.0,
+            prediction_provenance="service",
+            tenant_id=test_identity.tenant_id,
+            workspace_id=test_identity.workspace_id,
+            plant_id="plant_01",
+        )
+        service.record_prediction_snapshot(test_identity, pred)
+
+        outc = ObservedOutcome(
+            outcome_id=f"outc_bad_{case_id}",
+            prediction_id=f"pred_bad_{case_id}",
+            target_reference=target,
+            outcome_type="DEMAND",
+            observed_at=t2,
+            observed_value=105.0,
+            provenance="sensor",
+            verification_status=OutcomeVerificationStatus.VERIFIED,
+            verification_reference=ref,
+            tenant_id=admin_identity.tenant_id,
+            workspace_id=admin_identity.workspace_id,
+            plant_id="plant_01",
+        )
+        saved = service.record_observed_outcome(admin_identity, outc)
+        assert saved.verification_status == OutcomeVerificationStatus.OBSERVED
+
+        ev = service.evaluate_prediction_outcome(test_identity, f"pred_bad_{case_id}", f"outc_bad_{case_id}")
+        assert ev.eligible_for_learning is False
+
+
+def test_101_administrator_role_without_verification_evidence_cannot_bypass(temp_db, admin_identity):
+    """101. An administrator role without authoritative verification evidence cannot bypass the checks."""
+    repo, service = temp_db
+    now_str = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    outc = ObservedOutcome(
+        outcome_id="outc_admin_bypass_attempt",
+        target_reference="sku_admin_bypass",
+        outcome_type="DEMAND",
+        observed_at=now_str,
+        observed_value=100.0,
+        provenance="admin_portal",
+        verification_status=OutcomeVerificationStatus.VERIFIED,
+        verification_reference="vrun_fake_admin_bypass",
+        tenant_id=admin_identity.tenant_id,
+        workspace_id=admin_identity.workspace_id,
+        plant_id="plant_01",
+    )
+    # Admin calls record_observed_outcome
+    saved = service.record_observed_outcome(admin_identity, outc)
+
+    # Server-side validation must not bypass for admin
+    assert saved.verification_status == OutcomeVerificationStatus.OBSERVED
+    assert saved.verification_reference is None
+
+
+def test_102_non_privileged_caller_cannot_bypass_with_plausible_reference(temp_db, test_identity):
+    """102. A non-privileged caller cannot bypass verification by supplying a plausible-looking reference."""
+    repo, service = temp_db
+    now_str = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    outc = ObservedOutcome(
+        outcome_id="outc_plausible_ref",
+        target_reference="sku_plausible",
+        outcome_type="DEMAND",
+        observed_at=now_str,
+        observed_value=100.0,
+        provenance="sensor",
+        verification_status=OutcomeVerificationStatus.VERIFIED,
+        verification_reference="vrun_9a8b7c6d5e4f3a2b",  # Plausible 64-char uuid hex
+        tenant_id=test_identity.tenant_id,
+        workspace_id=test_identity.workspace_id,
+        plant_id="plant_01",
+    )
+    saved = service.record_observed_outcome(test_identity, outc)
+    assert saved.verification_status == OutcomeVerificationStatus.OBSERVED
+    assert saved.verification_reference is None
+
+
+def test_103_valid_reference_to_unrelated_finding_cannot_verify_target(temp_db, test_identity, admin_identity):
+    """103. A valid-looking reference to an unrelated verification finding cannot verify the target outcome."""
+    repo, service = temp_db
+    now_str = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    # Seed authoritative run for an unrelated target
+    seed_authoritative_run(
+        service,
+        tenant_id=test_identity.tenant_id,
+        workspace_id=test_identity.workspace_id,
+        plant_id="plant_01",
+        verification_id="vrun_unrelated_sensor",
+        target_id="sensor_boiler_pressure_99",
+        status=VerificationStatus.VERIFIED,
+    )
+
+    # Outcome claims this verification for demand forecast target
+    outc = ObservedOutcome(
+        outcome_id="outc_unrelated_target",
+        target_reference="sku_chocolate_bars_50g",
+        outcome_type="DEMAND",
+        observed_at=now_str,
+        observed_value=500.0,
+        provenance="erp",
+        verification_status=OutcomeVerificationStatus.VERIFIED,
+        verification_reference="vrun_unrelated_sensor",
+        tenant_id=admin_identity.tenant_id,
+        workspace_id=admin_identity.workspace_id,
+        plant_id="plant_01",
+    )
+    saved = service.record_observed_outcome(admin_identity, outc)
+
+    # Must be downgraded due to target mismatch
+    assert saved.verification_status == OutcomeVerificationStatus.OBSERVED
+    assert saved.verification_reference is None
+
+
+def test_104_api_cannot_forge_authoritative_verification_status(client, admin_identity):
+    """104. The API cannot forge authoritative verification status through request JSON."""
+    app.dependency_overrides[get_current_identity] = lambda: admin_identity
+    try:
+        now_str = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        outc_id = f"outc_api_forge_{uuid.uuid4().hex[:12]}"
+        res = client.post(
+            "/api/v3/learning/outcomes",
+            json={
+                "outcome_id": outc_id,
+                "target_reference": "sku_api_forge",
+                "outcome_type": "DEMAND",
+                "observed_at": now_str,
+                "recorded_at": now_str,
+                "observed_value": 75.0,
+                "provenance": "sensor",
+                "verification_status": "VERIFIED",
+                "verification_reference": "vrun_fabricated_api_token",
+                "data_mode": "REAL",
+                "tenant_id": admin_identity.tenant_id,
+                "workspace_id": admin_identity.workspace_id,
+                "plant_id": "plant_01",
+            },
+        )
+        assert res.status_code == 201
+        data = res.json()
+        # Server must override/downgrade to OBSERVED and clear reference
+        assert data["verification_status"] == "OBSERVED"
+        assert data["verification_reference"] is None
+    finally:
+        app.dependency_overrides.pop(get_current_identity, None)
+
+
+def test_105_rejected_verification_evidence_does_not_contaminate_metrics(temp_db, test_identity, admin_identity):
+    """105. Rejected verification evidence does not contaminate aggregate metrics."""
+    repo, service = temp_db
+    t1 = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
+    t2 = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    # 1. Genuine verified evaluation (error = 5.0)
+    seed_authoritative_run(
+        service,
+        tenant_id=test_identity.tenant_id,
+        workspace_id=test_identity.workspace_id,
+        plant_id="plant_01",
+        verification_id="vrun_metric_genuine",
+        target_id="cost_metric_gen",
+        status=VerificationStatus.VERIFIED,
+    )
+    pred_g = PredictionSnapshot(
+        prediction_id="pred_metric_gen",
+        prediction_type=PredictionType.OPERATIONAL_COST,
+        target_reference="cost_metric_gen",
+        predicted_at=t1,
+        expected_value=100.0,
+        expected_unit="usd",
+        prediction_provenance="service",
+        tenant_id=test_identity.tenant_id,
+        workspace_id=test_identity.workspace_id,
+        plant_id="plant_01",
+    )
+    service.record_prediction_snapshot(test_identity, pred_g)
+    outc_g = ObservedOutcome(
+        outcome_id="outc_metric_gen",
+        target_reference="cost_metric_gen",
+        outcome_type="COST",
+        observed_at=t2,
+        observed_value=105.0,
+        unit="usd",
+        provenance="sensor",
+        verification_status=OutcomeVerificationStatus.VERIFIED,
+        verification_reference="vrun_metric_genuine",
+        tenant_id=admin_identity.tenant_id,
+        workspace_id=admin_identity.workspace_id,
+        plant_id="plant_01",
+    )
+    service.record_observed_outcome(admin_identity, outc_g)
+    service.evaluate_prediction_outcome(test_identity, "pred_metric_gen", "outc_metric_gen")
+
+    # 2. Fabricated reference evaluation (error = 500.0)
+    pred_f = PredictionSnapshot(
+        prediction_id="pred_metric_fab",
+        prediction_type=PredictionType.OPERATIONAL_COST,
+        target_reference="cost_metric_fab",
+        predicted_at=t1,
+        expected_value=100.0,
+        expected_unit="usd",
+        prediction_provenance="service",
+        tenant_id=test_identity.tenant_id,
+        workspace_id=test_identity.workspace_id,
+        plant_id="plant_01",
+    )
+    service.record_prediction_snapshot(test_identity, pred_f)
+    outc_f = ObservedOutcome(
+        outcome_id="outc_metric_fab",
+        target_reference="cost_metric_fab",
+        outcome_type="COST",
+        observed_at=t2,
+        observed_value=600.0,
+        unit="usd",
+        provenance="sensor",
+        verification_status=OutcomeVerificationStatus.VERIFIED,
+        verification_reference="vrun_fake_metric_ref",
+        tenant_id=admin_identity.tenant_id,
+        workspace_id=admin_identity.workspace_id,
+        plant_id="plant_01",
+    )
+    service.record_observed_outcome(admin_identity, outc_f)
+    service.evaluate_prediction_outcome(test_identity, "pred_metric_fab", "outc_metric_fab")
+
+    metrics = service.get_aggregate_metrics(test_identity, PredictionType.OPERATIONAL_COST, min_sample_threshold=1)
+    # Only genuine evaluation is included
+    assert metrics.eligible_sample_count == 1
+    assert metrics.mean_absolute_error == 5.0
+
+
+def test_106_rejected_verification_evidence_does_not_enter_governed_learning_context(temp_db, test_identity, admin_identity):
+    """106. Rejected verification evidence does not enter governed learning context."""
+    repo, service = temp_db
+    t1 = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
+    t2 = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    seed_authoritative_run(
+        service,
+        tenant_id=test_identity.tenant_id,
+        workspace_id=test_identity.workspace_id,
+        plant_id="plant_01",
+        verification_id="vrun_ctx_genuine",
+        target_id="cost_ctx_gen",
+        status=VerificationStatus.VERIFIED,
+    )
+    pred_g = PredictionSnapshot(
+        prediction_id="pred_ctx_gen",
+        prediction_type=PredictionType.OPERATIONAL_COST,
+        target_reference="cost_ctx_gen",
+        predicted_at=t1,
+        expected_value=50.0,
+        expected_unit="usd",
+        prediction_provenance="service",
+        tenant_id=test_identity.tenant_id,
+        workspace_id=test_identity.workspace_id,
+        plant_id="plant_01",
+    )
+    service.record_prediction_snapshot(test_identity, pred_g)
+    outc_g = ObservedOutcome(
+        outcome_id="outc_ctx_gen",
+        target_reference="cost_ctx_gen",
+        outcome_type="COST",
+        observed_at=t2,
+        observed_value=52.0,
+        unit="usd",
+        provenance="sensor",
+        verification_status=OutcomeVerificationStatus.VERIFIED,
+        verification_reference="vrun_ctx_genuine",
+        tenant_id=admin_identity.tenant_id,
+        workspace_id=admin_identity.workspace_id,
+        plant_id="plant_01",
+    )
+    service.record_observed_outcome(admin_identity, outc_g)
+    service.evaluate_prediction_outcome(test_identity, "pred_ctx_gen", "outc_ctx_gen")
+
+    # Add outcome with invalidated evidence
+    seed_authoritative_run(
+        service,
+        tenant_id=test_identity.tenant_id,
+        workspace_id=test_identity.workspace_id,
+        plant_id="plant_01",
+        verification_id="vrun_ctx_inval",
+        target_id="cost_ctx_inval",
+        status=VerificationStatus.VERIFIED,
+        is_invalidated=True,
+    )
+    pred_inv = PredictionSnapshot(
+        prediction_id="pred_ctx_inv",
+        prediction_type=PredictionType.OPERATIONAL_COST,
+        target_reference="cost_ctx_inval",
+        predicted_at=t1,
+        expected_value=50.0,
+        expected_unit="usd",
+        prediction_provenance="service",
+        tenant_id=test_identity.tenant_id,
+        workspace_id=test_identity.workspace_id,
+        plant_id="plant_01",
+    )
+    service.record_prediction_snapshot(test_identity, pred_inv)
+    outc_inv = ObservedOutcome(
+        outcome_id="outc_ctx_inv",
+        target_reference="cost_ctx_inval",
+        outcome_type="COST",
+        observed_at=t2,
+        observed_value=999.0,
+        unit="usd",
+        provenance="sensor",
+        verification_status=OutcomeVerificationStatus.VERIFIED,
+        verification_reference="vrun_ctx_inval",
+        tenant_id=admin_identity.tenant_id,
+        workspace_id=admin_identity.workspace_id,
+        plant_id="plant_01",
+    )
+    service.record_observed_outcome(admin_identity, outc_inv)
+    service.evaluate_prediction_outcome(test_identity, "pred_ctx_inv", "outc_ctx_inv")
+
+    ctx = service.get_governed_learning_context(test_identity, PredictionType.OPERATIONAL_COST)
+    assert ctx.sample_count == 1
+    assert ctx.mean_absolute_error == 2.0
+
+
+def test_107_eventbus_redelivery_cannot_bypass_authoritative_verification(temp_db, test_identity, admin_identity):
+    """107. EventBus redelivery cannot bypass authoritative verification checks."""
+    repo, service = temp_db
+    handler = OutcomeLearningEventHandler(service=service, enabled=True)
+
+    t1 = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    t2 = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    pred = PredictionSnapshot(
+        prediction_id="pred_bus_redeliv",
+        prediction_type=PredictionType.DEMAND_FORECAST,
+        target_reference="sku_bus_target",
+        predicted_at=t1,
+        expected_value=100.0,
+        prediction_provenance="service",
+        tenant_id=test_identity.tenant_id,
+        workspace_id=test_identity.workspace_id,
+        plant_id="plant_01",
+    )
+    service.record_prediction_snapshot(test_identity, pred)
+
+    # Initial outcome with forged reference submitted
+    outc_initial = ObservedOutcome(
+        outcome_id="outc_bus_redeliv",
+        prediction_id="pred_bus_redeliv",
+        target_reference="sku_bus_target",
+        outcome_type="DEMAND",
+        observed_at=t2,
+        observed_value=110.0,
+        provenance="event_stream",
+        verification_status=OutcomeVerificationStatus.VERIFIED,
+        verification_reference="vrun_fake_bus_token",
+        tenant_id=admin_identity.tenant_id,
+        workspace_id=admin_identity.workspace_id,
+        plant_id="plant_01",
+    )
+    saved_outc = service.record_observed_outcome(admin_identity, outc_initial)
+    assert saved_outc.verification_status == OutcomeVerificationStatus.OBSERVED
+    assert saved_outc.verification_reference is None
+
+    event_payload = {
+        "prediction_id": "pred_bus_redeliv",
+        "outcome_id": "outc_bus_redeliv",
+    }
+
+    event1 = CanonicalEvent(
+        tenant_id=admin_identity.tenant_id,
+        workspace_id=admin_identity.workspace_id,
+        plant_id="plant_01",
+        category=EventCategory.QUALITY,
+        event_type="outcome.observed",
+        occurred_at=t2,
+        observed_at=t2,
+        provenance="sensor",
+        payload=event_payload,
+    )
+    event1.event_fingerprint = event1.compute_fingerprint()
+
+    # First delivery
+    ev1 = handler.handle_event(event1)
+    assert ev1 is not None
+    assert ev1.eligible_for_learning is False
+
+    # Redelivery (duplicate event with same payload)
+    event2 = CanonicalEvent(
+        tenant_id=admin_identity.tenant_id,
+        workspace_id=admin_identity.workspace_id,
+        plant_id="plant_01",
+        category=EventCategory.QUALITY,
+        event_type="outcome.observed",
+        occurred_at=t2,
+        observed_at=t2,
+        provenance="sensor",
+        payload=event_payload,
+    )
+    event2.event_fingerprint = event2.compute_fingerprint()
+    ev2 = handler.handle_event(event2)
+    assert ev2 is not None
+    assert ev2.eligible_for_learning is False
+
+    # Verification status remains OBSERVED; cannot be promoted
+    outc_after = service.get_observed_outcome(test_identity, "outc_bus_redeliv")
+    assert outc_after.verification_status == OutcomeVerificationStatus.OBSERVED
+
+
+def test_108_existing_valid_verification_workflows_remain_compatible(temp_db, test_identity, admin_identity):
+    """108. Existing valid verification workflows remain compatible."""
+    repo, service = temp_db
+    t1 = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    t2 = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    # Full workflow with finding reference
+    run = seed_authoritative_run(
+        service,
+        tenant_id=test_identity.tenant_id,
+        workspace_id=test_identity.workspace_id,
+        plant_id="plant_01",
+        verification_id="vrun_compat_01",
+        target_id="sku_compat_target",
+        finding_id="vf_compat_finding_01",
+        status=VerificationStatus.VERIFIED,
+    )
+
+    pred = PredictionSnapshot(
+        prediction_id="pred_compat_01",
+        prediction_type=PredictionType.PRODUCTION_THROUGHPUT,
+        target_reference="sku_compat_target",
+        predicted_at=t1,
+        expected_value=1000.0,
+        expected_unit="kg",
+        prediction_provenance="service",
+        tenant_id=test_identity.tenant_id,
+        workspace_id=test_identity.workspace_id,
+        plant_id="plant_01",
+    )
+    service.record_prediction_snapshot(test_identity, pred)
+
+    # Reference finding_id directly
+    outc = ObservedOutcome(
+        outcome_id="outc_compat_01",
+        prediction_id="pred_compat_01",
+        target_reference="sku_compat_target",
+        outcome_type="THROUGHPUT",
+        observed_at=t2,
+        observed_value=980.0,
+        unit="kg",
+        provenance="sensor",
+        verification_status=OutcomeVerificationStatus.VERIFIED,
+        verification_reference="vf_compat_finding_01",
+        tenant_id=admin_identity.tenant_id,
+        workspace_id=admin_identity.workspace_id,
+        plant_id="plant_01",
+    )
+    saved = service.record_observed_outcome(admin_identity, outc)
+    assert saved.verification_status == OutcomeVerificationStatus.VERIFIED
+    assert saved.verification_reference == "vf_compat_finding_01"
+
+    ev = service.evaluate_prediction_outcome(test_identity, "pred_compat_01", "outc_compat_01")
+    assert ev.eligible_for_learning is True
+    assert ev.absolute_error == 20.0
+
+
+def test_109_historical_revalidation_remediates_untrusted_evaluations(temp_db, test_identity, admin_identity):
+    """109. Historical revalidation procedure remediates unverified evaluations safely."""
+    repo, service = temp_db
+    t1 = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat().replace("+00:00", "Z")
+    t2 = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    pred = PredictionSnapshot(
+        prediction_id="pred_hist_01",
+        prediction_type=PredictionType.DEMAND_FORECAST,
+        target_reference="sku_hist_01",
+        predicted_at=t1,
+        expected_value=100.0,
+        expected_unit="units",
+        prediction_provenance="service",
+        tenant_id=test_identity.tenant_id,
+        workspace_id=test_identity.workspace_id,
+        plant_id="plant_01",
+    )
+    service.record_prediction_snapshot(test_identity, pred)
+
+    outc = ObservedOutcome(
+        outcome_id="outc_hist_01",
+        target_reference="sku_hist_01",
+        outcome_type="DEMAND",
+        observed_at=t2,
+        observed_value=105.0,
+        unit="units",
+        provenance="sensor",
+        verification_status=OutcomeVerificationStatus.VERIFIED,
+        verification_reference="vrun_fake_historical_ref",
+        tenant_id=admin_identity.tenant_id,
+        workspace_id=admin_identity.workspace_id,
+        plant_id="plant_01",
+    )
+    # Bypass record_observed_outcome to simulate legacy record written before Prompt 39 correction
+    repo.record_observed_outcome(outc)
+
+    # Insert legacy evaluation with eligible_for_learning=True directly
+    legacy_eval = PredictionOutcomeEvaluation(
+        evaluation_id="eval_legacy_untrusted_01",
+        schema_version="3.0.0",
+        tenant_id=admin_identity.tenant_id,
+        workspace_id=admin_identity.workspace_id,
+        plant_id="plant_01",
+        idempotency_key="idem_legacy_untrusted_01",
+        prediction_id="pred_hist_01",
+        outcome_id="outc_hist_01",
+        evaluation_status=EvaluationStatus.EVALUATED,
+        eligibility_reason="ELIGIBLE",
+        evaluation_policy_version="1.0.0",
+        metric_implementation_version="1.0.0",
+        prediction_type=PredictionType.DEMAND_FORECAST,
+        target_reference="sku_hist_01",
+        predicted_value=100.0,
+        observed_value=105.0,
+        unit="units",
+        comparison_semantics="NUMERIC_ERROR",
+        absolute_error=5.0,
+        verification_reference="vrun_fake_historical_ref",
+        eligible_for_learning=True,
+        provenance="legacy_untrusted",
+    )
+    repo.record_evaluation(legacy_eval)
+
+    # Verify legacy record was eligible initially
+    initial = repo.get_evaluation(admin_identity.tenant_id, admin_identity.workspace_id, "eval_legacy_untrusted_01")
+    assert initial.eligible_for_learning is True
+
+    # Run historical revalidation procedure
+    report = service.revalidate_historical_evaluations(admin_identity)
+    assert report["corrected_count"] >= 1
+
+    # Evaluation is now remediated and no longer eligible for learning
+    remediated = repo.get_evaluation(admin_identity.tenant_id, admin_identity.workspace_id, "eval_legacy_untrusted_01")
+    assert remediated.eligible_for_learning is False
+    assert "HISTORICAL_REVALIDATION" in remediated.learning_ineligibility_reason

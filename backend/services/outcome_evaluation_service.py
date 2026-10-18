@@ -40,6 +40,7 @@ try:
         SAGE_OUTCOME_EVALUATION_MAX_WINDOW_DAYS,
         SAGE_OUTCOME_EVALUATION_MAX_PAYLOAD_BYTES,
         SAGE_OUTCOME_EVALUATION_CLOCK_SKEW_TOLERANCE_SECONDS,
+        SAGE_VERIFICATION_DB_PATH,
     )
     from core.auth import Identity
     from governance.audit import log_security_event
@@ -69,6 +70,15 @@ try:
         METRIC_IMPLEMENTATION_VERSION,
         _parse_utc_iso,
     )
+    from data.schemas.verification_contract import (
+        VerificationStatus,
+        ScopeStatus,
+        QualityStatus,
+    )
+    from repositories.verification_repository import (
+        VerificationRepository,
+        verification_repository,
+    )
     from repositories.outcome_learning_repository import (
         OutcomeLearningRepository,
         outcome_learning_repository,
@@ -88,6 +98,7 @@ except (ImportError, ModuleNotFoundError):
         SAGE_OUTCOME_EVALUATION_MAX_WINDOW_DAYS,
         SAGE_OUTCOME_EVALUATION_MAX_PAYLOAD_BYTES,
         SAGE_OUTCOME_EVALUATION_CLOCK_SKEW_TOLERANCE_SECONDS,
+        SAGE_VERIFICATION_DB_PATH,
     )
     from backend.core.auth import Identity
     from backend.governance.audit import log_security_event
@@ -116,6 +127,15 @@ except (ImportError, ModuleNotFoundError):
         EVALUATION_POLICY_VERSION,
         METRIC_IMPLEMENTATION_VERSION,
         _parse_utc_iso,
+    )
+    from backend.data.schemas.verification_contract import (
+        VerificationStatus,
+        ScopeStatus,
+        QualityStatus,
+    )
+    from backend.repositories.verification_repository import (
+        VerificationRepository,
+        verification_repository,
     )
     from backend.repositories.outcome_learning_repository import (
         OutcomeLearningRepository,
@@ -147,10 +167,16 @@ class OutcomeEvaluationService:
         repository: Optional[OutcomeLearningRepository] = None,
         event_bus: Optional[EventBus] = None,
         enabled: Optional[bool] = None,
+        verification_repository: Optional[VerificationRepository] = None,
     ):
         self.repository = repository or outcome_learning_repository
         self._event_bus = event_bus
         self.enabled = SAGE_OUTCOME_EVALUATION_ENABLED if enabled is None else enabled
+        if verification_repository is not None:
+            self.verification_repository = verification_repository
+        else:
+            db_path = getattr(self.repository, "_db_path", SAGE_VERIFICATION_DB_PATH)
+            self.verification_repository = VerificationRepository(db_path=db_path)
 
     @property
     def event_bus(self) -> EventBus:
@@ -221,8 +247,133 @@ class OutcomeEvaluationService:
         )
 
     # -------------------------------------------------------------------------
-    # 2. OBSERVED OUTCOME OPERATIONS
+    # 2. OBSERVED OUTCOME OPERATIONS & AUTHORITATIVE VERIFICATION
     # -------------------------------------------------------------------------
+
+    def _validate_authoritative_verification(
+        self,
+        identity: Identity,
+        outcome: ObservedOutcome,
+        prediction: Optional[PredictionSnapshot] = None,
+    ) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+        """
+        Validates whether an outcome's verification_reference identifies a genuine,
+        persisted, authoritative, and in-scope verification record in the canonical Verification Engine.
+
+        Enforces:
+        1. Reference existence and non-empty format.
+        2. Resolution to persisted VerificationRun or VerificationFinding.
+        3. Strict tenant, workspace, and plant matching.
+        4. Authoritative VERIFIED status (never PENDING, FAILED, BLOCKED, etc.).
+        5. Exclusion of diagnostic-only verification.
+        6. Exclusion of invalidated or rejected evidence.
+        7. Target relevance between outcome/prediction and verification record.
+        8. Caller authorization to access the verification record.
+        """
+        ref = outcome.verification_reference
+        if not ref or not isinstance(ref, str) or not ref.strip():
+            return False, "MISSING_VERIFICATION_REFERENCE", None
+        ref = ref.strip()
+
+        # Query canonical verification repository scoped strictly to tenant and workspace
+        auth_record = self.verification_repository.get_authoritative_verification_record(
+            tenant_id=outcome.tenant_id,
+            workspace_id=outcome.workspace_id,
+            reference_id=ref,
+        )
+        if not auth_record:
+            # Note: Cross-tenant references also fail here without disclosing
+            # whether the ID exists in another tenant.
+            return False, "VERIFICATION_RECORD_NOT_FOUND", None
+
+        # Scope verification: plant must match
+        if auth_record["plant_id"] != outcome.plant_id:
+            return False, "CROSS_PLANT_VERIFICATION", auth_record
+
+        # Prediction scope matching if evaluating against prediction
+        if prediction is not None:
+            if (
+                prediction.tenant_id != auth_record["tenant_id"]
+                or prediction.workspace_id != auth_record["workspace_id"]
+                or prediction.plant_id != auth_record["plant_id"]
+            ):
+                return False, "PREDICTION_SCOPE_MISMATCH", auth_record
+
+        # Caller authorization
+        assigned_plants = getattr(identity, "assigned_plants", ["*"]) or ["*"]
+        if "*" not in assigned_plants and auth_record["plant_id"] not in assigned_plants:
+            return False, "CALLER_PLANT_UNAUTHORIZED", auth_record
+
+        # Diagnostic check: Diagnostic verification cannot verify an outcome or establish learning eligibility
+        if auth_record.get("is_diagnostic"):
+            return False, "DIAGNOSTIC_ONLY_VERIFICATION", auth_record
+        if auth_record.get("rule_id") == "RULE_EVIDENCE_EXISTS_V1":
+            return False, "DIAGNOSTIC_ONLY_VERIFICATION", auth_record
+
+        # Authoritative status check: Must be VERIFIED
+        if auth_record["status"] != VerificationStatus.VERIFIED:
+            return False, f"NON_AUTHORITATIVE_STATUS_{auth_record['status'].value}", auth_record
+
+        # Invalidation check on outcome itself
+        if outcome.is_invalidated:
+            return False, "OUTCOME_EVIDENCE_INVALIDATED", auth_record
+
+        # Rejection & invalidation checks on underlying evidence
+        if auth_record["type"] == "FINDING":
+            finding = auth_record["record"]
+            for ea in getattr(finding, "evidence_assessments", []):
+                if ea.scope_status in (
+                    ScopeStatus.REJECTED,
+                    ScopeStatus.CROSS_TENANT,
+                    ScopeStatus.CROSS_WORKSPACE,
+                    ScopeStatus.CROSS_PLANT,
+                    ScopeStatus.UNAUTHORIZED,
+                ):
+                    return False, "REJECTED_EVIDENCE_SCOPE", auth_record
+                if ea.quality_status in (QualityStatus.INVALID, QualityStatus.CONFLICTING):
+                    return False, "INVALID_EVIDENCE_QUALITY", auth_record
+                if str(ea.integrity_status).upper() == "INVALID":
+                    return False, "INVALID_EVIDENCE_INTEGRITY", auth_record
+        elif auth_record["type"] == "RUN":
+            run = auth_record["record"]
+            for f in run.findings:
+                if f.status in (VerificationStatus.FAILED, VerificationStatus.CONFLICTING):
+                    return False, f"RUN_FINDING_STATUS_{f.status.value}", auth_record
+                for ea in f.evidence_assessments:
+                    if ea.scope_status in (
+                        ScopeStatus.REJECTED,
+                        ScopeStatus.CROSS_TENANT,
+                        ScopeStatus.CROSS_WORKSPACE,
+                        ScopeStatus.CROSS_PLANT,
+                        ScopeStatus.UNAUTHORIZED,
+                    ):
+                        return False, "REJECTED_EVIDENCE_SCOPE", auth_record
+                    if ea.quality_status in (QualityStatus.INVALID, QualityStatus.CONFLICTING):
+                        return False, "INVALID_EVIDENCE_QUALITY", auth_record
+                    if str(ea.integrity_status).upper() == "INVALID":
+                        return False, "INVALID_EVIDENCE_INTEGRITY", auth_record
+
+        # Target relevance check:
+        # The verification record must be relevant to the outcome being evaluated
+        candidate_targets = {
+            outcome.target_reference.strip().lower(),
+        }
+        if outcome.prediction_id:
+            candidate_targets.add(outcome.prediction_id.strip().lower())
+        if prediction is not None:
+            candidate_targets.add(prediction.target_reference.strip().lower())
+            candidate_targets.add(prediction.prediction_id.strip().lower())
+
+        record_targets = {
+            str(t).strip().lower() for t in auth_record.get("targets", []) if t
+        }
+        if auth_record.get("mission_id"):
+            record_targets.add(str(auth_record["mission_id"]).strip().lower())
+
+        if not candidate_targets.intersection(record_targets):
+            return False, "UNRELATED_VERIFICATION_RECORD", auth_record
+
+        return True, "VERIFIED", auth_record
 
     def record_observed_outcome(
         self, identity: Identity, outcome: ObservedOutcome
@@ -230,21 +381,35 @@ class OutcomeEvaluationService:
         """
         Records an observed outcome.
         Prevents client-side forgery of authoritative verification status.
+        Requires genuine, persisted, authoritative verification record in the Verification Engine.
+        Privileged roles (ADMINISTRATOR, SYSTEM_VERIFIER) CANNOT bypass this check.
         """
         self._validate_identity_scope(identity, outcome.tenant_id, outcome.workspace_id, outcome.plant_id)
 
-        # Security Invariant: An untrusted client cannot assert outcome is VERIFIED
-        # without authoritative verification reference.
-        user_roles = [r.upper() for r in identity.roles]
-        is_verifier = "SYSTEM_VERIFIER" in user_roles or "SYSTEM_ADMIN" in user_roles or "ADMINISTRATOR" in user_roles
+        # Authoritative verification check:
+        # A caller declaring VERIFIED must be backed by genuine persisted verification evidence.
         if outcome.verification_status == OutcomeVerificationStatus.VERIFIED:
-            if not outcome.verification_reference and not is_verifier:
+            is_valid, reason, auth_record = self._validate_authoritative_verification(
+                identity, outcome, prediction=None
+            )
+            if not is_valid:
                 logger.warning(
-                    "Caller '%s' attempted to record VERIFIED outcome '%s' without verification reference. Downgrading to OBSERVED.",
+                    "Caller '%s' attempted to record VERIFIED outcome '%s' with non-authoritative reference '%s' (reason: %s). Downgrading to OBSERVED.",
                     identity.user_id,
                     outcome.outcome_id,
+                    outcome.verification_reference,
+                    reason,
                 )
                 outcome.verification_status = OutcomeVerificationStatus.OBSERVED
+                outcome.verification_reference = None
+                if reason == "DIAGNOSTIC_ONLY_VERIFICATION" or (auth_record and auth_record.get("is_diagnostic")):
+                    outcome.is_diagnostic = True
+                elif "INVALID" in reason or "REJECTED" in reason or (auth_record and auth_record.get("is_invalidated")):
+                    outcome.is_invalidated = True
+            else:
+                # Synchronize server-authoritative flags from canonical verification record
+                outcome.is_diagnostic = False
+                outcome.is_invalidated = False
 
         persisted = self.repository.record_observed_outcome(outcome)
 
@@ -255,6 +420,9 @@ class OutcomeEvaluationService:
                 "outcome_id": persisted.outcome_id,
                 "target_reference": persisted.target_reference,
                 "verification_status": persisted.verification_status.value,
+                "verification_reference": persisted.verification_reference,
+                "is_diagnostic": persisted.is_diagnostic,
+                "is_invalidated": persisted.is_invalidated,
                 "observed_at": persisted.observed_at,
                 "plant_id": persisted.plant_id,
             },
@@ -552,21 +720,29 @@ class OutcomeEvaluationService:
                 dir_bias = DirectionalBias.MATCHED if exact_match else DirectionalBias.NOT_DETERMINABLE
 
             # Determine eligibility for future learning
-            if outcome.verification_status != OutcomeVerificationStatus.VERIFIED:
-                learning_eligible = False
-                learning_inelig_reason = "OUTCOME_NOT_VERIFIED"
-            elif outcome.is_diagnostic:
+            if outcome.is_diagnostic:
                 learning_eligible = False
                 learning_inelig_reason = "DIAGNOSTIC_VERIFICATION_ONLY"
-            elif outcome.data_mode != DataMode.REAL:
-                learning_eligible = False
-                learning_inelig_reason = "SIMULATION_DATA_MODE"
             elif outcome.is_invalidated:
                 learning_eligible = False
                 learning_inelig_reason = "INVALIDATED_EVIDENCE"
+            elif outcome.data_mode != DataMode.REAL:
+                learning_eligible = False
+                learning_inelig_reason = "SIMULATION_DATA_MODE"
+            elif outcome.verification_status != OutcomeVerificationStatus.VERIFIED:
+                learning_eligible = False
+                learning_inelig_reason = "OUTCOME_NOT_VERIFIED"
             else:
-                learning_eligible = True
-                learning_inelig_reason = None
+                # Authoritative re-validation at evaluation boundary against canonical Verification Engine
+                is_valid, reason, auth_record = self._validate_authoritative_verification(
+                    identity, outcome, prediction=prediction
+                )
+                if not is_valid:
+                    learning_eligible = False
+                    learning_inelig_reason = f"VERIFICATION_{reason}"
+                else:
+                    learning_eligible = True
+                    learning_inelig_reason = None
 
         prior_eval_id: Optional[str] = None
         if reevaluation_reason:
@@ -798,6 +974,91 @@ class OutcomeEvaluationService:
         except Exception as e:
             # Safe recovery: event publication failure does NOT roll back committed evaluation
             logger.error("Failed to publish canonical evaluation event: %s", e)
+
+    def revalidate_historical_evaluations(
+        self,
+        identity: Identity,
+        plant_id: Optional[str] = None,
+        limit: int = 500,
+    ) -> Dict[str, Any]:
+        """
+        Explicit historical evaluation revalidation procedure (Prompt 39 correction).
+        Audits existing evaluations marked eligible_for_learning=1 against canonical
+        persisted verification records. Fails closed and corrects any evaluations backed
+        by unverified or missing verification evidence, emitting structured security audit logs.
+        """
+        if plant_id:
+            self._validate_plant_access(identity, plant_id)
+
+        evals = self.repository.list_evaluations(
+            tenant_id=identity.tenant_id,
+            workspace_id=identity.workspace_id,
+            plant_id=plant_id,
+            eligible_only=True,
+            limit=limit,
+        )
+
+        total_checked = len(evals)
+        corrected_count = 0
+        corrected_eval_ids = []
+
+        for ev in evals:
+            try:
+                outcome = self.repository.get_observed_outcome(
+                    tenant_id=ev.tenant_id,
+                    workspace_id=ev.workspace_id,
+                    outcome_id=ev.outcome_id,
+                )
+                if not outcome or outcome.verification_status != OutcomeVerificationStatus.VERIFIED:
+                    should_correct = True
+                    reason = "HISTORICAL_OUTCOME_NOT_VERIFIED"
+                else:
+                    prediction = self.repository.get_prediction_snapshot(
+                        tenant_id=ev.tenant_id,
+                        workspace_id=ev.workspace_id,
+                        prediction_id=ev.prediction_id,
+                    )
+                    is_valid, v_reason, _ = self._validate_authoritative_verification(
+                        identity, outcome, prediction=prediction
+                    )
+                    should_correct = not is_valid
+                    reason = f"HISTORICAL_REVALIDATION_{v_reason}"
+
+                if should_correct:
+                    self.repository.update_evaluation_learning_eligibility(
+                        tenant_id=ev.tenant_id,
+                        workspace_id=ev.workspace_id,
+                        evaluation_id=ev.evaluation_id,
+                        eligible_for_learning=False,
+                        learning_ineligibility_reason=reason,
+                    )
+                    corrected_count += 1
+                    corrected_eval_ids.append(ev.evaluation_id)
+
+                    self._log_audit_event(
+                        "HISTORICAL_EVALUATION_REVALIDATION_CORRECTION",
+                        identity,
+                        {
+                            "evaluation_id": ev.evaluation_id,
+                            "prediction_id": ev.prediction_id,
+                            "outcome_id": ev.outcome_id,
+                            "previous_eligible_for_learning": True,
+                            "new_eligible_for_learning": False,
+                            "reason": reason,
+                        },
+                    )
+            except Exception as e:
+                logger.error("Error during historical revalidation of evaluation '%s': %s", ev.evaluation_id, e)
+
+        return {
+            "tenant_id": identity.tenant_id,
+            "workspace_id": identity.workspace_id,
+            "plant_id": plant_id,
+            "total_checked": total_checked,
+            "corrected_count": corrected_count,
+            "corrected_evaluation_ids": corrected_eval_ids,
+            "revalidation_timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        }
 
     # -------------------------------------------------------------------------
     # 7. INTERNAL VALIDATION & AUDIT

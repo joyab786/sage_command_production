@@ -405,6 +405,37 @@ async def list_evaluations(
         )
 
 
+@router.post(
+    "/evaluations/revalidate",
+    response_model=Dict[str, Any],
+    status_code=status.HTTP_200_OK,
+)
+async def revalidate_historical_evaluations(
+    plant_id: Optional[str] = Query(None),
+    limit: int = Query(500, ge=1, le=1000),
+    user: Identity = Depends(require_permission("learning.evaluation.evaluate")),
+):
+    """
+    Explicit remediation and revalidation endpoint for historical evaluations.
+    Verifies that all evaluations marked eligible_for_learning are supported by
+    canonical persisted verification records, updating and auditing any anomalies.
+    """
+    try:
+        return outcome_evaluation_service.revalidate_historical_evaluations(
+            identity=user,
+            plant_id=plant_id,
+            limit=limit,
+        )
+    except OutcomeEvaluationScopeMismatchError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except Exception as e:
+        logger.error("Error during historical evaluation revalidation: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An internal error occurred during evaluation revalidation.",
+        )
+
+
 # =============================================================================
 # 4. METRICS & LEARNING CONTEXT ENDPOINTS
 # =============================================================================

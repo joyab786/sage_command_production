@@ -36,6 +36,9 @@ try:
         VerificationProvenance,
         TriggerType,
         compute_diagnostic_run_fields,
+        EvidenceAssessment,
+        ScopeStatus,
+        QualityStatus,
     )
     from data.schemas.closed_loop_contract import (
         VerificationFeedbackRecord,
@@ -57,6 +60,9 @@ except (ImportError, ModuleNotFoundError):
         VerificationProvenance,
         TriggerType,
         compute_diagnostic_run_fields,
+        EvidenceAssessment,
+        ScopeStatus,
+        QualityStatus,
     )
     from backend.data.schemas.closed_loop_contract import (
         VerificationFeedbackRecord,
@@ -857,6 +863,190 @@ class VerificationRepository:
                 diagnostic_outcome=diag_out,
                 created_at=row["created_at"],
             )
+
+    def get_run_by_id(
+        self,
+        tenant_id: str,
+        workspace_id: str,
+        verification_id: str,
+    ) -> Optional[VerificationRun]:
+        """
+        Retrieves a verification run by verification_id strictly scoped to tenant and workspace.
+        Does not require mission_id. Returns None if not found or unauthorized.
+        """
+        with self._lock, self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT * FROM verification_runs
+                WHERE tenant_id = ? AND workspace_id = ? AND verification_id = ?
+                """,
+                (tenant_id, workspace_id, verification_id),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+
+            findings = self.get_findings(tenant_id, workspace_id, row["mission_id"], verification_id)
+            prov_data = json.loads(row["provenance_json"])
+
+            finding_statuses = [f.status for f in findings]
+            finding_rules = {f.rule_id for f in findings}
+            diag_stat_raw = row["diagnostic_status"] if "diagnostic_status" in row.keys() else None
+            diag_stat = VerificationStatus(diag_stat_raw) if diag_stat_raw else None
+            diag_out = row["diagnostic_outcome"] if "diagnostic_outcome" in row.keys() else None
+            status_val = VerificationStatus(row["status"])
+            summary_val = row["summary"] or ""
+            is_diag_raw = bool(row["is_diagnostic"]) if "is_diagnostic" in row.keys() and row["is_diagnostic"] is not None else False
+
+            is_diag, status_val, diag_stat, diag_out = self._normalize_diagnostic_run_fields(
+                is_diagnostic=is_diag_raw,
+                status=status_val,
+                diagnostic_status=diag_stat,
+                diagnostic_outcome=diag_out,
+                finding_statuses=finding_statuses,
+                finding_rules=finding_rules,
+                summary=summary_val,
+                target_count=row["target_count"],
+            )
+
+            return VerificationRun(
+                verification_id=row["verification_id"],
+                schema_version=row["schema_version"],
+                mission_id=row["mission_id"],
+                mission_revision=row["mission_revision"],
+                verification_scope=row["verification_scope"],
+                status=status_val,
+                started_at=row["started_at"],
+                completed_at=row["completed_at"],
+                requested_by=row["requested_by"],
+                tenant_id=row["tenant_id"],
+                workspace_id=row["workspace_id"],
+                plant_id=row["plant_id"],
+                session_id=row["session_id"],
+                trigger_type=TriggerType(row["trigger_type"]),
+                rule_set_version=row["rule_set_version"],
+                summary=row["summary"],
+                target_count=row["target_count"],
+                verified_count=row["verified_count"],
+                unverified_count=row["unverified_count"],
+                indeterminate_count=row["indeterminate_count"],
+                blocked_count=row["blocked_count"],
+                failed_count=row["failed_count"],
+                findings=findings,
+                provenance=VerificationProvenance.model_validate(prov_data),
+                idempotency_key=row["idempotency_key"],
+                is_diagnostic=is_diag,
+                diagnostic_status=diag_stat,
+                diagnostic_outcome=diag_out,
+                created_at=row["created_at"],
+            )
+
+    def get_finding_by_id(
+        self,
+        tenant_id: str,
+        workspace_id: str,
+        finding_id: str,
+    ) -> Optional[Tuple[VerificationFinding, str, str, str]]:
+        """
+        Retrieves a single finding strictly scoped to tenant and workspace.
+        Returns tuple of (VerificationFinding, plant_id, verification_id, mission_id) or None.
+        """
+        with self._lock, self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT * FROM verification_findings
+                WHERE tenant_id = ? AND workspace_id = ? AND finding_id = ?
+                """,
+                (tenant_id, workspace_id, finding_id),
+            )
+            r = cursor.fetchone()
+            if not r:
+                return None
+
+            ev_refs = json.loads(r["evidence_references_json"])
+            ev_assessments_raw = json.loads(r["evidence_assessments_json"])
+            limitations = json.loads(r["limitations_json"])
+            ev_assessments = [EvidenceAssessment.model_validate(ea) for ea in ev_assessments_raw]
+
+            finding = VerificationFinding(
+                finding_id=r["finding_id"],
+                target_type=VerificationTargetType(r["target_type"]),
+                target_id=r["target_id"],
+                status=VerificationStatus(r["status"]),
+                evidence_references=ev_refs,
+                evidence_assessments=ev_assessments,
+                rule_id=r["rule_id"],
+                rule_version=r["rule_version"],
+                explanation=r["explanation"],
+                limitations=limitations,
+                evaluated_at=r["evaluated_at"],
+            )
+            return finding, r["plant_id"], r["verification_id"], r["mission_id"]
+
+    def get_authoritative_verification_record(
+        self,
+        tenant_id: str,
+        workspace_id: str,
+        reference_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Unified lookup for authoritative verification records by run_id or finding_id.
+        Fails closed with strict tenant & workspace isolation.
+        Returns canonical metadata dictionary or None if record does not exist.
+        """
+        if not reference_id or not isinstance(reference_id, str):
+            return None
+        clean_ref = reference_id.strip()
+
+        # 1. Attempt lookup as VerificationRun
+        run = self.get_run_by_id(tenant_id, workspace_id, clean_ref)
+        if run:
+            targets = [run.mission_id]
+            for f in run.findings:
+                if f.target_id not in targets:
+                    targets.append(f.target_id)
+            return {
+                "type": "RUN",
+                "record": run,
+                "verification_id": run.verification_id,
+                "mission_id": run.mission_id,
+                "tenant_id": run.tenant_id,
+                "workspace_id": run.workspace_id,
+                "plant_id": run.plant_id,
+                "status": run.status,
+                "is_diagnostic": run.is_diagnostic,
+                "diagnostic_status": run.diagnostic_status,
+                "findings": run.findings,
+                "targets": targets,
+            }
+
+        # 2. Attempt lookup as VerificationFinding
+        finding_tuple = self.get_finding_by_id(tenant_id, workspace_id, clean_ref)
+        if finding_tuple:
+            finding, plant_id, v_id, m_id = finding_tuple
+            parent_run = self.get_run_by_id(tenant_id, workspace_id, v_id)
+            is_diag = (parent_run.is_diagnostic if parent_run else False) or (finding.rule_id == "RULE_EVIDENCE_EXISTS_V1")
+            targets = [m_id, finding.target_id]
+            return {
+                "type": "FINDING",
+                "record": finding,
+                "verification_id": v_id,
+                "finding_id": finding.finding_id,
+                "mission_id": m_id,
+                "tenant_id": tenant_id,
+                "workspace_id": workspace_id,
+                "plant_id": plant_id,
+                "status": finding.status,
+                "is_diagnostic": is_diag,
+                "rule_id": finding.rule_id,
+                "evidence_assessments": finding.evidence_assessments,
+                "parent_run": parent_run,
+                "targets": targets,
+            }
+
+        return None
 
     def list_runs(
         self,

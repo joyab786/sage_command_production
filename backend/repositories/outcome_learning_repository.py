@@ -724,6 +724,38 @@ class OutcomeLearningRepository:
             rows = conn.execute(query, params).fetchall()
             return [self._row_to_evaluation(r) for r in rows]
 
+    def update_evaluation_learning_eligibility(
+        self,
+        tenant_id: str,
+        workspace_id: str,
+        evaluation_id: str,
+        eligible_for_learning: bool,
+        learning_ineligibility_reason: Optional[str] = None,
+    ) -> bool:
+        """
+        Safely updates an evaluation's learning eligibility status during explicit historical revalidation.
+        Enforces strict tenant and workspace boundaries. Returns True if record was updated.
+        """
+        self._validate_scope(tenant_id, workspace_id, "scope_guard")
+        with self._lock, self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE prediction_outcome_evaluations
+                SET eligible_for_learning = ?, learning_ineligibility_reason = ?
+                WHERE tenant_id = ? AND workspace_id = ? AND evaluation_id = ?
+                """,
+                (
+                    1 if eligible_for_learning else 0,
+                    learning_ineligibility_reason,
+                    tenant_id,
+                    workspace_id,
+                    evaluation_id,
+                ),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
     # -------------------------------------------------------------------------
     # 4. METRICS AGGREGATION & GOVERNED LEARNING CONTEXT
     # -------------------------------------------------------------------------
