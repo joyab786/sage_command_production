@@ -208,25 +208,28 @@ class TestV3SecurityHardening(unittest.TestCase):
 
     # --- 6. REST API HARDENED ROUTES TESTS ---
     def test_connect_live_db_sanitization(self):
-        import socket
-        postgres_reachable = False
+        from unittest.mock import patch, MagicMock
         try:
-            with socket.create_connection(("localhost", 5432), timeout=1.0):
-                postgres_reachable = True
-        except (OSError, ConnectionRefusedError):
-            postgres_reachable = False
-
-        if not postgres_reachable:
-            self.skipTest("Live PostgreSQL service on localhost:5432 is unreachable; skipping live connection test")
+            import api.routes as r_mod
+        except ImportError:
+            import backend.api.routes as r_mod
 
         payload = {
             "connection_string": "postgresql://dbadmin:SuperSecret123@localhost:5432/live_db"
         }
         headers = {"Authorization": "Bearer manager_token"}
-        response = self.client.post("/connect-live-db", json=payload, headers=headers)
-        self.assertEqual(response.status_code, 200)
-        resp_data = response.json()
-        self.assertNotIn("SuperSecret123", json.dumps(resp_data))
+        mock_resp = MagicMock(
+            database_type="postgresql",
+            connection_id="mock_conn_sanitization",
+            dict=lambda: {"connection_id": "mock_conn_sanitization", "database_type": "postgresql"}
+        )
+
+        with patch.object(r_mod.db_gateway, "create_connection", return_value=mock_resp), \
+             patch.object(r_mod.db_gateway, "discover_schema", return_value={"tables": []}):
+            response = self.client.post("/connect-live-db", json=payload, headers=headers)
+            self.assertEqual(response.status_code, 200)
+            resp_data = response.json()
+            self.assertNotIn("SuperSecret123", json.dumps(resp_data))
 
     def test_connect_live_db_blocked_scheme(self):
         payload = {

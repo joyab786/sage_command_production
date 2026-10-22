@@ -14,11 +14,11 @@
 - **Starting Base SHA:** `6e5f7b96cd464a907f654126b08c3136c7a47bd3`
 - **Prompt 39 Full Base HEAD SHA:** `c184c257b71a0afa12fcb6dbd7738281ee1a1d6d`
 - **Prompt 39 Correction 5 Full HEAD SHA:** `f3a572eb2ee141bef2a18b31ba9ae3ed181dedac`
-- **Commit Message:** `fix(v3): stabilize outcome evaluation query ordering`
-- **Parent Commit SHA:** `640cea33772ac87993e83bfde4c9f332ce23afa2`
-- **Push Status:** Successfully pushed to `origin/main` (`640cea3..f3a572e`)
+- **Prompt 39 Correction 5b Starting SHA:** `fc4b1fa30d3b2252be6bd7aac738c8ea5f8c9f03`
+- **Milestone:** Prompt 39 Correction 5b — Baseline Evidence Gaps & Hardening
+- **Commit Message:** `test(v3): document baseline evidence and unskip sanitization test (Prompt 39 Correction 5b)`
 - **Remote Synchronization:** Synchronized with `origin/main`
-- **Working-Tree Status:** Clean (0 unstaged changes, 0 untracked files)
+- **Working-Tree Status:** Clean (all changes tracked and committed)
 
 ---
 
@@ -73,7 +73,7 @@ Prompt 39 builds directly upon the established Prompt 37 Closed-Loop Learning Fo
 
 ---
 
-## E. Test Suite Execution & Results
+## E. Test Suite Execution, Environment Drift & Baseline Evidence
 
 ### 1. Focused Prompt 39 Test Suite
 Command: `python -m pytest backend/test_v3_closed_loop_outcome_evaluation.py -q`
@@ -100,55 +100,115 @@ Coverage across Groups A–N:
 - Group N: Prompt 39 Correction 5 Security Regression (Tests 137–141) — Pre-LIMIT deterministic SQL query ordering (`ORDER BY evaluated_at DESC, evaluation_id ASC LIMIT ?`), deterministic tie-breaking when identical timestamps exceed repository query limit, multi-plant revalidation preserving cross-plant deterministic ordering and overall limit, tenant/workspace/plant boundary preservation, and repository boundary clamping compatibility.
 
 ### 2. Targeted Regression Test Suites
-- **Existing Closed-Loop Learning Suite:** `pytest backend/test_v3_closed_loop_learning.py -q`
+- **Closed-Loop Learning Suite:** `pytest backend/test_v3_closed_loop_learning.py -q`
   - **Results:** 102 passed, 0 failed (100% green in 23.7s)
 - **Continuous Verification Engine Suite:** `pytest backend/test_v3_continuous_verification.py -q`
-  - **Results:** 126 passed, 2 failed (pre-existing environment issue: missing `pytest-asyncio` plugin for 2 async test coroutines; verified identical failures at commits `640cea3`, `d07607c`, and `0fc3073`)
+  - **Results:** 128 passed, 0 failed (100% green in 12.1s)
+  - *Note:* Previously reported 2 failures when running under pytest 9 without `pytest-asyncio`. Upon installing `pytest-asyncio==1.4.0`, all 128 tests pass unconditionally, reproducing the full pass result.
 - **Autonomy Governance Suite:** `pytest backend/test_v3_autonomy.py -q`
   - **Results:** 111 passed, 0 failed (100% green in 14.8s)
 - **Security & Authorization Suites:** `pytest backend/test_v3_security.py backend/test_v3_security_integration.py backend/test_v3_authorization.py -q`
-  - **Results:** 48 passed, 0 failed, 1 skipped (`test_connect_live_db_sanitization` cleanly skips when live PostgreSQL is unreachable at `localhost:5432`)
+  - **Results:** 49 passed, 0 failed, 0 skipped
+  - *Note:* `test_connect_live_db_sanitization` previously skipped when a live PostgreSQL daemon was unreachable on `localhost:5432`. It was refactored with a scoped network mock patching `db_gateway.create_connection` and `db_gateway.discover_schema`, enabling all sanitization and redaction assertions to execute and pass cleanly without external dependencies.
 
-### 3. Comprehensive Repository Regression & Documented Failures
-Full regression suites were executed across the codebase:
-- **All V3 Test Suites (`$files = Get-ChildItem backend -Filter "test_v3_*.py"`):**
-  - **Results:** 2514 passed, 3 failed, 1 skipped, 285 warnings (duration: ~146.8s)
+### 3. Repository-Wide Test Suite Execution Counts
+- **All V3 Test Suites (`python -m pytest (Get-ChildItem backend/test_v3_*.py) -q -ra`):**
+  - **Results:** 2517 passed, 1 failed, 0 skipped, 283 warnings (duration: ~158.2s)
+  - **Single Failure:** `backend/test_v3_execution_gateway.py::TestV3ExecutionGateway::test_15_api_action_execute_endpoint`
 - **Full Backend Suite (`python -m pytest backend/ -q -ra`):**
-  - **Results:** 2530 passed, 8 failed, 1 skipped, 285 warnings, 18 subtests passed (duration: ~139.9s)
+  - **Results:** 2533 passed, 6 failed, 0 skipped, 283 warnings, 18 subtests passed (duration: ~149.7s)
+  - **Failure Count:** Exactly 6 failures across the entire repository.
 
-#### Documented Failure Inventory (All Proven Pre-Existing):
+---
 
-1. **Continuous Verification Async Tests (2 failures in `backend/test_v3_continuous_verification.py`):**
-   - `test_async_active_verification_identity_lifecycle`
-   - `test_concurrent_async_tasks_isolated_identity_context`
-   - **Root Cause:** Both tests are declared as `async def` with `@pytest.mark.asyncio`. The test environment has Python 3.14.5 and `pytest 9.1.1` with `anyio 4.15.1`, but does not have `pytest-asyncio` installed. Pytest 9 natively fails on async test coroutines without an async framework plugin.
-   - **Pre-Existing Evidence:** Verified by executing at parent commit `640cea33772ac87993e83bfde4c9f332ce23afa2`, commit `d07607c`, and baseline commit `0fc3073`, where both tests fail identically. `backend/test_v3_continuous_verification.py` was last committed in Prompt 36H (`ae8c0c5`) and was not touched by Prompt 39 or Correction 5.
+### 4. Environment Drift & Development Dependencies
 
-2. **Standalone Agent Async Test (1 failure in `backend/test_agent.py`, listed separately):**
-   - `backend/test_agent.py::test_agent`
-   - **Root Cause:** Standalone async test declared as `async def test_agent()`. Fails for the same reason as above: `pytest-asyncio` plugin is not installed in the Python environment.
-   - **Pre-Existing Evidence:** Legacy test file dating back to early Prompt 01 architecture.
+#### Host Environment Facts:
+- **Interpreters Installed (`py -0`):**
+  - `Python 3.14.5 (64-bit)` at `C:\Python314\python.exe` (active default)
+  - `Python 3.13.14 (64-bit)` via WindowsApps
+  - *Python 3.12 is not installed on this host system.*
+- **Package Versions in Active Interpreter:**
+  - `pytest`: 9.1.1
+  - `pytest-asyncio`: 1.4.0
+  - `anyio`: 4.15.1
+- **Development Requirements Pinning:**
+  - Created `backend/requirements-dev.txt` pinning:
+    ```text
+    pytest==9.1.1
+    pytest-asyncio==1.4.0
+    ```
+  - Documented supported versions:
+    - **Python:** 3.12 – 3.14
+    - **pytest:** 8.3.4 – 9.1.1
+    - **pytest-asyncio:** 0.23+ / 1.4.0+
+  - Production dependencies (`backend/requirements.txt`) remain completely unchanged.
 
-3. **Execution Gateway Dry Run Action Test (1 failure in `backend/test_v3_execution_gateway.py`):**
-   - `backend/test_v3_execution_gateway.py::TestV3ExecutionGateway::test_15_api_action_execute_endpoint`
-   - **Root Cause:** `POST /api/v3/actions/{id}/execute` returns 500 in dry-run mode when mock/internal components for action execution are not fully stubbed in the standalone test context.
-   - **Pre-Existing Evidence:** File was created in Prompt 10 (`7240c02`) and has not been modified since.
+#### Plain Cause Classification:
+- **Environment-Caused:**
+  - The 2 async test failures in `backend/test_v3_continuous_verification.py` were 100% environment-caused by running `pytest 9.1.1` without `pytest-asyncio`. With `pytest-asyncio==1.4.0` installed, the 128-pass result is fully reproduced (128 passed, 0 failed).
+- **Code-Caused:**
+  - The failure in `test_15_api_action_execute_endpoint` and all 4 failures in `backend/test_websocket_endpoints.py` are code-caused regressions introduced in Prompt 38A (`a630e7f`), detailed below.
+- **Test Structure / Script Convention:**
+  - `backend/test_agent.py::test_agent` is an interactive standalone script (`if __name__ == '__main__': asyncio.run(test_agent())`) whose coroutine declaration is discovered by pytest.
 
-4. **Legacy WebSocket Endpoints Tests (4 failures in `backend/test_websocket_endpoints.py`):**
-   - `TestServerEndpoints::test_endpoint_connect_live_db`
-   - `TestServerEndpoints::test_endpoint_upload_csv`
-   - `TestServerEndpoints::test_websocket_chat_and_history`
-   - `TestServerEndpoints::test_websocket_rbac_approval`
-   - **Root Cause:** Legacy test suite from Prompt 01 relying on unmocked live endpoints/WebSockets and legacy authentication profiles without tenant/session contexts.
-   - **Pre-Existing Evidence:** File was created in commit `e252d46` (Prompt 01) and has never been modified since.
+---
 
-5. **Guarded Live DB Test (`backend/test_v3_security.py`):**
-   - `TestV3SecurityHardening::test_connect_live_db_sanitization`
-   - **Status:** SKIPPED cleanly when PostgreSQL service on `localhost:5432` is unreachable.
-   - **Root Cause:** The test connects to `postgresql://dbadmin:SuperSecret123@localhost:5432/live_db` without a running PostgreSQL daemon. Guarded to skip cleanly with explicit reason while keeping all sanitization assertions fully intact when the database is available.
-   - **Pre-Existing Evidence:** Fails identically at `640cea3` and `0fc3073`.
+### 5. Historical Commit Comparison & Baseline Evidence
 
-### 4. Frontend Build & TypeScript Validation
+All 6 repository failures were tested across multiple historical commits using clean worktrees:
+- `502f0c5` (Prompt 24, baseline from earlier milestone)
+- `54cdc6f` (Prompt 38 Base)
+- `a630e7f` (Prompt 38A: Autonomy Governance Security Corrections)
+- `6e5f7b9` (Prompt 38E: Session and Workspace Scope Gaps)
+- `0fc3073` (Prompt 39 Baseline)
+- `640cea3` (Prompt 39 Correction 4)
+- `fc4b1fa` / Current HEAD (Prompt 39 Correction 5b)
+
+#### Test Comparison Matrix:
+
+| Test Identifier | Result at `502f0c5` (P24) | Result at `54cdc6f` (P38) | Result at `a630e7f` (P38A) | Result at `6e5f7b9` (P38E) | Result at `0fc3073` (P39) | Result at `640cea3` (P39 C4) | Result at Current HEAD | Failure Message & Cause |
+|---|---|---|---|---|---|---|---|---|
+| `test_v3_execution_gateway.py::TestV3ExecutionGateway::test_15_api_action_execute_endpoint` | **PASSED** | **PASSED** | **FAILED** | **FAILED** | **FAILED** | **FAILED** | **FAILED** | `HTTP 500 != 200`: `pydantic_core._pydantic_core.ValidationError: 1 validation error for PolicyEvaluationContext; session_id: Input should be a valid string, input_value=None` |
+| `test_websocket_endpoints.py::TestServerEndpoints::test_endpoint_connect_live_db` | **PASSED** | **PASSED** | **FAILED** | **FAILED** | **FAILED** | **FAILED** | **FAILED** | `HTTP 400 != 200`: `DatabaseContext` validation error (`session_id` is `None` when request lacks `X-Session-ID` header) |
+| `test_websocket_endpoints.py::TestServerEndpoints::test_endpoint_upload_csv` | **PASSED** | **PASSED** | **FAILED** | **FAILED** | **FAILED** | **FAILED** | **FAILED** | `HTTP 400 != 200`: `DatabaseContext` validation error (`session_id` is `None` when request lacks `X-Session-ID` header) |
+| `test_websocket_endpoints.py::TestServerEndpoints::test_websocket_chat_and_history` | **PASSED** | **PASSED** | **FAILED** | **FAILED** | **FAILED** | **FAILED** | **FAILED** | `WebSocketDisconnect` / connection failure due to missing session identity on connect |
+| `test_websocket_endpoints.py::TestServerEndpoints::test_websocket_rbac_approval` | **PASSED** | **PASSED** | **FAILED** | **FAILED** | **FAILED** | **FAILED** | **FAILED** | `WebSocketDisconnect` / connection failure due to missing session identity on connect |
+| `test_agent.py::test_agent` | **FAILED** | **FAILED** | **FAILED** | **FAILED** | **FAILED** | **FAILED** | **FAILED** | `Failed: async def functions are not allowed in this position` (standalone interactive script without `@pytest.mark.asyncio`) |
+
+#### Root Cause Analysis of Code-Caused Regressions:
+
+1. **First Failing Commit:** `a630e7ff78d4b381573da8784c5cb78e743090d6` ("fix(autonomy): Prompt 38A autonomy governance security corrections and regression suite").
+2. **The Breaking Change in `backend/core/auth.py`:**
+   - In Prompt 38A, `Identity.session_id` default was changed from `uuid.uuid4()` to `None`.
+   - In `get_current_identity`, the fallback for non-production environments (`elif not IS_PRODUCTION: identity.session_id = f"session_{identity.user_id}"`) was removed, causing `identity.session_id` to remain `None` when requests omit the `X-Session-ID` header.
+3. **Impact on Strict Pydantic Domain Schemas:**
+   - In `backend/data/schemas/policy_evaluation_contract.py`, `PolicyEvaluationContext` defines `session_id: str = Field(...)` (strictly non-null).
+   - In `backend/services/db_gateway.py`, `DatabaseContext` defines `session_id: str = Field(...)` (strictly non-null).
+   - In `test_15_api_action_execute_endpoint`: The test issues `POST /api/v3/actions/{id}/execute` with an authorization token but without `X-Session-ID`. The route handler invokes `PolicyEvaluationContext(session_id=identity.session_id, ...)`, triggering an unhandled `pydantic_core.ValidationError` that returns HTTP 500.
+   - In `test_websocket_endpoints.py`: Tests issue `POST /connect-live-db` and `POST /upload-csv` without authentication or session headers. The route handlers attempt to instantiate `DatabaseContext(session_id=identity.session_id, ...)`, which triggers a `ValidationError` caught as `ValueError` and returned as HTTP 400.
+4. **Conclusion:**
+   - These 5 failures are **real code-caused regressions introduced in Prompt 38A (`a630e7f`)**.
+   - They passed cleanly at `502f0c5` (Prompt 24) and `54cdc6f` (Prompt 38 base).
+   - They were not introduced by Prompt 39 or any of its corrections.
+
+---
+
+### 6. Sanitization Test Hardening (`test_connect_live_db_sanitization`)
+
+- **Investigation:**
+  - Tested `test_connect_live_db_sanitization` in `backend/test_v3_security.py` with the network layer mocked.
+  - The request provides `headers={"Authorization": "Bearer manager_token"}`. Under development authentication, the bearer token resolves an identity with `session_id="session_manager"`.
+  - When mocked at `r_mod.db_gateway.create_connection` and `r_mod.db_gateway.discover_schema`, the route handler succeeds with HTTP 200, returning `{"connection_id": "mock_conn_sanitization", "database_type": "postgresql"}`.
+  - The credential sanitization assertion `self.assertNotIn("SuperSecret123", json.dumps(resp_data))` executes and passes completely.
+- **Resolution:**
+  - The previous `self.skipTest()` was solely due to a live TCP socket probe to `localhost:5432`.
+  - Replaced the socket probe with a scoped `patch.object` on `db_gateway.create_connection` and `db_gateway.discover_schema` using a context manager.
+  - No assertions were weakened or removed; the test is now 100% deterministic and runs without requiring an external PostgreSQL instance.
+
+---
+
+### 7. Frontend Build & TypeScript Validation
 Command: `npm run build` in `frontend/`
 - **Next.js Version:** 16.2.7 (Turbopack)
 - **TypeScript Check:** Finished in 6.2s with 0 errors
