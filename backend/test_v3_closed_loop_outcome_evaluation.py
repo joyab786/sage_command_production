@@ -5242,3 +5242,188 @@ def test_136_existing_authoritative_verification_and_evaluation_flow_intact(temp
     corrected = repo.get_evaluation(admin_identity.tenant_id, admin_identity.workspace_id, "eval_136_unverified")
     assert corrected.eligible_for_learning is False
 
+
+# =============================================================================
+# GROUP N: DETERMINISTIC ORDERING BEFORE REPOSITORY LIMITS (Prompt 39 Correction 5)
+# =============================================================================
+
+def test_137_repository_ordering_primary_evaluated_at_desc_secondary_eval_id_asc(temp_db):
+    """137. Repository results are ordered by evaluated_at DESC, then evaluation_id ASC."""
+    repo, service = temp_db
+    # Insert in mixed order with varied timestamps and ties
+    _create_scoped_test_eval(repo, "eval_137_mid_z", "plant_01", "2026-10-18T10:00:00Z")
+    _create_scoped_test_eval(repo, "eval_137_new_a", "plant_01", "2026-10-18T12:00:00Z")
+    _create_scoped_test_eval(repo, "eval_137_mid_a", "plant_01", "2026-10-18T10:00:00Z")
+    _create_scoped_test_eval(repo, "eval_137_old_m", "plant_01", "2026-10-18T08:00:00Z")
+    _create_scoped_test_eval(repo, "eval_137_mid_m", "plant_01", "2026-10-18T10:00:00Z")
+
+    results = repo.list_evaluations(tenant_id="tenant_alpha", workspace_id="workspace_prod", plant_id="plant_01")
+    result_ids = [r.evaluation_id for r in results]
+
+    # Expected: 12:00 first, then 10:00 sorted ASC by eval_id (mid_a, mid_m, mid_z), then 08:00
+    assert result_ids == [
+        "eval_137_new_a",
+        "eval_137_mid_a",
+        "eval_137_mid_m",
+        "eval_137_mid_z",
+        "eval_137_old_m",
+    ]
+
+
+def test_138_deterministic_selection_when_tied_timestamps_exceed_query_limit(temp_db):
+    """138. When multiple records share the same timestamp and exceed query limit, selected records are deterministic before limit."""
+    repo, service = temp_db
+    # Create 8 records sharing the EXACT same timestamp (10:00:00Z), inserted out of alphabetical order
+    same_ts = "2026-10-18T10:00:00Z"
+    ids_to_insert = [
+        "eval_138_tie_07",
+        "eval_138_tie_02",
+        "eval_138_tie_05",
+        "eval_138_tie_01",
+        "eval_138_tie_08",
+        "eval_138_tie_03",
+        "eval_138_tie_06",
+        "eval_138_tie_04",
+    ]
+    for eid in ids_to_insert:
+        _create_scoped_test_eval(repo, eid, "plant_01", same_ts)
+
+    # Query with limit=4 (exceeded by 8 records)
+    limit = 4
+    results = repo.list_evaluations(
+        tenant_id="tenant_alpha",
+        workspace_id="workspace_prod",
+        plant_id="plant_01",
+        limit=limit,
+    )
+
+    # Must deterministically select the lowest 4 evaluation_ids before limit is applied
+    assert len(results) == 4
+    selected_ids = [r.evaluation_id for r in results]
+    assert selected_ids == [
+        "eval_138_tie_01",
+        "eval_138_tie_02",
+        "eval_138_tie_03",
+        "eval_138_tie_04",
+    ]
+
+    # Verify repeatable deterministic behavior
+    repeat_results = repo.list_evaluations(
+        tenant_id="tenant_alpha",
+        workspace_id="workspace_prod",
+        plant_id="plant_01",
+        limit=limit,
+    )
+    assert [r.evaluation_id for r in repeat_results] == selected_ids
+
+
+def test_139_multi_plant_revalidation_retains_deterministic_ordering_and_overall_limit(temp_db):
+    """139. Multi-plant revalidation retains deterministic ordering and the overall limit."""
+    repo, service = temp_db
+    admin_multi = Identity(
+        user_id="user_admin_reval_det",
+        tenant_id="tenant_alpha",
+        workspace_id="workspace_prod",
+        roles=["ADMINISTRATOR"],
+        permissions=["learning.evaluation.revalidate"],
+        assigned_plants=["plant_01", "plant_02"],
+        clearance_level=3,
+        is_server_authoritative=True,
+    )
+
+    # Seed records in plant_01 and plant_02 with same timestamps exceeding limit
+    # plant_01 has 2 items at 10:00:00Z and 1 at 12:00:00Z
+    _create_scoped_test_eval(repo, "eval_139_tie_b_p1", "plant_01", "2026-10-18T10:00:00Z")
+    _create_scoped_test_eval(repo, "eval_139_tie_d_p1", "plant_01", "2026-10-18T10:00:00Z")
+    _create_scoped_test_eval(repo, "eval_139_recent_p1", "plant_01", "2026-10-18T12:00:00Z")
+
+    # plant_02 has 2 items at 10:00:00Z and 1 at 12:00:00Z
+    _create_scoped_test_eval(repo, "eval_139_tie_a_p2", "plant_02", "2026-10-18T10:00:00Z")
+    _create_scoped_test_eval(repo, "eval_139_tie_c_p2", "plant_02", "2026-10-18T10:00:00Z")
+    _create_scoped_test_eval(repo, "eval_139_recent_p2", "plant_02", "2026-10-18T12:00:00Z")
+
+    # Intercept outcomes to track the exact sequence in which revalidation examines records
+    checked_eval_outcomes = []
+    orig_get_outcome = repo.get_observed_outcome
+
+    def spy_get_outcome(*args, **kwargs):
+        outcome_id = kwargs.get("outcome_id") or (args[2] if len(args) > 2 else None)
+        checked_eval_outcomes.append(outcome_id)
+        return orig_get_outcome(*args, **kwargs)
+
+    service.repository.get_observed_outcome = spy_get_outcome
+
+    # Request limit=4 overall across both plants (there are 6 eligible records)
+    report = service.revalidate_historical_evaluations(admin_multi, limit=4)
+    assert report["total_checked"] == 4
+
+    # Ordering must be evaluated_at DESC (12:00 before 10:00) then evaluation_id ASC:
+    # 12:00: eval_139_recent_p1, then eval_139_recent_p2
+    # 10:00: eval_139_tie_a_p2 (plant_02), then eval_139_tie_b_p1 (plant_01)
+    assert checked_eval_outcomes == [
+        "outc_eval_139_recent_p1",
+        "outc_eval_139_recent_p2",
+        "outc_eval_139_tie_a_p2",
+        "outc_eval_139_tie_b_p1",
+    ]
+
+
+def test_140_tenant_workspace_plant_and_eligibility_filtering_unchanged(temp_db):
+    """140. Tenant/workspace/plant filtering and eligibility filters remain strictly enforced."""
+    repo, service = temp_db
+    same_ts = "2026-10-18T10:00:00Z"
+
+    # Seed records in target scope
+    _create_scoped_test_eval(repo, "eval_140_target_1", "plant_01", same_ts, eligible=True)
+    _create_scoped_test_eval(repo, "eval_140_target_2", "plant_01", same_ts, eligible=False)
+
+    # Seed records outside target scope (other plant, other workspace, other tenant)
+    _create_scoped_test_eval(repo, "eval_140_diff_plant", "plant_02", same_ts, eligible=True)
+    _create_scoped_test_eval(repo, "eval_140_diff_ws", "plant_01", same_ts, workspace_id="workspace_other", eligible=True)
+    _create_scoped_test_eval(repo, "eval_140_diff_tenant", "plant_01", same_ts, tenant_id="tenant_other", eligible=True)
+
+    # Query with plant_id="plant_01" and eligible_only=True
+    filtered = repo.list_evaluations(
+        tenant_id="tenant_alpha",
+        workspace_id="workspace_prod",
+        plant_id="plant_01",
+        eligible_only=True,
+    )
+    assert len(filtered) == 1
+    assert filtered[0].evaluation_id == "eval_140_target_1"
+
+    # Query with plant_id="plant_01" and eligible_only=False
+    all_p1 = repo.list_evaluations(
+        tenant_id="tenant_alpha",
+        workspace_id="workspace_prod",
+        plant_id="plant_01",
+        eligible_only=False,
+    )
+    assert len(all_p1) == 2
+    assert {r.evaluation_id for r in all_p1} == {"eval_140_target_1", "eval_140_target_2"}
+
+
+def test_141_existing_repository_and_service_behavior_remains_compatible(temp_db, test_identity):
+    """141. Existing repository and service behavior remains compatible with limit bounding and prior eval lookup."""
+    repo, service = temp_db
+    # Test repository bounds limit: min(max(1, limit), 200)
+    for i in range(5):
+        _create_scoped_test_eval(repo, f"eval_141_{i}", "plant_01", f"2026-10-18T10:0{i}:00Z")
+
+    # Limit = -10 clamped to 1
+    res_neg = repo.list_evaluations("tenant_alpha", "workspace_prod", limit=-10)
+    assert len(res_neg) == 1
+
+    # Limit = 0 clamped to 1
+    res_zero = repo.list_evaluations("tenant_alpha", "workspace_prod", limit=0)
+    assert len(res_zero) == 1
+
+    # Service list_evaluations delegates transparently
+    srv_list = service.list_evaluations(test_identity, plant_id="plant_01", limit=3)
+    assert len(srv_list) == 3
+    # Verify deterministic ordering holds on service call as well
+    assert srv_list[0].evaluation_id == "eval_141_4"  # Most recent (10:04)
+    assert srv_list[1].evaluation_id == "eval_141_3"  # 10:03
+    assert srv_list[2].evaluation_id == "eval_141_2"  # 10:02
+
+

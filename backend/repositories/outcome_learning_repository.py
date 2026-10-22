@@ -717,7 +717,7 @@ class OutcomeLearningRepository:
         if window_end:
             query += " AND evaluated_at <= ?"
             params.append(window_end)
-        query += " ORDER BY evaluated_at DESC LIMIT ?"
+        query += " ORDER BY evaluated_at DESC, evaluation_id ASC LIMIT ?"
         params.append(min(max(1, limit), 200))
 
         with self._lock, self._get_connection() as conn:
