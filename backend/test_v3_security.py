@@ -208,6 +208,17 @@ class TestV3SecurityHardening(unittest.TestCase):
 
     # --- 6. REST API HARDENED ROUTES TESTS ---
     def test_connect_live_db_sanitization(self):
+        import socket
+        postgres_reachable = False
+        try:
+            with socket.create_connection(("localhost", 5432), timeout=1.0):
+                postgres_reachable = True
+        except (OSError, ConnectionRefusedError):
+            postgres_reachable = False
+
+        if not postgres_reachable:
+            self.skipTest("Live PostgreSQL service on localhost:5432 is unreachable; skipping live connection test")
+
         payload = {
             "connection_string": "postgresql://dbadmin:SuperSecret123@localhost:5432/live_db"
         }
