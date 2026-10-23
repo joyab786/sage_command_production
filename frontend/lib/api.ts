@@ -1,7 +1,18 @@
+export function getClientSessionId(): string {
+  if (typeof window === "undefined") return "session_dev_client";
+  let sid = localStorage.getItem("sage_session_id");
+  if (!sid) {
+    sid = "session_" + Math.random().toString(36).substring(2, 10);
+    localStorage.setItem("sage_session_id", sid);
+  }
+  return sid;
+}
+
 export async function fetchSage(endpoint: string, options: RequestInit = {}) {
   const token = (typeof window !== "undefined" && localStorage.getItem("sage_token")) || "manager_token";
   const defaultHeaders: Record<string, string> = {
     "Authorization": `Bearer ${token}`,
+    "X-Session-ID": getClientSessionId(),
   };
   if (options.body && typeof options.body === "string") {
     defaultHeaders["Content-Type"] = "application/json";

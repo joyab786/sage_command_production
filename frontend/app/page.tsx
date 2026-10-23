@@ -28,6 +28,7 @@ import EvidenceExplainabilityModal from "./components/EvidenceExplainabilityModa
 import ConfidenceUncertaintyModal from "./components/ConfidenceUncertaintyModal";
 import AutonomyModal from "./components/AutonomyModal";
 import OutcomeLearningModal from "./components/OutcomeLearningModal";
+import { getClientSessionId } from "@/lib/api";
 
 
 
@@ -125,9 +126,13 @@ export default function ObsidianCommandCenter() {
 
   // --- WEBSOCKET TETHER ---
   useEffect(() => {
-    const WS_URL =
+    const sessionId = getClientSessionId();
+    const rawWsUrl =
       process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:8000/ws/sage";
-    const socket = new WebSocket(WS_URL);
+    const wsUrl = rawWsUrl.includes("?")
+      ? `${rawWsUrl}&session_id=${encodeURIComponent(sessionId)}`
+      : `${rawWsUrl}?session_id=${encodeURIComponent(sessionId)}`;
+    const socket = new WebSocket(wsUrl);
 
     socket.onopen = () => {
       setSystemStatus("ONLINE");
@@ -312,6 +317,9 @@ export default function ObsidianCommandCenter() {
     try {
       const response = await fetch("http://localhost:8000/upload-db", {
         method: "POST",
+        headers: {
+          "X-Session-ID": getClientSessionId(),
+        },
         body: formData,
       });
       const data = await response.json();
@@ -357,6 +365,7 @@ export default function ObsidianCommandCenter() {
         headers: {
           "Content-Type": "application/json",
           "Authorization": "Bearer manager_token",
+          "X-Session-ID": getClientSessionId(),
         },
         body: JSON.stringify({
           database_type: dbType,

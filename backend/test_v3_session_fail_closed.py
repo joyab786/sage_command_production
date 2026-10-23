@@ -10,21 +10,25 @@ Exhaustively tests fail-closed session handling across:
 """
 
 import io
+import time
 import unittest
+import jwt
 from unittest.mock import patch
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 try:
     from server import app
-    from core.config import IS_PRODUCTION, SAGE_DEV_SESSION_FALLBACK
+    from core.config import IS_PRODUCTION, SAGE_DEV_SESSION_FALLBACK, SAGE_SECRET_KEY, SAGE_AUTH_ISSUER, SAGE_AUTH_AUDIENCE
     from core.auth import get_current_identity, Identity
+    import core.auth as auth_mod
     from data.schemas.action_contract import Action, ActionStatus, RiskLevel
     from services.action_store import action_store
 except (ImportError, ModuleNotFoundError):
     from backend.server import app
-    from backend.core.config import IS_PRODUCTION, SAGE_DEV_SESSION_FALLBACK
+    from backend.core.config import IS_PRODUCTION, SAGE_DEV_SESSION_FALLBACK, SAGE_SECRET_KEY, SAGE_AUTH_ISSUER, SAGE_AUTH_AUDIENCE
     from backend.core.auth import get_current_identity, Identity
+    import backend.core.auth as auth_mod
     from backend.data.schemas.action_contract import Action, ActionStatus, RiskLevel
     from backend.services.action_store import action_store
 
@@ -236,11 +240,6 @@ class TestV3SessionFailClosed(unittest.TestCase):
 
     def test_dev_fallback_when_explicitly_enabled(self):
         """When explicitly enabled in development, fallback session is generated."""
-        try:
-            import core.auth as auth_mod
-        except ImportError:
-            import backend.core.auth as auth_mod
-
         class DummyRequest:
             headers = {}
 
@@ -251,6 +250,218 @@ class TestV3SessionFailClosed(unittest.TestCase):
             identity = auth_mod.get_current_identity(req, credentials=None)
             self.assertIsNotNone(identity.session_id)
             self.assertTrue(identity.session_id.startswith("session_"))
+
+    # -------------------------------------------------------------------------
+    # 6. Header vs Token Binding Tests (Prompt 39 Correction 5d)
+    # -------------------------------------------------------------------------
+
+    def _create_jwt(self, payload_override=None):
+        now = int(time.time())
+        payload = {
+            "sub": "test_user_jwt",
+            "tenant_id": "tenant_default",
+            "workspace_id": "workspace_default",
+            "roles": ["operator", "manager"],
+            "clearance_level": 2,
+            "assigned_plants": ["plant_01"],
+            "status": "ACTIVE",
+            "iss": SAGE_AUTH_ISSUER,
+            "aud": SAGE_AUTH_AUDIENCE,
+            "iat": now,
+            "exp": now + 3600
+        }
+        if payload_override:
+            payload.update(payload_override)
+        return jwt.encode(payload, SAGE_SECRET_KEY, algorithm="HS256")
+
+    def test_jwt_session_claim_retained_when_no_header(self):
+        """JWT with a session claim and no header: claim is retained."""
+        token = self._create_jwt({"session_id": "session_from_jwt_claim"})
+        headers = {"Authorization": f"Bearer {token}"}
+        resp = self.client.get("/api/v3/actions?limit=5", headers=headers)
+        self.assertEqual(resp.status_code, 200)
+
+        from starlette.datastructures import Headers
+        class DummyRequest:
+            def __init__(self, headers_dict):
+                self.headers = Headers(headers_dict)
+
+        req = DummyRequest({"authorization": f"Bearer {token}"})
+        identity = auth_mod.get_current_identity(req, credentials=None)
+        self.assertEqual(identity.session_id, "session_from_jwt_claim")
+
+    def test_jwt_session_claim_retained_when_different_header_sent(self):
+        """JWT with session claim and DIFFERENT header: claim is retained, header ignored."""
+        token = self._create_jwt({"session_id": "session_authoritative_jwt"})
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "X-Session-ID": "session_attacker_spoof_header"
+        }
+        resp = self.client.get("/api/v3/actions?limit=5", headers=headers)
+        self.assertEqual(resp.status_code, 200)
+
+        from starlette.datastructures import Headers
+        class DummyRequest:
+            def __init__(self, headers_dict):
+                self.headers = Headers(headers_dict)
+
+        req = DummyRequest({
+            "authorization": f"Bearer {token}",
+            "x-session-id": "session_attacker_spoof_header"
+        })
+        identity = auth_mod.get_current_identity(req, credentials=None)
+        # Authoritative JWT claim is retained; client header CANNOT replace it
+        self.assertEqual(identity.session_id, "session_authoritative_jwt")
+
+    def test_jwt_without_session_claim_and_header_current_behavior(self):
+        """JWT without session claim and header: report current behavior."""
+        now = int(time.time())
+        raw_payload = {
+            "sub": "user_no_sess_claim",
+            "tenant_id": "tenant_default",
+            "workspace_id": "workspace_default",
+            "roles": ["operator"],
+            "status": "ACTIVE",
+            "iss": SAGE_AUTH_ISSUER,
+            "aud": SAGE_AUTH_AUDIENCE,
+            "iat": now,
+            "exp": now + 3600
+        }
+        token = jwt.encode(raw_payload, SAGE_SECRET_KEY, algorithm="HS256")
+        from starlette.datastructures import Headers
+        class DummyRequest:
+            def __init__(self, headers_dict):
+                self.headers = Headers(headers_dict)
+
+        req = DummyRequest({
+            "authorization": f"Bearer {token}",
+            "x-session-id": "session_from_client_header"
+        })
+        identity = auth_mod.get_current_identity(req, credentials=None)
+        # Document current behavior: JWT provider sets is_server_authoritative=True
+        # and generates UUID fallback if omitted in claims
+        self.assertIsNotNone(identity.session_id)
+        self.assertNotEqual(identity.session_id, "session_from_client_header")
+
+    def test_mock_token_with_session_retained_when_no_header(self):
+        """Mock token with session and no header: session is retained."""
+        from starlette.datastructures import Headers
+        class DummyRequest:
+            def __init__(self, headers_dict):
+                self.headers = Headers(headers_dict)
+
+        req = DummyRequest({"authorization": "Bearer test_token_tenant_a"})
+        identity = auth_mod.get_current_identity(req, credentials=None)
+        self.assertEqual(identity.session_id, "session_A")
+
+    # -------------------------------------------------------------------------
+    # 7. Dev Fallback Autonomy Safety Verification (Prompt 39 Correction 5d)
+    # -------------------------------------------------------------------------
+
+    def test_fallback_session_rejected_by_autonomy_when_stored_action_session_bound(self):
+        """Fallback-derived session (session_{user_id}) cannot access session-bound stored action."""
+        try:
+            from services.autonomy_service import autonomy_service
+            from repositories.autonomy_repository import autonomy_repository
+            from data.schemas.autonomy_contract import AutonomyGrant, AutonomyLevel, SubjectType, AutonomyReasonCode, AutonomyDecisionEffect
+        except ImportError:
+            from backend.services.autonomy_service import autonomy_service
+            from backend.repositories.autonomy_repository import autonomy_repository
+            from backend.data.schemas.autonomy_contract import AutonomyGrant, AutonomyLevel, SubjectType, AutonomyReasonCode, AutonomyDecisionEffect
+
+        act_id = f"act_real_{time.time_ns()}"
+        act = Action(
+            action_id=act_id,
+            action_type="ADJUST_REORDER_POINT",
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            session_id="session_legit_user_42",
+            status=ActionStatus.READY,
+            parameters={"sku": "SKU-01", "reorder_point": 10},
+            target={"resource_type": "INVENTORY_ITEM", "resource_id": "SKU-01", "plant_id": "plant_01"},
+            reason={"summary": "Test action", "reason_code": "STOCK_LOW", "trigger": "MANUAL", "business_impact": "LOW"}
+        )
+        action_store.save(act)
+
+        grant = AutonomyGrant(
+            grant_id=f"grant_{time.time_ns()}",
+            subject_type=SubjectType.AGENT,
+            subject_id="agent_safety_test",
+            autonomy_level=AutonomyLevel.RECOMMEND,
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            plant_id="plant_01",
+            data_mode="REAL",
+            permitted_capabilities=["PROPOSE_ACTION"],
+            created_by="admin_test"
+        )
+        autonomy_repository.save_grant(grant)
+
+        caller_identity = Identity(
+            user_id="dev_user_001",
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            session_id="session_dev_user_001",
+            roles=["operator"],
+            assigned_plants=["plant_01"],
+            clearance_level=2
+        )
+
+        dec = autonomy_service.evaluate_autonomy(
+            identity=caller_identity,
+            subject_id="agent_safety_test",
+            requested_capability="PROPOSE_ACTION",
+            resource_scope=grant.scope,
+            data_mode="REAL",
+            risk_context={"action_id": act_id, "action_type": "ADJUST_REORDER_POINT"}
+        )
+        self.assertEqual(dec.decision, AutonomyDecisionEffect.DENY)
+        self.assertEqual(dec.reason_code, AutonomyReasonCode.SESSION_MISMATCH)
+
+    def test_fallback_session_cannot_authorize_autonomous_execution_capabilities(self):
+        """Autonomous execution capabilities (EXECUTE_SQL, CONTROL_PLC, etc.) cannot be authorized with fallback session."""
+        try:
+            from services.autonomy_service import autonomy_service
+            from repositories.autonomy_repository import autonomy_repository
+            from data.schemas.autonomy_contract import AutonomyGrant, AutonomyLevel, SubjectType, AutonomyDecisionEffect
+        except ImportError:
+            from backend.services.autonomy_service import autonomy_service
+            from backend.repositories.autonomy_repository import autonomy_repository
+            from backend.data.schemas.autonomy_contract import AutonomyGrant, AutonomyLevel, SubjectType, AutonomyDecisionEffect
+
+        grant = AutonomyGrant(
+            grant_id=f"grant_{time.time_ns()}",
+            subject_type=SubjectType.AGENT,
+            subject_id="agent_exec_prohibit",
+            autonomy_level=AutonomyLevel.RECOMMEND,
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            plant_id="plant_01",
+            data_mode="REAL",
+            permitted_capabilities=["PROPOSE_ACTION"],
+            created_by="admin_test"
+        )
+        autonomy_repository.save_grant(grant)
+
+        caller_identity = Identity(
+            user_id="dev_user_001",
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            session_id="session_dev_user_001",
+            roles=["operator"],
+            assigned_plants=["plant_01"],
+            clearance_level=2
+        )
+
+        for cap in ("EXECUTE_SQL", "EXECUTE_COMMAND", "CONTROL_PLC", "CONTROL_SCADA"):
+            dec = autonomy_service.evaluate_autonomy(
+                identity=caller_identity,
+                subject_id="agent_exec_prohibit",
+                requested_capability=cap,
+                resource_scope=grant.scope,
+                data_mode="REAL"
+            )
+            self.assertEqual(dec.decision, AutonomyDecisionEffect.DENY)
 
 
 if __name__ == "__main__":
