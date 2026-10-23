@@ -26,12 +26,6 @@ SAGE_SECRET_KEY = os.getenv("SAGE_SECRET_KEY", "sagecommand_default_dev_secret_k
 raw_jwt_algs = os.getenv("SAGE_JWT_ALGORITHMS", "HS256,RS256")
 SAGE_JWT_ALGORITHMS = [a.strip() for a in raw_jwt_algs.split(",") if a.strip()]
 
-# Explicitly gated development fallback for session identity. Off by default.
-# Permanently inert when IS_PRODUCTION is true.
-SAGE_DEV_SESSION_FALLBACK = (
-    os.getenv("SAGE_DEV_SESSION_FALLBACK", "false").lower() in ("true", "1", "yes")
-    and not IS_PRODUCTION
-)
 
 # --- REQUEST & RESOURCE BOUNDARIES ---
 SAGE_MAX_REQUEST_SIZE = int(os.getenv("SAGE_MAX_REQUEST_SIZE", 10 * 1024 * 1024))  # 10 MB default limit

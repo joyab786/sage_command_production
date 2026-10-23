@@ -209,6 +209,27 @@ Command: `npm run build` in `frontend/`
 - **TypeScript Check:** Finished in 6.2s with 0 errors
 - **Static Page Generation:** All routes prerendered successfully (`✓ Generating static pages using 5 workers (4/4)`)
 
+### 8. Prompt 39 Correction 5e: Authentication and Session Hardening
+
+- **Removal of Dev Session Fallback:**
+  - Deleted `SAGE_DEV_SESSION_FALLBACK` configuration from `backend/core/config.py`.
+  - Removed dev session fallback logic (`session_{identity.user_id}`) from `backend/core/auth.py` and `backend/api/websocket.py`.
+  - Removed tests exercising the fallback and replaced with tests proving that any request lacking session headers, claims, or token profiles yields `session_id=None` across all environments.
+- **No Fabricated Sessions for JWT:**
+  - In `JWTAuthenticationProvider.authenticate_token`, removed `uuid4()` default. A token lacking a `session_id` claim yields `session_id=None`.
+  - Authoritative Session Rule: A client `X-Session-ID` header or query parameter must NEVER supply, inject, or override a session for a JWT identity (`is_server_authoritative=True`).
+- **Route Fail-Closed Consistency:**
+  - `/api/v3/actions/{id}/execute` -> HTTP 401 (`MISSING_SESSION`)
+  - `/api/v3/transactions/{txId}/execute` -> HTTP 401 (`MISSING_SESSION`)
+  - `/connect-live-db` -> HTTP 400 (`Session context required`)
+  - `/upload-db` & `/upload-csv` -> HTTP 400 (`Session context required`)
+  - `/ws/sage` -> WebSocket Close Code `1008` (Policy Violation)
+  - `/api/v3/database/connections/*` -> HTTP 401/403/404; strictly zero 500 errors
+- **Frontend Session Continuity:**
+  - Bound `X-Session-ID` in `TransactionPlanModal.tsx` for transaction execution and rollback.
+  - Exported `resetClientSession()` in `frontend/lib/api.ts` to clear `localStorage` session state upon logout.
+  - Confirmed `npm run build` compiles cleanly with zero TypeScript errors.
+
 ---
 
 ## F. Known Limitations & Deferred Capabilities

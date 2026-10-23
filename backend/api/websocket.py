@@ -5,7 +5,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from langchain_core.messages import HumanMessage
 
 try:
-    from core.config import SAGE_AUTH_ENABLED, IS_PRODUCTION, SAGE_MAX_REQUEST_SIZE, DEFAULT_DB_PATH, SAGE_DEV_SESSION_FALLBACK
+    from core.config import SAGE_AUTH_ENABLED, IS_PRODUCTION, SAGE_MAX_REQUEST_SIZE, DEFAULT_DB_PATH
     from core.auth import get_auth_provider, Identity
     from governance.audit import log_security_event
     from governance.redaction import sanitize_log_message
@@ -18,7 +18,7 @@ try:
     from data.schemas.action_contract import ActionStatus
     from tools.verification_tools import active_verification_identity
 except (ImportError, ModuleNotFoundError):
-    from backend.core.config import SAGE_AUTH_ENABLED, IS_PRODUCTION, SAGE_MAX_REQUEST_SIZE, DEFAULT_DB_PATH, SAGE_DEV_SESSION_FALLBACK
+    from backend.core.config import SAGE_AUTH_ENABLED, IS_PRODUCTION, SAGE_MAX_REQUEST_SIZE, DEFAULT_DB_PATH
     from backend.core.auth import get_auth_provider, Identity
     from backend.governance.audit import log_security_event
     from backend.governance.redaction import sanitize_log_message
@@ -70,20 +70,17 @@ async def websocket_endpoint(websocket: WebSocket):
         await websocket.close(code=1008)
         return
 
-    # Extract session identity from token claims, query parameters, or client headers
-    session_val = (
-        identity.session_id
-        or websocket.query_params.get("session_id")
-        or websocket.query_params.get("x-session-id")
-        or websocket.headers.get("x-session-id")
-        or websocket.headers.get("X-Session-ID")
-    )
-    if session_val:
-        identity.session_id = session_val
-    elif not IS_PRODUCTION and SAGE_DEV_SESSION_FALLBACK:
-        identity.session_id = f"session_{identity.user_id}"
-    else:
-        identity.session_id = None
+    # HARDENING RULE: A client query parameter or header must NOT supply a session for a JWT identity.
+    # For server-authoritative identities (e.g. JWT), session_id must come strictly from token claims.
+    if not identity.is_server_authoritative:
+        session_val = (
+            identity.session_id
+            or websocket.query_params.get("session_id")
+            or websocket.query_params.get("x-session-id")
+            or websocket.headers.get("x-session-id")
+            or websocket.headers.get("X-Session-ID")
+        )
+        identity.session_id = session_val or None
 
     # Fail closed on missing session identity
     if not identity.session_id:

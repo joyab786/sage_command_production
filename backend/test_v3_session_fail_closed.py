@@ -19,14 +19,14 @@ from starlette.websockets import WebSocketDisconnect
 
 try:
     from server import app
-    from core.config import IS_PRODUCTION, SAGE_DEV_SESSION_FALLBACK, SAGE_SECRET_KEY, SAGE_AUTH_ISSUER, SAGE_AUTH_AUDIENCE
+    from core.config import IS_PRODUCTION, SAGE_SECRET_KEY, SAGE_AUTH_ISSUER, SAGE_AUTH_AUDIENCE
     from core.auth import get_current_identity, Identity
     import core.auth as auth_mod
     from data.schemas.action_contract import Action, ActionStatus, RiskLevel
     from services.action_store import action_store
 except (ImportError, ModuleNotFoundError):
     from backend.server import app
-    from backend.core.config import IS_PRODUCTION, SAGE_DEV_SESSION_FALLBACK, SAGE_SECRET_KEY, SAGE_AUTH_ISSUER, SAGE_AUTH_AUDIENCE
+    from backend.core.config import IS_PRODUCTION, SAGE_SECRET_KEY, SAGE_AUTH_ISSUER, SAGE_AUTH_AUDIENCE
     from backend.core.auth import get_current_identity, Identity
     import backend.core.auth as auth_mod
     from backend.data.schemas.action_contract import Action, ActionStatus, RiskLevel
@@ -184,16 +184,11 @@ class TestV3SessionFailClosed(unittest.TestCase):
             self.assertIn(rec1.get("type"), ["node_update", "node_active", "chat_response", "log"])
 
     # -------------------------------------------------------------------------
-    # 5. Production Mode Inertness and Dev Fallback Gating
+    # 5. Production Mode Fail-Closed & Universal No-Session Handling
     # -------------------------------------------------------------------------
 
-    def test_production_mode_never_applies_dev_fallback(self):
-        """When IS_PRODUCTION is True, dev fallback is strictly inert and session_id remains None."""
-        class DummyRequest:
-            headers = {}
-
-    def test_production_mode_never_applies_dev_fallback(self):
-        """When IS_PRODUCTION is True, dev fallback is strictly inert and unauthenticated requests fail closed."""
+    def test_production_mode_fails_closed_without_credentials(self):
+        """When IS_PRODUCTION is True, provider is JWT and unauthenticated requests fail closed."""
         try:
             import core.auth as auth_mod
         except ImportError:
@@ -204,52 +199,52 @@ class TestV3SessionFailClosed(unittest.TestCase):
             headers = {}
 
         # 1. Under production, provider is JWTAuthenticationProvider
-        with patch.object(auth_mod, "IS_PRODUCTION", True), \
-             patch.object(auth_mod, "SAGE_DEV_SESSION_FALLBACK", True):
+        with patch.object(auth_mod, "IS_PRODUCTION", True):
             provider = auth_mod.get_auth_provider()
             self.assertTrue(provider.__class__.__name__ == "JWTAuthenticationProvider")
 
         # 2. Test unauthenticated request under IS_PRODUCTION=True raises 401 (fails closed)
         req = DummyRequest()
-        with patch.object(auth_mod, "IS_PRODUCTION", True), \
-             patch.object(auth_mod, "SAGE_DEV_SESSION_FALLBACK", True):
+        with patch.object(auth_mod, "IS_PRODUCTION", True):
             with self.assertRaises(HTTPException) as ctx:
                 auth_mod.get_current_identity(req, credentials=None)
             self.assertEqual(ctx.exception.status_code, 401)
 
-        # 3. Test that production mode never assigns dev session fallback to server-authoritative or production identities
+        # 3. Server-authoritative or production identities have session_id None if claim omitted
         prod_identity = Identity(user_id="prod_user", is_server_authoritative=True)
         self.assertIsNone(prod_identity.session_id)
 
-    def test_dev_fallback_off_by_default(self):
-        """When not in production, dev fallback is off by default and session_id is None without X-Session-ID."""
+    def test_no_session_header_no_claim_no_token_yields_none_in_every_environment(self):
+        """A request with no session header, no claim, and no token session yields session_id None in every environment."""
         try:
             import core.auth as auth_mod
         except ImportError:
             import backend.core.auth as auth_mod
+        from starlette.datastructures import Headers
 
         class DummyRequest:
-            headers = {}
+            def __init__(self, headers_dict):
+                self.headers = Headers(headers_dict)
 
-        req = DummyRequest()
+        # Environment 1: Development/Test mode unauthenticated request
+        req1 = DummyRequest({})
         with patch.object(auth_mod, "IS_PRODUCTION", False), \
-             patch.object(auth_mod, "SAGE_DEV_SESSION_FALLBACK", False), \
              patch.object(auth_mod, "SAGE_AUTH_ENABLED", False):
-            identity = auth_mod.get_current_identity(req, credentials=None)
-            self.assertIsNone(identity.session_id)
+            identity1 = auth_mod.get_current_identity(req1, credentials=None)
+            self.assertIsNone(identity1.session_id)
 
-    def test_dev_fallback_when_explicitly_enabled(self):
-        """When explicitly enabled in development, fallback session is generated."""
-        class DummyRequest:
-            headers = {}
+        # Environment 2: Development/Test mode with mock token that has no session in its profile
+        req2 = DummyRequest({"authorization": "Bearer manager_token"})
+        with patch.object(auth_mod, "IS_PRODUCTION", False):
+            identity2 = auth_mod.get_current_identity(req2, credentials=None)
+            self.assertIsNone(identity2.session_id)
 
-        req = DummyRequest()
-        with patch.object(auth_mod, "IS_PRODUCTION", False), \
-             patch.object(auth_mod, "SAGE_DEV_SESSION_FALLBACK", True), \
-             patch.object(auth_mod, "SAGE_AUTH_ENABLED", False):
-            identity = auth_mod.get_current_identity(req, credentials=None)
-            self.assertIsNotNone(identity.session_id)
-            self.assertTrue(identity.session_id.startswith("session_"))
+        # Environment 3: Production mode with JWT token that has no session_id claim
+        jwt_no_sess = self._create_jwt({"sub": "prod_tester_01"})
+        req3 = DummyRequest({"authorization": f"Bearer {jwt_no_sess}"})
+        with patch.object(auth_mod, "IS_PRODUCTION", True):
+            identity3 = auth_mod.get_current_identity(req3, credentials=None)
+            self.assertIsNone(identity3.session_id)
 
     # -------------------------------------------------------------------------
     # 6. Header vs Token Binding Tests (Prompt 39 Correction 5d)
@@ -313,8 +308,8 @@ class TestV3SessionFailClosed(unittest.TestCase):
         # Authoritative JWT claim is retained; client header CANNOT replace it
         self.assertEqual(identity.session_id, "session_authoritative_jwt")
 
-    def test_jwt_without_session_claim_and_header_current_behavior(self):
-        """JWT without session claim and header: report current behavior."""
+    def test_jwt_without_session_claim_yields_none_and_header_cannot_replace_claim(self):
+        """A JWT without a session claim yields session_id None; a client X-Session-ID header cannot supply it."""
         now = int(time.time())
         raw_payload = {
             "sub": "user_no_sess_claim",
@@ -333,15 +328,193 @@ class TestV3SessionFailClosed(unittest.TestCase):
             def __init__(self, headers_dict):
                 self.headers = Headers(headers_dict)
 
-        req = DummyRequest({
+        # 1. Without header: session_id is None (no fabricated UUID)
+        req_no_hdr = DummyRequest({"authorization": f"Bearer {token}"})
+        identity_no_hdr = auth_mod.get_current_identity(req_no_hdr, credentials=None)
+        self.assertIsNone(identity_no_hdr.session_id)
+
+        # 2. With client X-Session-ID header: header is ignored, session_id remains None
+        req_with_hdr = DummyRequest({
             "authorization": f"Bearer {token}",
             "x-session-id": "session_from_client_header"
         })
-        identity = auth_mod.get_current_identity(req, credentials=None)
-        # Document current behavior: JWT provider sets is_server_authoritative=True
-        # and generates UUID fallback if omitted in claims
-        self.assertIsNotNone(identity.session_id)
-        self.assertNotEqual(identity.session_id, "session_from_client_header")
+        identity_with_hdr = auth_mod.get_current_identity(req_with_hdr, credentials=None)
+        self.assertIsNone(identity_with_hdr.session_id)
+
+    def test_jwt_without_claim_returns_missing_session_on_action_execute(self):
+        """JWT without session claim returns 401 MISSING_SESSION on action execute."""
+        act = self._create_approved_action()
+        token = self._create_jwt({"sub": "jwt_user_no_sess"})  # no session_id claim
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "X-Tenant-ID": act.tenant_id,
+            "X-Session-ID": "session_header_should_be_ignored"
+        }
+        resp = self.client.post(
+            f"/api/v3/actions/{act.action_id}/execute",
+            json={"dry_run": True},
+            headers=headers
+        )
+        self.assertEqual(resp.status_code, 401)
+        data = resp.json()
+        error_info = data.get("error", {})
+        code = error_info.get("code") if isinstance(error_info, dict) else data.get("code")
+        self.assertEqual(code, "MISSING_SESSION")
+
+    def test_jwt_without_claim_returns_missing_session_on_connect_live_db(self):
+        """JWT without session claim returns 400 on connect-live-db."""
+        token = self._create_jwt({"sub": "jwt_user_no_sess"})
+        headers = {"Authorization": f"Bearer {token}"}
+        payload = {"connection_string": "sqlite:///./dynamic_datacore.sqlite"}
+        resp = self.client.post("/connect-live-db", json=payload, headers=headers)
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("Session context required", resp.text)
+
+    def test_jwt_without_claim_returns_missing_session_on_upload(self):
+        """JWT without session claim returns 400 on upload."""
+        token = self._create_jwt({"sub": "jwt_user_no_sess"})
+        headers = {"Authorization": f"Bearer {token}"}
+        csv_content = "sensor_id,reading\nS-1,10.5\n"
+        file_tuple = ("test.csv", io.BytesIO(csv_content.encode("utf-8")), "text/csv")
+        resp = self.client.post("/upload-db", files={"file": file_tuple}, headers=headers)
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("Session context required", resp.text)
+
+    def test_jwt_without_claim_returns_missing_session_on_websocket(self):
+        """JWT without session claim connecting to WebSocket is closed with code 1008."""
+        token = self._create_jwt({"sub": "jwt_user_no_sess"})
+        with self.assertRaises(WebSocketDisconnect) as ctx:
+            with self.client.websocket_connect(f"/ws/sage?token={token}"):
+                pass
+        self.assertEqual(ctx.exception.code, 1008)
+
+    def test_jwt_without_claim_and_query_param_rejected_on_websocket(self):
+        """JWT without session claim cannot use query parameter to supply session on WebSocket."""
+        token = self._create_jwt({"sub": "jwt_user_no_sess"})
+        with self.assertRaises(WebSocketDisconnect) as ctx:
+            with self.client.websocket_connect(f"/ws/sage?token={token}&session_id=spoofed_query_session"):
+                pass
+        self.assertEqual(ctx.exception.code, 1008)
+
+    def test_jwt_with_claim_succeeds_and_shares_session_across_requests(self):
+        """JWT with a session_id claim works and two requests with the same token share the session."""
+        shared_session = "session_jwt_stable_test_99"
+        act = self._create_approved_action()
+        token = self._create_jwt({
+            "sub": "jwt_user_claimed",
+            "session_id": shared_session,
+            "tenant_id": act.tenant_id,
+            "assigned_plants": ["plant_mumbai"]
+        })
+
+        # Request 1
+        from starlette.datastructures import Headers
+        class DummyRequest:
+            def __init__(self, headers_dict):
+                self.headers = Headers(headers_dict)
+
+        req1 = DummyRequest({"authorization": f"Bearer {token}"})
+        ident1 = auth_mod.get_current_identity(req1, credentials=None)
+
+        # Request 2
+        req2 = DummyRequest({"authorization": f"Bearer {token}"})
+        ident2 = auth_mod.get_current_identity(req2, credentials=None)
+
+        self.assertEqual(ident1.session_id, shared_session)
+        self.assertEqual(ident2.session_id, shared_session)
+        self.assertEqual(ident1.session_id, ident2.session_id)
+
+        # Action execute with this token succeeds
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "X-Tenant-ID": act.tenant_id,
+        }
+        resp = self.client.post(
+            f"/api/v3/actions/{act.action_id}/execute",
+            json={"dry_run": True},
+            headers=headers
+        )
+        self.assertEqual(resp.status_code, 200)
+
+    def test_session_scoped_db_connections_end_to_end_for_jwt_with_claim(self):
+        """Confirm session-scoped DB connections work end to end for a JWT with claim (connect then sample/query)."""
+        session_id = f"session_jwt_db_{int(time.time())}"
+        token = self._create_jwt({
+            "sub": "jwt_db_user",
+            "session_id": session_id,
+            "roles": ["operator", "manager"],
+            "clearance_level": 3
+        })
+        headers = {"Authorization": f"Bearer {token}"}
+
+        # Step 1: Connect live DB with this JWT
+        payload = {"connection_string": "sqlite:///./dynamic_datacore.sqlite"}
+        resp1 = self.client.post("/connect-live-db", json=payload, headers=headers)
+        self.assertEqual(resp1.status_code, 200)
+        data1 = resp1.json()
+        self.assertEqual(data1.get("status"), "success")
+        self.assertIn("tables", data1)
+
+        # Step 2: Separate request with same token verifies connection access
+        resp2 = self.client.post("/connect-live-db", json=payload, headers=headers)
+        self.assertEqual(resp2.status_code, 200)
+        data2 = resp2.json()
+        self.assertEqual(data2.get("status"), "success")
+
+        # Step 3: Verify session isolation in registry (different session cannot access)
+        try:
+            from services.connection_manager import db_manager
+        except ImportError:
+            from backend.services.connection_manager import db_manager
+
+        conn_ctx, _, _, _ = db_manager.get_connection("tenant_default", "workspace_default", session_id, "sqlite_main")
+        self.assertEqual(conn_ctx.session_id, session_id)
+
+        with self.assertRaises((KeyError, PermissionError)):
+            db_manager.get_connection("tenant_default", "workspace_default", "session_unauthorized_attacker", "sqlite_main")
+
+    def test_transaction_execute_missing_session_returns_missing_session(self):
+        """POST /api/v3/transactions/{txId}/execute returns 401 MISSING_SESSION when session_id is None."""
+        token = self._create_jwt({"sub": "jwt_tx_user"})  # no session_id
+        headers = {"Authorization": f"Bearer {token}", "X-Tenant-ID": "tenant_default"}
+        resp = self.client.post(
+            "/api/v3/transactions/tx_dummy_id/execute",
+            json={"transaction_id": "tx_dummy_id", "dry_run": True},
+            headers=headers
+        )
+        self.assertEqual(resp.status_code, 401)
+        data = resp.json()
+        detail = data.get("detail", {})
+        code = detail.get("code") if isinstance(detail, dict) else None
+        self.assertEqual(code, "MISSING_SESSION")
+
+    def test_database_routes_missing_session_never_return_500(self):
+        """Database routes with missing session fail gracefully (404/403/200) and NEVER return 500."""
+        token = self._create_jwt({"sub": "jwt_db_user"})  # no session_id
+        headers = {"Authorization": f"Bearer {token}"}
+
+        # 1. GET /api/v3/database/connections/{id}
+        resp1 = self.client.get("/api/v3/database/connections/conn_nonexistent", headers=headers)
+        self.assertIn(resp1.status_code, (401, 403, 404))
+        self.assertNotEqual(resp1.status_code, 500)
+
+        # 2. POST /api/v3/database/connections/{id}/sample
+        resp2 = self.client.post(
+            "/api/v3/database/connections/conn_nonexistent/sample",
+            json={"table": "sensor_telemetry", "limit": 5},
+            headers=headers
+        )
+        self.assertIn(resp2.status_code, (401, 403, 404))
+        self.assertNotEqual(resp2.status_code, 500)
+
+        # 3. POST /api/v3/database/connections/{id}/revoke
+        resp3 = self.client.post(
+            "/api/v3/database/connections/conn_nonexistent/revoke",
+            json={"reason": "Security audit"},
+            headers=headers
+        )
+        self.assertIn(resp3.status_code, (200, 401, 403, 404))
+        self.assertNotEqual(resp3.status_code, 500)
 
     def test_mock_token_with_session_retained_when_no_header(self):
         """Mock token with session and no header: session is retained."""

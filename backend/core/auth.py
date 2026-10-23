@@ -22,8 +22,7 @@ try:
         IS_PRODUCTION,
         SAGE_AUTH_ISSUER,
         SAGE_AUTH_AUDIENCE,
-        SAGE_JWT_ALGORITHMS,
-        SAGE_DEV_SESSION_FALLBACK
+        SAGE_JWT_ALGORITHMS
     )
     from governance.audit import log_security_event
     from data.schemas.authorization_contract import (
@@ -43,8 +42,7 @@ except ModuleNotFoundError:
         IS_PRODUCTION,
         SAGE_AUTH_ISSUER,
         SAGE_AUTH_AUDIENCE,
-        SAGE_JWT_ALGORITHMS,
-        SAGE_DEV_SESSION_FALLBACK
+        SAGE_JWT_ALGORITHMS
     )
     from backend.governance.audit import log_security_event
     from backend.data.schemas.authorization_contract import (
@@ -302,7 +300,10 @@ class JWTAuthenticationProvider(AuthenticationProvider):
 
         tenant_id = str(payload.get("tenant_id", "tenant_default"))
         workspace_id = str(payload.get("workspace_id", "workspace_default"))
-        session_id = str(payload.get("session_id", str(uuid.uuid4())))
+        # Security Hardening: No fabricated sessions for JWT.
+        # A token without a session_id claim yields session_id None.
+        session_id_val = payload.get("session_id")
+        session_id = str(session_id_val) if session_id_val is not None else None
 
         roles = payload.get("roles", ["operator"])
         if isinstance(roles, str):
@@ -370,6 +371,8 @@ def get_current_identity(
 
     # If identity is established by verified JWT claims or an authoritative token profile,
     # or if the server is running in production mode, NO client header is authoritative.
+    # HARDENING RULE: A client X-Session-ID header must NOT supply a session for a JWT identity.
+    # For JWT, session_id is strictly derived from the verified token claim (None if omitted).
     if IS_PRODUCTION or identity.is_server_authoritative:
         return identity
 
@@ -377,8 +380,6 @@ def get_current_identity(
     session_hdr = request.headers.get("X-Session-ID") or request.headers.get("x-session-id")
     if session_hdr:
         identity.session_id = session_hdr
-    elif not IS_PRODUCTION and SAGE_DEV_SESSION_FALLBACK:
-        identity.session_id = f"session_{identity.user_id}"
     else:
         identity.session_id = None
 
