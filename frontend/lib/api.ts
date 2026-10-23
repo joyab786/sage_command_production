@@ -8,6 +8,13 @@ export function getClientSessionId(): string {
   return sid;
 }
 
+export function resetClientSession(): void {
+  if (typeof window !== "undefined") {
+    localStorage.removeItem("sage_session_id");
+    localStorage.removeItem("sage_token");
+  }
+}
+
 export async function fetchSage(endpoint: string, options: RequestInit = {}) {
   const token = (typeof window !== "undefined" && localStorage.getItem("sage_token")) || "manager_token";
   const defaultHeaders: Record<string, string> = {

@@ -2,6 +2,7 @@
 import React, { useState, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Layers, ShieldCheck, Clock, AlertTriangle, RefreshCw, X, CheckCircle, FileText, Play, RotateCcw } from "lucide-react";
+import { getClientSessionId } from "../../lib/api";
 
 interface TransactionItem {
   transaction_id: string;
@@ -62,6 +63,7 @@ export default function TransactionPlanModal({
         headers: {
           Authorization: `Bearer ${token}`,
           "X-Tenant-ID": "tenant_default",
+          "X-Session-ID": getClientSessionId(),
         },
       });
       if (!res.ok) {
@@ -91,6 +93,7 @@ export default function TransactionPlanModal({
           "Content-Type": "application/json",
           Authorization: `Bearer ${token}`,
           "X-Tenant-ID": "tenant_default",
+          "X-Session-ID": getClientSessionId(),
         },
         body: JSON.stringify({ transaction_id: txId, dry_run: false }),
       });
@@ -124,6 +127,7 @@ export default function TransactionPlanModal({
           "Content-Type": "application/json",
           Authorization: `Bearer ${token}`,
           "X-Tenant-ID": "tenant_default",
+          "X-Session-ID": getClientSessionId(),
         },
         body: JSON.stringify({ reason: "Operator requested rollback via UI" }),
       });
