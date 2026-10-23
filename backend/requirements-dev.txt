@@ -1,4 +1,4 @@
 # Development and test dependencies for SageCommand V3
-# Verified against Python 3.14.5 (and compatible with Python 3.12 - 3.14)
+# Verified combination: Python 3.14.5, pytest 9.1.1, pytest-asyncio 1.4.0
 pytest==9.1.1
 pytest-asyncio==1.4.0

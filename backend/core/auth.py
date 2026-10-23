@@ -22,7 +22,8 @@ try:
         IS_PRODUCTION,
         SAGE_AUTH_ISSUER,
         SAGE_AUTH_AUDIENCE,
-        SAGE_JWT_ALGORITHMS
+        SAGE_JWT_ALGORITHMS,
+        SAGE_DEV_SESSION_FALLBACK
     )
     from governance.audit import log_security_event
     from data.schemas.authorization_contract import (
@@ -42,7 +43,8 @@ except ModuleNotFoundError:
         IS_PRODUCTION,
         SAGE_AUTH_ISSUER,
         SAGE_AUTH_AUDIENCE,
-        SAGE_JWT_ALGORITHMS
+        SAGE_JWT_ALGORITHMS,
+        SAGE_DEV_SESSION_FALLBACK
     )
     from backend.governance.audit import log_security_event
     from backend.data.schemas.authorization_contract import (
@@ -375,6 +377,8 @@ def get_current_identity(
     session_hdr = request.headers.get("X-Session-ID") or request.headers.get("x-session-id")
     if session_hdr:
         identity.session_id = session_hdr
+    elif not IS_PRODUCTION and SAGE_DEV_SESSION_FALLBACK:
+        identity.session_id = f"session_{identity.user_id}"
     else:
         identity.session_id = None
 

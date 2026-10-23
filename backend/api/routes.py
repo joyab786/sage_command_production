@@ -76,6 +76,17 @@ async def connect_live_db(
         log_security_event("RATE_LIMIT_TRIGGERED", {"user_id": identity.user_id, "endpoint": "/connect-live-db"}, severity="WARNING")
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Rate limit exceeded.")
 
+    if not identity.session_id:
+        log_security_event(
+            "DATABASE_CONNECTION_REJECTED",
+            {"user_id": identity.user_id, "reason": "Missing required session identity."},
+            severity="WARNING"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Session context required for database connection."
+        )
+
     try:
         safe_info = parse_safe_connection_info(payload.connection_string)
         
@@ -105,10 +116,15 @@ async def connect_live_db(
             "tables": table_names,
             "connection_info": resp.dict()
         }
+    except HTTPException:
+        raise
     except DatabasePolicyBlockedError as pol_err:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"DATABASE_POLICY_BLOCKED: {str(pol_err)}")
     except ValueError as val_err:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(val_err))
+        val_str = str(val_err)
+        if "validation error" in val_str.lower():
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid database connection parameters.")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=val_str)
     except Exception as e:
         safe_err_msg = sanitize_connection_string(str(e))
         log_security_event("DATABASE_CONNECTION_FAILED", {"user_id": identity.user_id, "error": safe_err_msg}, severity="WARNING")
@@ -116,6 +132,7 @@ async def connect_live_db(
 
 
 @router.post("/upload-db")
+@router.post("/upload-csv")
 async def upload_database(
     response: Response,
     file: UploadFile = File(...),
@@ -132,6 +149,17 @@ async def upload_database(
     if not allowed:
         log_security_event("RATE_LIMIT_TRIGGERED", {"user_id": identity.user_id, "endpoint": "/upload-db"}, severity="WARNING")
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Rate limit exceeded.")
+
+    if not identity.session_id:
+        log_security_event(
+            "DATABASE_CONNECTION_REJECTED",
+            {"user_id": identity.user_id, "reason": "Missing required session identity."},
+            severity="WARNING"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Session context required for file upload."
+        )
 
     try:
         # Isolate upload storage per tenant and session to prevent global datacore collisions and path traversal
@@ -180,8 +208,12 @@ async def upload_database(
         else:
             return {"status": "error", "message": "Unsupported file format. Please upload .csv, .db, or .sqlite"}
 
+    except HTTPException:
+        raise
     except Exception as e:
         safe_err_msg = sanitize_connection_string(str(e))
+        if "validation error" in safe_err_msg.lower():
+            safe_err_msg = "Invalid file upload parameters."
         return {"status": "error", "message": safe_err_msg}
 
 

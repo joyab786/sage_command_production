@@ -217,7 +217,7 @@ class TestV3SecurityHardening(unittest.TestCase):
         payload = {
             "connection_string": "postgresql://dbadmin:SuperSecret123@localhost:5432/live_db"
         }
-        headers = {"Authorization": "Bearer manager_token"}
+        headers = {"Authorization": "Bearer manager_token", "X-Session-ID": "session_security_test"}
         mock_resp = MagicMock(
             database_type="postgresql",
             connection_id="mock_conn_sanitization",
@@ -235,7 +235,7 @@ class TestV3SecurityHardening(unittest.TestCase):
         payload = {
             "connection_string": "file:///etc/passwd"
         }
-        headers = {"Authorization": "Bearer manager_token"}
+        headers = {"Authorization": "Bearer manager_token", "X-Session-ID": "session_security_test"}
         response = self.client.post("/connect-live-db", json=payload, headers=headers)
         self.assertEqual(response.status_code, 400)
         self.assertIn("not supported", response.json().get("detail", ""))

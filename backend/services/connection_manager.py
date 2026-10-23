@@ -59,6 +59,15 @@ class DatabaseConnectionManager:
         Validates URI scheme, initializes isolated SQLAlchemy engine, creates DatabaseContext,
         registers connection in ConnectionRegistry, and stores engine handles in pool.
         """
+        # 0. Enforce session presence
+        if not session_id:
+            log_security_event(
+                "DB_CONNECTION_FAILED",
+                {"tenant_id": tenant_id, "workspace_id": workspace_id, "error": "Missing required session_id"},
+                severity="WARNING"
+            )
+            raise ValueError("DATABASE_CONNECTION_REJECTED: Session context required.")
+
         # 1. Enforce URI scheme whitelist
         validate_db_connection_uri(connection_string)
 

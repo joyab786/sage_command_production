@@ -33,8 +33,9 @@ class TestServerEndpoints(unittest.TestCase):
         """Test uploading a CSV file to compile into SQL table and hot-swap cortex."""
         csv_content = "sensor_id,reading,location\nS-1,104.2,Sector 7G\nS-2,98.6,Sector 4B\n"
         file_tuple = ("telemetry.csv", io.BytesIO(csv_content.encode("utf-8")), "text/csv")
+        headers = {"X-Session-ID": "session_ws_test"}
         
-        response = self.client.post("/upload-db", files={"file": file_tuple})
+        response = self.client.post("/upload-db", files={"file": file_tuple}, headers=headers)
         self.assertEqual(response.status_code, 200)
         data = response.json()
         self.assertEqual(data.get("status"), "success")
@@ -44,7 +45,8 @@ class TestServerEndpoints(unittest.TestCase):
     def test_endpoint_connect_live_db(self):
         """Test live database URI tether and schema inspection."""
         payload = {"connection_string": "sqlite:///./dynamic_datacore.sqlite"}
-        response = self.client.post("/connect-live-db", json=payload)
+        headers = {"X-Session-ID": "session_ws_test"}
+        response = self.client.post("/connect-live-db", json=payload, headers=headers)
         self.assertEqual(response.status_code, 200)
         data = response.json()
         self.assertEqual(data.get("status"), "success")
@@ -53,7 +55,7 @@ class TestServerEndpoints(unittest.TestCase):
     # --- 4. WEBSOCKET /ws/sage COMMUNICATOR ---
     def test_websocket_chat_and_history(self):
         """Test duplex WebSocket protocol for chat commands and checkpoint history."""
-        with self.client.websocket_connect("/ws/sage") as websocket:
+        with self.client.websocket_connect("/ws/sage?session_id=session_ws_test") as websocket:
             # Test chat command
             websocket.send_json({"command": "chat", "text": "List usable tables."})
             
@@ -74,7 +76,7 @@ class TestServerEndpoints(unittest.TestCase):
 
     def test_websocket_rbac_approval(self):
         """Test WebSocket RBAC enforcement when Operator attempts approval."""
-        with self.client.websocket_connect("/ws/sage") as websocket:
+        with self.client.websocket_connect("/ws/sage?session_id=session_ws_test") as websocket:
             # Send approve command with Operator role
             websocket.send_json({"command": "approve", "user_role": "operator"})
             

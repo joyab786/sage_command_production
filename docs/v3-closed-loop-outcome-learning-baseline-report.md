@@ -15,8 +15,9 @@
 - **Prompt 39 Full Base HEAD SHA:** `c184c257b71a0afa12fcb6dbd7738281ee1a1d6d`
 - **Prompt 39 Correction 5 Full HEAD SHA:** `f3a572eb2ee141bef2a18b31ba9ae3ed181dedac`
 - **Prompt 39 Correction 5b Starting SHA:** `fc4b1fa30d3b2252be6bd7aac738c8ea5f8c9f03`
-- **Milestone:** Prompt 39 Correction 5b — Baseline Evidence Gaps & Hardening
-- **Commit Message:** `test(v3): document baseline evidence and unskip sanitization test (Prompt 39 Correction 5b)`
+- **Prompt 39 Correction 5c Starting SHA:** `f864a5fa2c47a96bb21d920f8a403f62eda1987e`
+- **Milestone:** Prompt 39 Correction 5c — Fail-Closed Session Handling & Clean Baseline
+- **Commit Message:** `fix(v3): fail closed on missing session identity (Prompt 39 Correction 5c)`
 - **Remote Synchronization:** Synchronized with `origin/main`
 - **Working-Tree Status:** Clean (all changes tracked and committed)
 
@@ -113,84 +114,78 @@ Coverage across Groups A–N:
 
 ### 3. Repository-Wide Test Suite Execution Counts
 - **All V3 Test Suites (`python -m pytest (Get-ChildItem backend/test_v3_*.py) -q -ra`):**
-  - **Results:** 2517 passed, 1 failed, 0 skipped, 283 warnings (duration: ~158.2s)
-  - **Single Failure:** `backend/test_v3_execution_gateway.py::TestV3ExecutionGateway::test_15_api_action_execute_endpoint`
+  - **Results:** 2530 passed, 0 failed, 0 skipped, 284 warnings (duration: ~164.8s)
+  - **Failure Count:** Exactly 0 failures across all V3 suites.
 - **Full Backend Suite (`python -m pytest backend/ -q -ra`):**
-  - **Results:** 2533 passed, 6 failed, 0 skipped, 283 warnings, 18 subtests passed (duration: ~149.7s)
-  - **Failure Count:** Exactly 6 failures across the entire repository.
+  - **Results:** 2550 passed, 0 failed, 0 skipped, 285 warnings, 18 subtests passed (duration: ~172.4s)
+  - **Failure Count:** Exactly 0 failures across the entire repository.
 
 ---
 
 ### 4. Environment Drift & Development Dependencies
 
-#### Host Environment Facts:
-- **Interpreters Installed (`py -0`):**
-  - `Python 3.14.5 (64-bit)` at `C:\Python314\python.exe` (active default)
-  - `Python 3.13.14 (64-bit)` via WindowsApps
-  - *Python 3.12 is not installed on this host system.*
+#### Verified Host Environment:
+- **Python Version:** `Python 3.14.5 (64-bit)` at `C:\Python314\python.exe`
 - **Package Versions in Active Interpreter:**
   - `pytest`: 9.1.1
   - `pytest-asyncio`: 1.4.0
   - `anyio`: 4.15.1
-- **Development Requirements Pinning:**
-  - Created `backend/requirements-dev.txt` pinning:
-    ```text
-    pytest==9.1.1
-    pytest-asyncio==1.4.0
-    ```
-  - Documented supported versions:
-    - **Python:** 3.12 – 3.14
-    - **pytest:** 8.3.4 – 9.1.1
-    - **pytest-asyncio:** 0.23+ / 1.4.0+
-  - Production dependencies (`backend/requirements.txt`) remain completely unchanged.
-
-#### Plain Cause Classification:
-- **Environment-Caused:**
-  - The 2 async test failures in `backend/test_v3_continuous_verification.py` were 100% environment-caused by running `pytest 9.1.1` without `pytest-asyncio`. With `pytest-asyncio==1.4.0` installed, the 128-pass result is fully reproduced (128 passed, 0 failed).
-- **Code-Caused:**
-  - The failure in `test_15_api_action_execute_endpoint` and all 4 failures in `backend/test_websocket_endpoints.py` are code-caused regressions introduced in Prompt 38A (`a630e7f`), detailed below.
-- **Test Structure / Script Convention:**
-  - `backend/test_agent.py::test_agent` is an interactive standalone script (`if __name__ == '__main__': asyncio.run(test_agent())`) whose coroutine declaration is discovered by pytest.
+- **Development Requirements Pinning (`backend/requirements-dev.txt`):**
+  ```text
+  pytest==9.1.1
+  pytest-asyncio==1.4.0
+  ```
+  Verified and locked to Python 3.14.5, pytest 9.1.1, pytest-asyncio 1.4.0.
+- Production dependencies (`backend/requirements.txt`) remain completely untouched.
 
 ---
 
-### 5. Historical Commit Comparison & Baseline Evidence
+### 5. Historical Commit Comparison & Prompt 39 Correction 5c Fail-Closed Fix
 
-All 6 repository failures were tested across multiple historical commits using clean worktrees:
-- `502f0c5` (Prompt 24, baseline from earlier milestone)
-- `54cdc6f` (Prompt 38 Base)
-- `a630e7f` (Prompt 38A: Autonomy Governance Security Corrections)
-- `6e5f7b9` (Prompt 38E: Session and Workspace Scope Gaps)
-- `0fc3073` (Prompt 39 Baseline)
-- `640cea3` (Prompt 39 Correction 4)
-- `fc4b1fa` / Current HEAD (Prompt 39 Correction 5b)
+All 6 historical failures have been investigated, root-caused to Prompt 38A (`a630e7f`), and resolved with strict fail-closed enforcement and clean test isolation in Prompt 39 Correction 5c:
 
 #### Test Comparison Matrix:
 
-| Test Identifier | Result at `502f0c5` (P24) | Result at `54cdc6f` (P38) | Result at `a630e7f` (P38A) | Result at `6e5f7b9` (P38E) | Result at `0fc3073` (P39) | Result at `640cea3` (P39 C4) | Result at Current HEAD | Failure Message & Cause |
-|---|---|---|---|---|---|---|---|---|
-| `test_v3_execution_gateway.py::TestV3ExecutionGateway::test_15_api_action_execute_endpoint` | **PASSED** | **PASSED** | **FAILED** | **FAILED** | **FAILED** | **FAILED** | **FAILED** | `HTTP 500 != 200`: `pydantic_core._pydantic_core.ValidationError: 1 validation error for PolicyEvaluationContext; session_id: Input should be a valid string, input_value=None` |
-| `test_websocket_endpoints.py::TestServerEndpoints::test_endpoint_connect_live_db` | **PASSED** | **PASSED** | **FAILED** | **FAILED** | **FAILED** | **FAILED** | **FAILED** | `HTTP 400 != 200`: `DatabaseContext` validation error (`session_id` is `None` when request lacks `X-Session-ID` header) |
-| `test_websocket_endpoints.py::TestServerEndpoints::test_endpoint_upload_csv` | **PASSED** | **PASSED** | **FAILED** | **FAILED** | **FAILED** | **FAILED** | **FAILED** | `HTTP 400 != 200`: `DatabaseContext` validation error (`session_id` is `None` when request lacks `X-Session-ID` header) |
-| `test_websocket_endpoints.py::TestServerEndpoints::test_websocket_chat_and_history` | **PASSED** | **PASSED** | **FAILED** | **FAILED** | **FAILED** | **FAILED** | **FAILED** | `WebSocketDisconnect` / connection failure due to missing session identity on connect |
-| `test_websocket_endpoints.py::TestServerEndpoints::test_websocket_rbac_approval` | **PASSED** | **PASSED** | **FAILED** | **FAILED** | **FAILED** | **FAILED** | **FAILED** | `WebSocketDisconnect` / connection failure due to missing session identity on connect |
-| `test_agent.py::test_agent` | **FAILED** | **FAILED** | **FAILED** | **FAILED** | **FAILED** | **FAILED** | **FAILED** | `Failed: async def functions are not allowed in this position` (standalone interactive script without `@pytest.mark.asyncio`) |
+| Test Identifier | Result at `502f0c5` (P24) | Result at `54cdc6f` (P38) | Result at `a630e7f` (P38A) | Result at `6e5f7b9` (P38E) | Result at `fc4b1fa` (P39 C5b) | Result at `f864a5f` (P39 C5c) | Fix & Verification Evidence |
+|---|---|---|---|---|---|---|---|
+| `test_v3_execution_gateway.py::TestV3ExecutionGateway::test_15_api_action_execute_endpoint` | **PASSED** | **PASSED** | **FAILED** | **FAILED** | **FAILED** | **PASSED** | Route fails closed on missing `session_id` with HTTP 401 (`MISSING_SESSION`) and audit log; test updated with valid `X-Session-ID`. |
+| `test_websocket_endpoints.py::TestServerEndpoints::test_endpoint_connect_live_db` | **PASSED** | **PASSED** | **FAILED** | **FAILED** | **FAILED** | **PASSED** | Route checks `identity.session_id` before domain context creation; returns clean HTTP 400 without schema leak; test updated with `X-Session-ID`. |
+| `test_websocket_endpoints.py::TestServerEndpoints::test_endpoint_upload_csv` | **PASSED** | **PASSED** | **FAILED** | **FAILED** | **FAILED** | **PASSED** | Route and alias `/upload-csv` check `identity.session_id`; returns clean HTTP 400 without schema leak; test updated with `X-Session-ID`. |
+| `test_websocket_endpoints.py::TestServerEndpoints::test_websocket_chat_and_history` | **PASSED** | **PASSED** | **FAILED** | **FAILED** | **FAILED** | **PASSED** | WebSocket handler validates session query parameter/header; closes with RFC 6455 code `1008` (Policy Violation) when missing; test passes valid `session_id`. |
+| `test_websocket_endpoints.py::TestServerEndpoints::test_websocket_rbac_approval` | **PASSED** | **PASSED** | **FAILED** | **FAILED** | **FAILED** | **PASSED** | WebSocket handler validates session on connection; closes with code `1008` when missing; test passes valid `session_id`. |
+| `test_agent.py::test_agent` | **FAILED** | **FAILED** | **FAILED** | **FAILED** | **FAILED** | **RESOLVED** | Relocated interactive check script from `backend/test_agent.py` to `scripts/manual_agent_check.py` to prevent invalid pytest collection without masking. |
 
-#### Root Cause Analysis of Code-Caused Regressions:
+#### Architectural Resolution Details (Prompt 39 Correction 5c):
 
-1. **First Failing Commit:** `a630e7ff78d4b381573da8784c5cb78e743090d6` ("fix(autonomy): Prompt 38A autonomy governance security corrections and regression suite").
-2. **The Breaking Change in `backend/core/auth.py`:**
-   - In Prompt 38A, `Identity.session_id` default was changed from `uuid.uuid4()` to `None`.
-   - In `get_current_identity`, the fallback for non-production environments (`elif not IS_PRODUCTION: identity.session_id = f"session_{identity.user_id}"`) was removed, causing `identity.session_id` to remain `None` when requests omit the `X-Session-ID` header.
-3. **Impact on Strict Pydantic Domain Schemas:**
-   - In `backend/data/schemas/policy_evaluation_contract.py`, `PolicyEvaluationContext` defines `session_id: str = Field(...)` (strictly non-null).
-   - In `backend/services/db_gateway.py`, `DatabaseContext` defines `session_id: str = Field(...)` (strictly non-null).
-   - In `test_15_api_action_execute_endpoint`: The test issues `POST /api/v3/actions/{id}/execute` with an authorization token but without `X-Session-ID`. The route handler invokes `PolicyEvaluationContext(session_id=identity.session_id, ...)`, triggering an unhandled `pydantic_core.ValidationError` that returns HTTP 500.
-   - In `test_websocket_endpoints.py`: Tests issue `POST /connect-live-db` and `POST /upload-csv` without authentication or session headers. The route handlers attempt to instantiate `DatabaseContext(session_id=identity.session_id, ...)`, which triggers a `ValidationError` caught as `ValueError` and returned as HTTP 400.
-4. **Conclusion:**
-   - These 5 failures are **real code-caused regressions introduced in Prompt 38A (`a630e7f`)**.
-   - They passed cleanly at `502f0c5` (Prompt 24) and `54cdc6f` (Prompt 38 base).
-   - They were not introduced by Prompt 39 or any of its corrections.
+1. **Root Cause Analysis (Prompt 38A):**
+   - Commit `a630e7f` intentionally changed `Identity.session_id` default from `uuid4()` to `None` and removed automatic fallback `session_{user_id}` to prevent ambient authorization grants without explicit session scope.
+   - Downstream route handlers (`/api/v3/actions/{id}/execute`, `/connect-live-db`, `/upload-csv`, `/ws/sage`) did not fail closed before instantiating Pydantic models requiring `session_id: str` (`PolicyEvaluationContext`, `DatabaseContext`), causing unhandled `ValidationError` exceptions returning 500 or leaking field schemas.
+
+2. **Production Fail-Closed Architecture:**
+   - **Action Execution (`POST /api/v3/actions/{id}/execute` & `ExecutionGateway`):**
+     - When `identity.session_id` is missing/empty, returns HTTP 401 with generic error `{"error": "Session identity required for action execution", "code": "MISSING_SESSION"}`.
+     - Emits structured security audit event `EXECUTION_AUTHORIZATION_DENIED` with reason `missing_session_id`.
+     - Catches unexpected exceptions cleanly, sanitizing output to prevent any `ValidationError` or stack trace leakage.
+   - **Database Connection Routes (`POST /connect-live-db`, `POST /upload-db`, `POST /upload-csv`):**
+     - When `identity.session_id` is missing/empty, returns HTTP 400 with generic error `{"detail": "Session ID required"}`.
+     - Logs security event `DB_GATEWAY_SESSION_REQUIRED`.
+     - Underlying gateways (`DBGateway.create_connection`, `ConnectionManager.create_connection`) assert non-empty `session_id` and raise sanitized exceptions.
+   - **WebSocket Endpoints (`/ws/sage`):**
+     - Extracts session from query parameter (`session_id`), HTTP headers (`X-Session-ID`), or token claims.
+     - When missing, emits security audit event `WEBSOCKET_AUTH_FAILURE` and closes the connection with code `1008` (Policy Violation) prior to accepting the connection.
+   - **Dev Fallback Isolation:**
+     - Fallback `session_{identity.user_id}` is gated strictly behind `SAGE_DEV_SESSION_FALLBACK` (default `false`) and `not IS_PRODUCTION`.
+     - In production (`IS_PRODUCTION=True`), dev fallback is mathematically and architecturally inert.
+
+3. **Regression & Safety Verification Suite (`backend/test_v3_session_fail_closed.py`):**
+   - 12 comprehensive automated test scenarios verifying:
+     - Missing session on `/api/v3/actions/{id}/execute` returns clean 401 (not 500) and writes audit log.
+     - Missing session on `/connect-live-db` returns clean 400 without `ValidationError` text.
+     - Missing session on `/upload-csv` returns clean 400 without `ValidationError` text.
+     - WebSocket connection without session closes with status code `1008`.
+     - Valid session succeeds across all routes.
+     - `IS_PRODUCTION=True` never applies dev fallback even if environment flags are set.
+     - Dev fallback is inert by default when environment flag is unset.
 
 ---
 

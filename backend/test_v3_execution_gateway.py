@@ -446,6 +446,7 @@ class TestV3ExecutionGateway(unittest.TestCase):
         headers = {
             "Authorization": "Bearer manager_token",
             "X-Tenant-ID": self.tenant_id,
+            "X-Session-ID": self.session_id,
             "X-User-Roles": "manager"
         }
         resp = self.client.post(

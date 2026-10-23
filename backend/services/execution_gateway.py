@@ -204,6 +204,13 @@ class ExecutionGateway:
         # Gate 1: Identity & Authentication Integrity
         if not identity or not identity.user_id:
             raise ExecutionGatewayException(401, "UNAUTHENTICATED", "Authentication identity required for execution.")
+        if not identity.session_id:
+            log_security_event(
+                "EXECUTION_AUTHORIZATION_DENIED",
+                {"user_id": identity.user_id, "action_id": action_id, "reason": "Missing required session context."},
+                severity="WARNING"
+            )
+            raise ExecutionGatewayException(401, "MISSING_SESSION", "Session context required for action execution.")
 
         # Gate 3a: Lookup Action
         action = self.store.get_by_id(action_id, identity.tenant_id)
@@ -461,6 +468,13 @@ class ExecutionGateway:
         # Gate 1: Identity & Authentication Integrity
         if not identity or not identity.user_id:
             raise ExecutionGatewayException(401, "UNAUTHENTICATED", "Authentication identity required for execution.")
+        if not identity.session_id:
+            log_security_event(
+                "EXECUTION_AUTHORIZATION_DENIED",
+                {"user_id": identity.user_id, "transaction_id": transaction_id, "reason": "Missing required session context."},
+                severity="WARNING"
+            )
+            raise ExecutionGatewayException(401, "MISSING_SESSION", "Session context required for transaction execution.")
 
         # Gate 3: Lookup Transaction
         tx = self.tx_repo.get_by_id(transaction_id, identity.tenant_id)

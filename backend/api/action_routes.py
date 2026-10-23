@@ -707,6 +707,19 @@ async def execute_action(
     identity: Identity = Depends(get_current_identity)
 ):
     req_id = extract_request_id(x_request_id)
+    if not identity.session_id:
+        log_security_event(
+            "EXECUTION_AUTHORIZATION_DENIED",
+            {"user_id": identity.user_id, "action_id": action_id, "reason": "Missing required session context."},
+            severity="WARNING"
+        )
+        return action_error_response(
+            status_code=401,
+            code="MISSING_SESSION",
+            message="Session context required for action execution.",
+            request_id=req_id
+        )
+
     exec_req = request or ExecutionRequest(action_id=action_id)
     if idempotency_key and not exec_req.idempotency_key:
         exec_req.idempotency_key = idempotency_key
@@ -734,7 +747,7 @@ async def execute_action(
         return action_error_response(
             status_code=500,
             code="INTERNAL_EXECUTION_ERROR",
-            message=str(ex),
+            message="An unexpected error occurred during execution.",
             request_id=req_id
         )
 

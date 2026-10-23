@@ -310,6 +310,14 @@ class DatabaseConnectionGateway:
         Validates request, stores credentials out-of-band, delegates connection registration
         to DatabaseConnectionManager, and returns safe connection metadata.
         """
+        if not identity.session_id:
+            log_security_event(
+                "DATABASE_CONNECTION_REJECTED",
+                {"user_id": identity.user_id, "reason": "Missing required session identity."},
+                severity="WARNING"
+            )
+            raise ValueError("DATABASE_CONNECTION_REJECTED: Session context required for database connection.")
+
         raw_uri, adapter = self.validate_request(request, identity)
 
         # Store password in SecretProvider out-of-band if provided
@@ -564,7 +572,16 @@ class DatabaseConnectionGateway:
         Supports optional Idempotency-Key caching, out-of-band secrets,
         policy enforcement, and returns DatabaseConnection.
         """
-        # 1. Idempotency Cache Check
+        # 1. Identity & Session Validation
+        if not identity.session_id:
+            log_security_event(
+                "DATABASE_CONNECTION_REJECTED",
+                {"user_id": identity.user_id, "reason": "Missing required session identity."},
+                severity="WARNING"
+            )
+            raise GatewayAPIException(400, GatewayErrorCode.INVALID_DATABASE_CONFIGURATION, "Session context required for database connection.")
+
+        # 2. Idempotency Cache Check
         if idempotency_key:
             cache_key = f"{identity.tenant_id}:{idempotency_key}"
             if cache_key in self._idempotency_cache:
@@ -572,7 +589,7 @@ class DatabaseConnectionGateway:
                 if time.time() - ts < 300:  # 5-minute TTL
                     return cached_conn
 
-        # 2. Build or extract connection URI
+        # 3. Build or extract connection URI
         db_type_str = request.database_type.value.upper()
         adapter = get_adapter(db_type_str)
 
