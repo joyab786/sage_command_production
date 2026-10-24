@@ -17,7 +17,7 @@ try:
     from core.auth import Identity, get_current_identity, require_role
     from governance.redaction import parse_safe_connection_info, sanitize_connection_string
     from governance.audit import log_security_event
-    from governance.rate_limiter import rate_limiter
+    from governance.rate_limiter import rate_limiter, db_connect_rate_limiter
     from gateway.db_gateway import db_gateway, DBConnectionRequest, DBConnectionResponse
     from gateway.network_policy import DatabasePolicyBlockedError
 except ModuleNotFoundError:
@@ -29,7 +29,7 @@ except ModuleNotFoundError:
     from backend.core.auth import Identity, get_current_identity, require_role
     from backend.governance.redaction import parse_safe_connection_info, sanitize_connection_string
     from backend.governance.audit import log_security_event
-    from backend.governance.rate_limiter import rate_limiter
+    from backend.governance.rate_limiter import rate_limiter, db_connect_rate_limiter
     from backend.gateway.db_gateway import db_gateway, DBConnectionRequest, DBConnectionResponse
     from backend.gateway.network_policy import DatabasePolicyBlockedError
 
@@ -71,10 +71,19 @@ async def connect_live_db(
     response.headers["X-Deprecated"] = "true"
     response.headers["Warning"] = "299 - 'Deprecated endpoint: use /api/v3/database/connections instead.'"
 
-    allowed, _ = rate_limiter.is_allowed(identity.user_id)
+    rate_key = f"{identity.tenant_id}:{identity.user_id}"
+    allowed, _, retry_after = db_connect_rate_limiter.is_allowed_with_retry_after(rate_key)
     if not allowed:
-        log_security_event("RATE_LIMIT_TRIGGERED", {"user_id": identity.user_id, "endpoint": "/connect-live-db"}, severity="WARNING")
-        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Rate limit exceeded.")
+        log_security_event(
+            "RATE_LIMIT_TRIGGERED",
+            {"user_id": identity.user_id, "tenant_id": identity.tenant_id, "endpoint": "/connect-live-db", "retry_after": retry_after},
+            severity="WARNING"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Rate limit exceeded. Please retry later.",
+            headers={"Retry-After": str(retry_after)}
+        )
 
     if not identity.session_id:
         log_security_event(
@@ -119,7 +128,8 @@ async def connect_live_db(
     except HTTPException:
         raise
     except DatabasePolicyBlockedError as pol_err:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"DATABASE_POLICY_BLOCKED: {str(pol_err)}")
+        log_security_event("DATABASE_CONNECTION_REJECTED", {"user_id": identity.user_id, "reason": str(pol_err)}, severity="WARNING")
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database host connection refused, blocked, or unreachable.")
     except ValueError as val_err:
         val_str = str(val_err)
         if "validation error" in val_str.lower():
@@ -128,7 +138,7 @@ async def connect_live_db(
     except Exception as e:
         safe_err_msg = sanitize_connection_string(str(e))
         log_security_event("DATABASE_CONNECTION_FAILED", {"user_id": identity.user_id, "error": safe_err_msg}, severity="WARNING")
-        return {"status": "error", "message": f"Connection failed: {safe_err_msg}"}
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database host connection refused, blocked, or unreachable.")
 
 
 @router.post("/upload-db")

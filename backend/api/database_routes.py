@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse
 
 try:
     from core.auth import Identity, require_role, get_current_identity
-    from governance.rate_limiter import rate_limiter
+    from governance.rate_limiter import rate_limiter, db_test_rate_limiter, db_connect_rate_limiter
     from governance.audit import log_security_event
     from gateway.db_gateway import db_gateway, GatewayAPIException
     from data.schemas.database_contract import (
@@ -77,7 +77,13 @@ def extract_request_id(x_request_id: Optional[str] = None) -> str:
     return f"req_{uuid.uuid4().hex[:12]}"
 
 
-def error_json_response(status_code: int, code: GatewayErrorCode, message: str, request_id: str) -> JSONResponse:
+def error_json_response(
+    status_code: int,
+    code: GatewayErrorCode,
+    message: str,
+    request_id: str,
+    retry_after: Optional[int] = None
+) -> JSONResponse:
     """Generates canonical error response envelope."""
     payload = {
         "success": False,
@@ -87,7 +93,10 @@ def error_json_response(status_code: int, code: GatewayErrorCode, message: str, 
             "message": message
         }
     }
-    return JSONResponse(status_code=status_code, content=payload)
+    headers = {}
+    if retry_after is not None:
+        headers["Retry-After"] = str(retry_after)
+    return JSONResponse(status_code=status_code, content=payload, headers=headers if headers else None)
 
 
 # =====================================================================
@@ -114,9 +123,15 @@ async def create_connection(
     identity: Identity = Depends(require_role("manager"))
 ):
     req_id = extract_request_id(x_request_id)
-    allowed, _ = rate_limiter.is_allowed(identity.user_id)
+    rate_key = f"{identity.tenant_id}:{identity.user_id}"
+    allowed, _, retry_after = db_connect_rate_limiter.is_allowed_with_retry_after(rate_key)
     if not allowed:
-        return error_json_response(429, GatewayErrorCode.RATE_LIMITED, "Rate limit exceeded.", req_id)
+        log_security_event(
+            "RATE_LIMIT_TRIGGERED",
+            {"user_id": identity.user_id, "tenant_id": identity.tenant_id, "endpoint": "/connections", "retry_after": retry_after},
+            severity="WARNING"
+        )
+        return error_json_response(429, GatewayErrorCode.RATE_LIMITED, "Rate limit exceeded. Please retry later.", req_id, retry_after=retry_after)
 
     try:
         conn = db_gateway.create_canonical_connection(
@@ -159,9 +174,15 @@ async def test_connection(
     identity: Identity = Depends(require_role("operator"))
 ):
     req_id = extract_request_id(x_request_id)
-    allowed, _ = rate_limiter.is_allowed(identity.user_id)
+    rate_key = f"{identity.tenant_id}:{identity.user_id}"
+    allowed, _, retry_after = db_test_rate_limiter.is_allowed_with_retry_after(rate_key)
     if not allowed:
-        return error_json_response(429, GatewayErrorCode.RATE_LIMITED, "Rate limit exceeded.", req_id)
+        log_security_event(
+            "RATE_LIMIT_TRIGGERED",
+            {"user_id": identity.user_id, "tenant_id": identity.tenant_id, "endpoint": "/connections/test", "retry_after": retry_after},
+            severity="WARNING"
+        )
+        return error_json_response(429, GatewayErrorCode.RATE_LIMITED, "Rate limit exceeded. Please retry later.", req_id, retry_after=retry_after)
 
     try:
         result = db_gateway.test_canonical_connection(request=request, identity=identity)

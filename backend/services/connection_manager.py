@@ -53,7 +53,8 @@ class DatabaseConnectionManager:
         access_mode: AccessMode = AccessMode.READ_ONLY,
         data_mode: DataMode = DataMode.REAL,
         plant_id: str = "plant_mumbai",
-        connection_id: Optional[str] = None
+        connection_id: Optional[str] = None,
+        pinned_ip: Optional[str] = None
     ) -> DatabaseContext:
         """
         Validates URI scheme, initializes isolated SQLAlchemy engine, creates DatabaseContext,
@@ -80,6 +81,8 @@ class DatabaseConnectionManager:
             connect_args["check_same_thread"] = False
         else:
             connect_args["connect_timeout"] = SAGE_DB_CONNECTION_TIMEOUT
+            if pinned_ip and ("postgresql" in connection_string or "postgres" in connection_string):
+                connect_args["hostaddr"] = pinned_ip
 
         engine = create_engine(
             connection_string,

@@ -102,10 +102,11 @@ def normalize_db_error(err: Exception) -> tuple[str, str]:
     elif "does not exist" in err_str or "unknown database" in err_str:
         return "DATABASE_NOT_FOUND", "Specified database does not exist on target host."
     elif "refused" in err_str or "could not connect" in err_str or "unreachable" in err_str:
-        return "DATABASE_HOST_UNREACHABLE", "Unable to establish network connection to database host."
+        return "DATABASE_UNREACHABLE", "Database host connection refused, blocked, or unreachable."
     elif "policy" in err_str or "blocked" in err_str:
-        return "DATABASE_POLICY_BLOCKED", sanitize_connection_string(str(err))
-    return "DATABASE_HOST_UNREACHABLE", sanitize_connection_string(str(err))
+        return "DATABASE_UNREACHABLE", "Database host connection refused, blocked, or unreachable."
+    return "DATABASE_UNREACHABLE", "Database host connection refused, blocked, or unreachable."
+
 
 
 class DBConnectionRequest(BaseModel):
@@ -249,7 +250,7 @@ class DatabaseConnectionGateway:
 
         # 5. Enforce SSRF & Network Policy Guardrails
         try:
-            self.net_policy.validate_host_and_port(host=host, port=port, scheme=scheme)
+            pinned_ip = self.net_policy.validate_host_and_port(host=host, port=port, scheme=scheme)
         except DatabasePolicyBlockedError as pol_err:
             log_security_event(
                 "DATABASE_CONNECTION_VALIDATION_FAILED",
@@ -258,13 +259,22 @@ class DatabaseConnectionGateway:
             )
             raise pol_err
 
-        return raw_uri, adapter
+        return raw_uri, adapter, pinned_ip
 
     def test_connection(self, request: DBConnectionRequest, identity: Identity) -> Dict[str, Any]:
         """
         Performs a transient, safe database ping test without registering the connection.
         """
-        raw_uri, adapter = self.validate_request(request, identity)
+        try:
+            raw_uri, adapter, pinned_ip = self.validate_request(request, identity)
+        except DatabasePolicyBlockedError as pol_err:
+            return {
+                "status": "FAILED",
+                "error_code": "DATABASE_UNREACHABLE",
+                "error": "DATABASE_UNREACHABLE: Database host connection refused, blocked, or unreachable.",
+                "database_type": request.database_type
+            }
+
         start_time = time.time()
 
         connect_args = {}
@@ -272,6 +282,8 @@ class DatabaseConnectionGateway:
             connect_args["check_same_thread"] = False
         else:
             connect_args["connect_timeout"] = SAGE_DB_CONNECTION_TIMEOUT
+            if pinned_ip and ("postgresql" in raw_uri or "postgres" in raw_uri):
+                connect_args["hostaddr"] = pinned_ip
 
         temp_engine = None
         try:
@@ -325,7 +337,7 @@ class DatabaseConnectionGateway:
             )
             raise ValueError("DATABASE_CONNECTION_REJECTED: Session context required for database connection.")
 
-        raw_uri, adapter = self.validate_request(request, identity)
+        raw_uri, adapter, pinned_ip = self.validate_request(request, identity)
 
         # Store password in SecretProvider out-of-band if provided
         if request.password:
@@ -334,13 +346,14 @@ class DatabaseConnectionGateway:
         # Delegate connection creation & pooling to Prompt 03 Manager
         ctx = self.manager.create_connection(
             tenant_id=identity.tenant_id,
-            workspace_id="workspace_default",
+            workspace_id=getattr(identity, "workspace_id", None) or "workspace_default",
             session_id=identity.session_id,
             connection_string=raw_uri,
             access_mode=request.access_mode,
             data_mode=request.data_mode,
             plant_id=request.plant_id,
-            connection_id=request.connection_id
+            connection_id=request.connection_id,
+            pinned_ip=pinned_ip
         )
 
         capabilities = adapter.get_capabilities(request.access_mode.value)
@@ -618,9 +631,9 @@ class DatabaseConnectionGateway:
         )
 
         try:
-            raw_uri, _ = self.validate_request(internal_req, identity)
+            raw_uri, _, pinned_ip = self.validate_request(internal_req, identity)
         except DatabasePolicyBlockedError as pol_err:
-            raise GatewayAPIException(403, GatewayErrorCode.DATABASE_POLICY_BLOCKED, str(pol_err))
+            raise GatewayAPIException(503, GatewayErrorCode.DATABASE_UNREACHABLE, "Database host connection refused, blocked, or unreachable.")
         except ValueError as val_err:
             v_str = str(val_err)
             if "TLS REQUIRED" in v_str:
@@ -639,12 +652,13 @@ class DatabaseConnectionGateway:
         # 4. Delegate to Connection Manager
         ctx = self.manager.create_connection(
             tenant_id=identity.tenant_id,
-            workspace_id="workspace_default",
+            workspace_id=getattr(identity, "workspace_id", None) or "workspace_default",
             session_id=identity.session_id,
             connection_string=raw_uri,
             access_mode=internal_req.access_mode,
             data_mode=internal_req.data_mode,
-            plant_id=internal_req.plant_id
+            plant_id=internal_req.plant_id,
+            pinned_ip=pinned_ip
         )
 
         created_iso = datetime.datetime.fromtimestamp(ctx.created_at, tz=datetime.timezone.utc).isoformat()
@@ -712,9 +726,9 @@ class DatabaseConnectionGateway:
         )
 
         try:
-            raw_uri, adapter = self.validate_request(internal_req, identity)
+            raw_uri, adapter, pinned_ip = self.validate_request(internal_req, identity)
         except DatabasePolicyBlockedError as pol_err:
-            raise GatewayAPIException(403, GatewayErrorCode.DATABASE_POLICY_BLOCKED, str(pol_err))
+            raise GatewayAPIException(503, GatewayErrorCode.DATABASE_UNREACHABLE, "Database host connection refused, blocked, or unreachable.")
         except ValueError as val_err:
             v_str = str(val_err)
             if "TLS REQUIRED" in v_str:
@@ -730,6 +744,9 @@ class DatabaseConnectionGateway:
             connect_args["check_same_thread"] = False
         else:
             connect_args["connect_timeout"] = SAGE_DB_CONNECTION_TIMEOUT
+            if pinned_ip and ("postgresql" in raw_uri or "postgres" in raw_uri):
+                connect_args["hostaddr"] = pinned_ip
+
 
         temp_engine = None
         try:
@@ -952,6 +969,25 @@ class DatabaseConnectionGateway:
                 severity="WARNING"
             )
             raise GatewayAPIException(403, GatewayErrorCode.AUTHORIZATION_DENIED, "Access Denied: Cross-tenant database revocation is prohibited.")
+
+        # Check if target exists in caller's tenant
+        in_tenant_ctx = next(
+            (c for c in self.manager.registry.contexts.values() if c.connection_id == connection_id and c.tenant_id == identity.tenant_id),
+            None
+        )
+        if not in_tenant_ctx:
+            # Not in caller's tenant. Check if it exists in another tenant -> 403 cross-tenant denial!
+            cross_tenant_ctx = next(
+                (c for c in self.manager.registry.contexts.values() if c.connection_id == connection_id and c.tenant_id != identity.tenant_id),
+                None
+            )
+            if cross_tenant_ctx:
+                log_security_event(
+                    "DATABASE_CONNECTION_REJECTED",
+                    {"reason": "Cross-tenant revocation prohibited", "user_id": identity.user_id, "connection_id": connection_id, "target_tenant": cross_tenant_ctx.tenant_id},
+                    severity="WARNING"
+                )
+                raise GatewayAPIException(403, GatewayErrorCode.AUTHORIZATION_DENIED, "Access Denied: Cross-tenant database revocation is prohibited.")
 
         user_roles = [r.lower() for r in identity.roles]
         is_admin = (
