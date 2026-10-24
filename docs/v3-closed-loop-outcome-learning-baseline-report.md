@@ -230,6 +230,35 @@ Command: `npm run build` in `frontend/`
   - Exported `resetClientSession()` in `frontend/lib/api.ts` to clear `localStorage` session state upon logout.
   - Confirmed `npm run build` compiles cleanly with zero TypeScript errors.
 
+### 9. Prompt 39 Correction 5g: Environment Fail-Closed and Route Hardening
+
+- **Environment Fail-Closed (`backend/core/config.py`, `backend/core/auth.py`, `backend/server.py`):**
+  - `SAGE_ENV` defaults to `"production"`. `IS_PRODUCTION` is true unless `SAGE_ENV` is explicitly `"development"` or `"test"`.
+  - Emits clear warnings when `SAGE_ENV` is unset or unrecognized, and at startup when running in `"development"` or `"test"`.
+  - Replaced deprecated `@app.on_event("startup")` with a FastAPI `lifespan` handler executing `verify_production_boot_guards()`.
+  - Startup Guard Refuses to Boot in Production unless:
+    1. Auth is enabled (`SAGE_AUTH_ENABLED=true`).
+    2. Provider is JWT (`SAGE_AUTH_PROVIDER=jwt`).
+    3. Issuer and audience are set (`SAGE_AUTH_ISSUER`, `SAGE_AUTH_AUDIENCE`).
+    4. Effective signing key is not the default literal and is >= 32 bytes (256 bits).
+    5. Production algorithm is `HS256` only (RS256 removed from default list until JWKS is implemented; `"none"` algorithm prohibited).
+    6. `DEV_MOCK_TOKENS` are unreachable and rejected.
+- **JWT Decode Options (`JWTAuthenticationProvider`):**
+  - Enforces `verify_signature=True`, `verify_exp=True`, `verify_iss=True`, `verify_aud=True`, and `require=["exp", "iss", "aud", "sub"]`.
+- **Session Claim Configuration (`SAGE_AUTH_SESSION_CLAIM`):**
+  - Added `SAGE_AUTH_SESSION_CLAIM` (default `"session_id"`). When configured claim is absent and default is in use, falls back to OIDC `"sid"`.
+  - Headers never supply or override session context for JWT identities.
+- **Policy Routes Fail-Closed (`/api/v3/policies/evaluate`, `/simulate`):**
+  - Removed fallback to `"session_default"`. Missing session returns HTTP 401 with code `MISSING_SESSION`.
+- **Database Routes Hardening (`/api/v3/database/connections`):**
+  - `list_connections`: Missing session returns HTTP 400 `MISSING_SESSION` (rather than an empty 200).
+  - `revoke_connection`: Non-admin callers cannot revoke connections from another session (HTTP 403 `AUTHORIZATION_DENIED`) or without a session (HTTP 400 `MISSING_SESSION`). Cross-session revocation is restricted to administrators and audited via `ADMIN_DATABASE_CONNECTION_REVOKED`.
+  - Negative tests added covering all 7 database endpoints (`get`, `health`, `schema`, `sample`, `disconnect`, `revoke`, `list`) ensuring zero 500s.
+- **Frontend Security:**
+  - Replaced `Math.random()` in `frontend/lib/api.ts` with `crypto.randomUUID()` with fallback for non-secure contexts.
+- **Subprocess Isolation Proofs:**
+  - Verified via subprocess tests that with `SAGE_ENV` unset and with `"staging"`, `IS_PRODUCTION` is true, dev mock tokens and anonymous dev identity are rejected, and the guard refuses to boot with the default key.
+
 ---
 
 ## F. Known Limitations & Deferred Capabilities

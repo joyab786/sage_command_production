@@ -200,6 +200,7 @@ The frontend is an **Obsidian Cyberpunk Command Center** engineered with Next.js
    ```bash
    cp .env.example .env
    # Edit .env and supply your GROQ_API_KEY, GEMINI_API_KEY, and TAVILY_API_KEY
+   # Ensure SAGE_ENV=development is set for local development (production defaults to fail-closed)
    ```
 5. Launch the FastAPI server:
    ```bash

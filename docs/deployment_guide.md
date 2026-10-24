@@ -28,7 +28,7 @@ Create a secure `.env` file in the `/backend` directory:
 # ==============================================================================
 # 1. CORE ENVIRONMENT & SYSTEM SETTINGS
 # ==============================================================================
-SAGE_ENV=production                               # 'development' or 'production'
+SAGE_ENV=production                               # 'development', 'test', or 'production' (defaults to production fail-closed)
 SAGE_DEBUG=false                                  # Must be false in production
 SAGE_MAX_REQUEST_SIZE=10485760                    # 10 MB maximum request payload
 SAGE_RATE_LIMIT=120                               # Requests per minute per IP
@@ -43,12 +43,13 @@ SAGE_ALLOWED_HOSTS=api.yourdomain.com,localhost,127.0.0.1
 # ==============================================================================
 # 3. AUTHENTICATION & ZERO-TRUST JWT
 # ==============================================================================
-SAGE_AUTH_ENABLED=true                            # Enforces fail-closed authentication
-SAGE_AUTH_PROVIDER=jwt                            # 'jwt' for production, 'dev_auth' for staging
-SAGE_SECRET_KEY=generate_a_cryptographically_secure_64_char_key_here
-SAGE_AUTH_ISSUER=https://auth.yourdomain.com
-SAGE_AUTH_AUDIENCE=sagecommand_api
-SAGE_JWT_ALGORITHMS=HS256,RS256
+SAGE_AUTH_ENABLED=true                            # Enforces fail-closed authentication (mandatory in production)
+SAGE_AUTH_PROVIDER=jwt                            # Must be 'jwt' in production (dev_auth refuses to boot in production)
+SAGE_SECRET_KEY=generate_a_cryptographically_secure_64_char_key_here # Must not be default and >= 32 bytes
+SAGE_AUTH_ISSUER=https://auth.yourdomain.com      # Required in production
+SAGE_AUTH_AUDIENCE=sagecommand_api                # Required in production
+SAGE_JWT_ALGORITHMS=HS256                         # HS256 only in production (RS256 removed until JWKS implemented; 'none' prohibited)
+SAGE_AUTH_SESSION_CLAIM=session_id                # Configurable session claim name; falls back to 'sid' if omitted
 
 # ==============================================================================
 # 4. DATABASE GATEWAY SECURITY & NETWORK POLICIES
