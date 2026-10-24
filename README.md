@@ -7,7 +7,7 @@
 [![LangGraph](https://img.shields.io/badge/Orchestrator-LangGraph-darkgreen?style=for-the-badge)](https://langchain-ai.github.io/langgraph/)
 [![Gemini / Groq](https://img.shields.io/badge/LLM-Gemini%202.0%20%2F%20Groq%20Llama%203.3-blue?style=for-the-badge)](https://ai.google.dev/)
 [![Zero Trust](https://img.shields.io/badge/Security-Zero%20Trust%20RBAC%20%2F%20ABAC-red?style=for-the-badge)](./docs/security-v3.md)
-[![License](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)](./LICENSE)
+[![License](https://img.shields.io/badge/License-Proprietary%20%2F%20All%20Rights%20Reserved-red?style=for-the-badge)](./LICENSE)
 
 > **SageCommand OS V3** is a next-generation **Autonomous AI Operating System for Industrial Operations, Smart Manufacturing, and Supply Chain Command Centers**. It bridges real-time multi-modal industrial telemetry with stateful multi-agent reasoning, deterministic policy guardrails, a **10-Gate Execution Gateway**, and **Continuous Closed-Loop Learning** under strict Human-in-the-Loop (HITL) constraints.
 
@@ -226,4 +226,7 @@ pytest -v
 
 ---
 
+## ⚖️ Intellectual Property & Copyright
+Copyright © 2026 Joyab. All rights reserved.
 
+This software, architecture, algorithmic designs, and associated intellectual property are proprietary and confidential. Unauthorized copying, reproduction, distribution, sublicensing, reverse engineering, or commercial exploitation of this codebase, in whole or in part, without explicit prior written authorization is strictly prohibited.
