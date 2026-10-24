@@ -55,6 +55,7 @@ SAGE_AUTH_SESSION_CLAIM=session_id                # Configurable session claim n
 # 4. DATABASE GATEWAY SECURITY & NETWORK POLICIES
 # ==============================================================================
 SAGE_DB_NETWORK_POLICY=RESTRICTED                 # 'OPEN' or 'RESTRICTED'
+# SAGE_DB_ALLOWED_HOSTS defaults to empty (deny). Private IP ranges and loopbacks are blocked in production unless explicitly listed here:
 SAGE_DB_ALLOWED_HOSTS=db-prod.internal,db-replica.internal,10.0.1.15
 SAGE_DB_ALLOWED_PORTS=5432,3306,1433
 SAGE_DB_SSL_POLICY=REQUIRED                       # 'REQUIRED', 'VERIFY_CA', 'OPTIONAL'

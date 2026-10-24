@@ -256,8 +256,25 @@ Command: `npm run build` in `frontend/`
   - Negative tests added covering all 7 database endpoints (`get`, `health`, `schema`, `sample`, `disconnect`, `revoke`, `list`) ensuring zero 500s.
 - **Frontend Security:**
   - Replaced `Math.random()` in `frontend/lib/api.ts` with `crypto.randomUUID()` with fallback for non-secure contexts.
-- **Subprocess Isolation Proofs:**
-  - Verified via subprocess tests that with `SAGE_ENV` unset and with `"staging"`, `IS_PRODUCTION` is true, dev mock tokens and anonymous dev identity are rejected, and the guard refuses to boot with the default key.
+- **Prompt 39 Correction 5h: 5g Closeout & SSRF Guard Hardening:**
+  - **Closed out 5g Verification:**
+    - Verified commits `c9dc2b5..8169dbb` (5 documentation and README updates).
+    - Reconciled +5 test count delta from 5g.
+    - Verified `test_L_tenant_database_isolation` resolution (`GatewayAPIException` inherits from `PermissionError`); confirmed zero assertions weakened across all pre-existing tests.
+    - Verified all 7 refusal conditions of `verify_production_boot_guards()`.
+    - Added comprehensive production JWT tests covering 10 rejection modes and valid token execution.
+    - Implemented production positive suite across all core actions (connections, list, revoke, execute, policy evaluate, transaction execute) passing independently of ambient environment.
+    - Verified `clearance_level` source is verified JWT claims; cross-tenant revocation fails closed with 403 `AUTHORIZATION_DENIED`.
+  - **SSRF Guard & Driver Pinning (B1–B7):**
+    - Multi-record DNS resolution (`A` and `AAAA`) rejecting if any address is blocked.
+    - Normalized with `ipaddress`; unwraps IPv4-mapped IPv6 and 6to4; blocks unusual IP encodings (octal, hex, decimal integer literals).
+    - Driver address pinning implemented for PostgreSQL via `connect_args["hostaddr"] = pinned_ip` while retaining original host for TLS SNI and server certificate validation. Pinning feasibility documented: MySQL and MSSQL lack dual host/hostaddr with TLS hostname validation and cannot pin; SQLite operates on local files.
+    - Never-allowlistable categories enforced: `169.254.0.0/16`, `fe80::/10`, `fd00:ec2::254/128`, `100.100.100.200/32`, `0.0.0.0/8`, `::/128`, multicast (`224.0.0.0/4`, `ff00::/8`), and reserved (`240.0.0.0/4`).
+    - Production default for `SAGE_DB_ALLOWED_HOSTS` set to deny (empty string). Private ranges and loopback blocked in production unless explicitly allowlisted. Loopback permitted only in development and test environments.
+    - Uniform HTTP 503 response (`DATABASE_UNREACHABLE`: `"Database host connection refused, blocked, or unreachable."`) across blocked, unreachable, and refused targets with zero IP or driver leakages.
+    - Sliding window rate limiting keyed by `(tenant, user)`: 10/min on `/connections/test`, shared 10/min on `/connections` and `/connect-live-db`, returning HTTP 429 with `Retry-After` header. Process-local in-memory limitation documented.
+    - Dedicated test suite `backend/test_v3_ssrf_guardrails.py` (12 tests, 36 subtests, 100% green).
+
 
 ---
 

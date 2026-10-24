@@ -69,7 +69,43 @@ Centralized security settings driven by environment variables with secure produc
 - **Human-in-the-Loop RBAC**: Enforces `manager` clearance on `approve` commands for high-risk actions.
 - **Audit Logging**: Emits structured security events on connect, disconnect, rate limit, and authorization failures.
 
+### 2.7 SSRF Guard, Network Policy & Driver Address Pinning (`backend/gateway/network_policy.py`, `backend/gateway/db_gateway.py`)
+- **DNS Resolution & Multi-Record Inspection**: Resolves target hostnames to all `A` and `AAAA` records. If *any* resolved address belongs to a prohibited category, the target is rejected immediately.
+- **Prohibited / Never-Allowlistable Networks**:
+  - `169.254.0.0/16` and `fe80::/10` (Cloud / IPv6 link-local metadata)
+  - `fd00:ec2::254/128` (AWS IMDSv6)
+  - `100.100.100.200/32` (Alibaba Cloud metadata)
+  - `0.0.0.0/8` and `::/128` (Unspecified addresses)
+  - `224.0.0.0/4` and `ff00::/8` (Multicast ranges)
+  - `240.0.0.0/4` (Reserved range)
+  - Unusual IP representations (octal, hex, decimal integer literals) are rejected.
+  - IPv4-mapped IPv6 (`::ffff:x.x.x.x`) and 6to4 (`2002::/16`) addresses are unwrapped to their underlying IPv4 addresses before policy checks.
+- **Production Default for `SAGE_DB_ALLOWED_HOSTS`**:
+  - The production default is **DENY** (empty list). Private IP ranges (RFC 1918 `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, RFC 6598 `100.64.0.0/10`, and RFC 4193 `fc00::/7`) and loopback (`127.0.0.0/8`, `::1`) are strictly blocked in production unless explicitly included in `SAGE_DB_ALLOWED_HOSTS`. Loopback is permitted only in `development` and `test` environments.
+- **Driver Address Pinning Feasibility**:
+  To eliminate DNS rebinding between policy verification and connection establishment, the gateway resolves and validates the address upfront:
+
+| Database Driver / Engine | Address Pinning Feasibility | Implementation Details |
+| :--- | :--- | :--- |
+| **PostgreSQL** (`psycopg2` / `libpq`) | **FEASIBLE** (Implemented) | Supported via `connect_args["hostaddr"] = pinned_ip` while retaining original `host` for TLS SNI and server certificate validation. |
+| **MySQL** (`pymysql` / `mysqlclient`) | **NOT FEASIBLE** (Dual host/hostaddr) | PyMySQL lacks separate `hostaddr` argument. Replacing `host` with IP breaks TLS SNI and certificate hostname matching. |
+| **MSSQL** (`pyodbc` / FreeTDS) | **NOT FEASIBLE** (Dual host/hostaddr) | Standard ODBC connection strings lack distinct TCP hostaddr vs TLS SNI host parameter without custom driver configuration. |
+| **SQLite** | **N/A** (Local Filesystem) | Operates on local filesystem paths; network socket pinning is not applicable. |
+
+- **Uniform SSRF Error Handling**:
+  Blocked, unreachable, and refused targets return an identical HTTP 503 response with error code `DATABASE_UNREACHABLE` and message `"Database host connection refused, blocked, or unreachable."` No internal IP addresses, resolved targets, or low-level driver stack traces are exposed to clients.
+- **(Tenant, User) Rate Limiting**:
+  - `/api/v3/database/connections/test`: 10 requests per minute per `(tenant, user)`.
+  - `/api/v3/database/connections` and `/connect-live-db`: 10 requests per minute (shared limit) per `(tenant, user)`.
+  - Exceeded rate limits return HTTP 429 Too Many Requests with a `Retry-After: <seconds>` header.
+  - **Process-Local Limitation**: `SlidingWindowRateLimiter` operates in-memory within the active Python process. When running multi-worker deployments (e.g. Uvicorn `--workers > 1`), limits apply on a per-process basis. Production multi-node clusters should back this limiter with Redis.
+
 ---
 
 ## 3. Verification & Compliance
-All security modules are validated by the automated test suite `backend/test_v3_security.py` (42 tests, 100% pass rate).
+All security modules are validated by the automated test suites:
+- `backend/test_v3_security.py` (42 tests)
+- `backend/test_v3_session_fail_closed.py` (35 tests)
+- `backend/test_v3_ssrf_guardrails.py` (12 tests, 36 subtests)
+- Full backend suite: 2,585 passed tests.
+
