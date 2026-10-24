@@ -2,7 +2,12 @@ export function getClientSessionId(): string {
   if (typeof window === "undefined") return "session_dev_client";
   let sid = localStorage.getItem("sage_session_id");
   if (!sid) {
-    sid = "session_" + Math.random().toString(36).substring(2, 10);
+    if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+      sid = "session_" + crypto.randomUUID();
+    } else {
+      // Fallback for non-secure contexts where crypto.randomUUID is unavailable
+      sid = "session_" + Math.random().toString(36).substring(2, 10);
+    }
     localStorage.setItem("sage_session_id", sid);
   }
   return sid;
