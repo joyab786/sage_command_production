@@ -75,7 +75,7 @@ except ModuleNotFoundError:
     )
 
 
-class GatewayAPIException(Exception):
+class GatewayAPIException(PermissionError, Exception):
     """Exception carrying canonical Gateway error code, HTTP status, and safe description."""
     def __init__(self, status_code: int, code: GatewayErrorCode, message: str):
         self.status_code = status_code
@@ -163,13 +163,20 @@ class DatabaseConnectionGateway:
 
     def _validate_identity_ownership(self, identity: Identity, tenant_id: str, session_id: str):
         """Enforces tenant and session ownership matching."""
+        if not identity.session_id:
+            log_security_event(
+                "DATABASE_CONNECTION_REJECTED",
+                {"reason": "Missing required session identity", "user_id": identity.user_id},
+                severity="WARNING"
+            )
+            raise GatewayAPIException(401, GatewayErrorCode.AUTHENTICATION_REQUIRED, "Session context required for database connection operations.")
         if identity.tenant_id != tenant_id or identity.session_id != session_id:
             log_security_event(
                 "DATABASE_CONNECTION_REJECTED",
                 {"reason": "Tenant or Session ownership mismatch", "user_id": identity.user_id},
                 severity="WARNING"
             )
-            raise PermissionError("Access Denied: You are not authorized to access connection belonging to another tenant or session.")
+            raise GatewayAPIException(403, GatewayErrorCode.AUTHORIZATION_DENIED, "Access Denied: You are not authorized to access connection belonging to another tenant or session.")
 
     def _check_expiration(self, ctx: DatabaseContext, identity: Identity):
         """Validates connection idle timeout and maximum lifetime."""
@@ -579,7 +586,7 @@ class DatabaseConnectionGateway:
                 {"user_id": identity.user_id, "reason": "Missing required session identity."},
                 severity="WARNING"
             )
-            raise GatewayAPIException(400, GatewayErrorCode.INVALID_DATABASE_CONFIGURATION, "Session context required for database connection.")
+            raise GatewayAPIException(400, GatewayErrorCode.MISSING_SESSION, "Session context required for database connection.")
 
         # 2. Idempotency Cache Check
         if idempotency_key:
@@ -841,6 +848,14 @@ class DatabaseConnectionGateway:
         """
         Lists scoped connections visible to authorized tenant/session with pagination and filters.
         """
+        if identity and not identity.session_id:
+            log_security_event(
+                "DATABASE_CONNECTION_REJECTED",
+                {"user_id": identity.user_id, "reason": "Missing required session identity for listing."},
+                severity="WARNING"
+            )
+            raise GatewayAPIException(400, GatewayErrorCode.MISSING_SESSION, "Session context required to list database connections.")
+
         if identity and identity.tenant_id != tenant_id:
             raise GatewayAPIException(403, GatewayErrorCode.AUTHORIZATION_DENIED, "Cannot query another tenant's connections.")
 
@@ -930,16 +945,83 @@ class DatabaseConnectionGateway:
         identity: Identity
     ) -> DisconnectConnectionInfo:
         """Revokes connection permanently for security/admin compliance."""
+        if identity.tenant_id != tenant_id:
+            log_security_event(
+                "DATABASE_CONNECTION_REJECTED",
+                {"reason": "Cross-tenant revocation prohibited", "user_id": identity.user_id},
+                severity="WARNING"
+            )
+            raise GatewayAPIException(403, GatewayErrorCode.AUTHORIZATION_DENIED, "Access Denied: Cross-tenant database revocation is prohibited.")
+
+        user_roles = [r.lower() for r in identity.roles]
+        is_admin = (
+            "administrator" in user_roles
+            or "security_admin" in user_roles
+            or identity.clearance_level >= 3
+            or "system:admin" in [p.lower() for p in getattr(identity, "permissions", [])]
+        )
+
+        if is_admin:
+            # Intentional admin override: can revoke connections across sessions within their tenant
+            target_ctx = next(
+                (c for c in self.manager.registry.contexts.values() if c.tenant_id == tenant_id and c.connection_id == connection_id),
+                None
+            )
+            if target_ctx:
+                self._revoked_connections.add((tenant_id, connection_id))
+                self.manager.disconnect(tenant_id, target_ctx.workspace_id, target_ctx.session_id, connection_id)
+                log_security_event(
+                    "ADMIN_DATABASE_CONNECTION_REVOKED",
+                    {
+                        "user_id": identity.user_id,
+                        "tenant_id": tenant_id,
+                        "connection_id": connection_id,
+                        "target_session": target_ctx.session_id,
+                        "admin_override": True
+                    },
+                    severity="WARNING"
+                )
+                return DisconnectConnectionInfo(connection_id=connection_id, status=ContractStatus.REVOKED)
+            else:
+                if (tenant_id, connection_id) in self._revoked_connections:
+                    return DisconnectConnectionInfo(connection_id=connection_id, status=ContractStatus.REVOKED)
+                raise GatewayAPIException(404, GatewayErrorCode.CONNECTION_NOT_FOUND, f"Connection '{connection_id}' not found.")
+
+        # Non-admin path: Requires valid session and caller session must own the connection
+        if not identity.session_id:
+            log_security_event(
+                "DATABASE_CONNECTION_REJECTED",
+                {"user_id": identity.user_id, "connection_id": connection_id, "reason": "Missing required session context to revoke connection."},
+                severity="WARNING"
+            )
+            raise GatewayAPIException(400, GatewayErrorCode.MISSING_SESSION, "Session context required to revoke database connection.")
+
+        # Check if target exists under a different session in the same tenant
+        other_session_ctx = next(
+            (c for c in self.manager.registry.contexts.values() if c.tenant_id == tenant_id and c.connection_id == connection_id and c.session_id != identity.session_id),
+            None
+        )
+        if other_session_ctx:
+            log_security_event(
+                "DATABASE_CONNECTION_REJECTED",
+                {"reason": "Non-admin caller attempted to revoke another session's connection", "user_id": identity.user_id, "connection_id": connection_id},
+                severity="WARNING"
+            )
+            raise GatewayAPIException(403, GatewayErrorCode.AUTHORIZATION_DENIED, "Access Denied: You cannot revoke a connection belonging to another session without administrator privileges.")
+
+        if (tenant_id, connection_id) in self._revoked_connections:
+            return DisconnectConnectionInfo(connection_id=connection_id, status=ContractStatus.REVOKED)
+
+        # Validate caller session ownership
         self._validate_identity_ownership(identity, tenant_id, session_id)
+
         # Mark in revoked set
         self._revoked_connections.add((tenant_id, connection_id))
-
-        # Close engine and unregister
         self.manager.disconnect(tenant_id, workspace_id, session_id, connection_id)
 
         log_security_event(
             "DATABASE_CONNECTION_REVOKED",
-            {"user_id": identity.user_id, "tenant_id": tenant_id, "connection_id": connection_id},
+            {"user_id": identity.user_id, "tenant_id": tenant_id, "session_id": session_id, "connection_id": connection_id},
             severity="WARNING"
         )
         return DisconnectConnectionInfo(

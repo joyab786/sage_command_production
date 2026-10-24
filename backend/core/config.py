@@ -5,8 +5,19 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # --- SYSTEM & ENVIRONMENT SETTINGS ---
-SAGE_ENV = os.getenv("SAGE_ENV", "development").lower()
-IS_PRODUCTION = (SAGE_ENV == "production")
+import warnings
+
+_raw_sage_env = os.getenv("SAGE_ENV")
+if _raw_sage_env is None or not _raw_sage_env.strip():
+    warnings.warn("SAGE_ENV environment variable is unset. Defaulting to 'production' (fail-closed).", UserWarning)
+    SAGE_ENV = "production"
+else:
+    SAGE_ENV = _raw_sage_env.strip().lower()
+    if SAGE_ENV not in ("production", "development", "test"):
+        warnings.warn(f"Unrecognized SAGE_ENV '{SAGE_ENV}'. Defaulting to 'production' (fail-closed).", UserWarning)
+        SAGE_ENV = "production"
+
+IS_PRODUCTION = (SAGE_ENV not in ("development", "test"))
 SAGE_DEBUG = os.getenv("SAGE_DEBUG", "false").lower() in ("true", "1", "yes") if IS_PRODUCTION else True
 
 # --- CORS & NETWORK SECURITY ---
@@ -23,8 +34,9 @@ SAGE_AUTH_PROVIDER = os.getenv("SAGE_AUTH_PROVIDER", "development" if not IS_PRO
 SAGE_AUTH_ISSUER = os.getenv("SAGE_AUTH_ISSUER", "https://auth.sagecommand.io")
 SAGE_AUTH_AUDIENCE = os.getenv("SAGE_AUTH_AUDIENCE", "sagecommand_api")
 SAGE_SECRET_KEY = os.getenv("SAGE_SECRET_KEY", "sagecommand_default_dev_secret_key_change_in_production")
-raw_jwt_algs = os.getenv("SAGE_JWT_ALGORITHMS", "HS256,RS256")
+raw_jwt_algs = os.getenv("SAGE_JWT_ALGORITHMS", "HS256")
 SAGE_JWT_ALGORITHMS = [a.strip() for a in raw_jwt_algs.split(",") if a.strip()]
+SAGE_AUTH_SESSION_CLAIM = os.getenv("SAGE_AUTH_SESSION_CLAIM", "session_id").strip()
 
 
 # --- REQUEST & RESOURCE BOUNDARIES ---

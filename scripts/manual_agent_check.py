@@ -1,9 +1,15 @@
+import os
+import sys
 import asyncio
 import websockets
 import json
 
+# Local development requires explicit SAGE_ENV=development for dev authentication and mock tokens
+os.environ.setdefault("SAGE_ENV", "development")
+
 async def test_agent(message="What tables are in the database? List them."):
-    uri = "ws://127.0.0.1:8000/ws/sage"
+    # Use dev token parameter for local development WebSocket handshake
+    uri = "ws://127.0.0.1:8000/ws/sage?token=manager_token"
     print(f"\n Connecting to SageCommand agent...")
     print(f" Sending: {message}\n")
 

@@ -5,12 +5,14 @@ Mounts CORS middleware, Security Headers, Request Size Limiter, API routes, WebS
 """
 
 import asyncio
+from contextlib import asynccontextmanager
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 try:
     from core.config import SAGE_ALLOWED_ORIGINS, IS_PRODUCTION
+    from core.auth import verify_production_boot_guards
     from governance.middleware import (
         SecurityHeadersMiddleware,
         RequestSizeLimiterMiddleware,
@@ -66,6 +68,7 @@ try:
 
 except (ImportError, ModuleNotFoundError):
     from backend.core.config import SAGE_ALLOWED_ORIGINS, IS_PRODUCTION
+    from backend.core.auth import verify_production_boot_guards
     from backend.governance.middleware import (
         SecurityHeadersMiddleware,
         RequestSizeLimiterMiddleware,
@@ -120,47 +123,23 @@ except (ImportError, ModuleNotFoundError):
 
 
 
-app = FastAPI(title="SageCommand V3 Industrial Operations AI OS")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    FastAPI Lifespan Context Manager.
+    Replaces deprecated @app.on_event startup and shutdown hooks.
+    Enforces fail-closed production startup guards before accepting any traffic.
+    """
+    # 1. Production Startup Boot Guard
+    verify_production_boot_guards()
 
-# Production Exception Handler (Prevents internal tracebacks/credentials in 500 error responses)
-app.add_exception_handler(Exception, safe_production_exception_handler)
-
-# Security Middleware Pipeline
-app.add_middleware(SecurityHeadersMiddleware)
-app.add_middleware(RequestSizeLimiterMiddleware)
-
-# CORS Configuration Hardening
-# Production must NOT use allow_origins=["*"] together with allow_credentials=True.
-raw_origins = SAGE_ALLOWED_ORIGINS if isinstance(SAGE_ALLOWED_ORIGINS, list) else [SAGE_ALLOWED_ORIGINS]
-filtered_origins = [o.strip() for o in raw_origins if o and o.strip() != "*"]
-
-if IS_PRODUCTION:
-    # Fail safely: require explicit production origins; never allow wildcard with credentials
-    cors_origins = filtered_origins
-    allow_creds = True if cors_origins else False
-else:
-    # Development: permit explicit dev origins (default to localhost:3000 / 127.0.0.1:3000)
-    cors_origins = filtered_origins if filtered_origins else ["http://localhost:3000", "http://127.0.0.1:3000"]
-    allow_creds = True
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=cors_origins,
-    allow_credentials=allow_creds,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
-    allow_headers=["*"],
-)
-
-
-# --- STARTUP/SHUTDOWN LIFECYCLE HOOKS ---
-@app.on_event("startup")
-async def startup_event():
-    """Launches the background event-driven factory anomaly generator loop and internal event bus."""
+    # 2. Background Event Bus & Simulator Initialization
     print(" [Server Startup] Launching Internal Event Bus workers...")
     event_bus = get_event_bus()
     event_bus.start()
     print(" [Server Startup] Launching Factory Simulator background anomaly generator...")
-    asyncio.create_task(run_factory_simulation_loop(interval_seconds=40))
+    sim_task = asyncio.create_task(run_factory_simulation_loop(interval_seconds=40))
+
     if SAGE_CLOSED_LOOP_ENABLED and SAGE_VERIFICATION_EVENT_TRIGGER_ENABLED:
         print(" [Server Startup] Initializing Closed-Loop Learning Coordinator...")
         coordinator = get_verification_trigger_coordinator()
@@ -195,13 +174,53 @@ async def startup_event():
         print(" [Server Startup] Registering Closed-Loop Outcome Learning Event Handler...")
         outcome_learning_event_handler.register_subscriptions()
 
+    yield
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Gracefully shuts down background services."""
+    # Shutdown
+    print(" [Server Shutdown] Cancelling Factory Simulator background anomaly generator...")
+    sim_task.cancel()
+    try:
+        await sim_task
+    except asyncio.CancelledError:
+        pass
     print(" [Server Shutdown] Stopping Internal Event Bus workers...")
     event_bus = get_event_bus()
     await event_bus.stop()
+
+
+app = FastAPI(
+    title="SageCommand V3 Industrial Operations AI OS",
+    lifespan=lifespan
+)
+
+# Production Exception Handler (Prevents internal tracebacks/credentials in 500 error responses)
+app.add_exception_handler(Exception, safe_production_exception_handler)
+
+# Security Middleware Pipeline
+app.add_middleware(SecurityHeadersMiddleware)
+app.add_middleware(RequestSizeLimiterMiddleware)
+
+# CORS Configuration Hardening
+# Production must NOT use allow_origins=["*"] together with allow_credentials=True.
+raw_origins = SAGE_ALLOWED_ORIGINS if isinstance(SAGE_ALLOWED_ORIGINS, list) else [SAGE_ALLOWED_ORIGINS]
+filtered_origins = [o.strip() for o in raw_origins if o and o.strip() != "*"]
+
+if IS_PRODUCTION:
+    # Fail safely: require explicit production origins; never allow wildcard with credentials
+    cors_origins = filtered_origins
+    allow_creds = True if cors_origins else False
+else:
+    # Development: permit explicit dev origins (default to localhost:3000 / 127.0.0.1:3000)
+    cors_origins = filtered_origins if filtered_origins else ["http://localhost:3000", "http://127.0.0.1:3000"]
+    allow_creds = True
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_credentials=allow_creds,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    allow_headers=["*"],
+)
 
 # Include API Routers
 app.include_router(api_router)

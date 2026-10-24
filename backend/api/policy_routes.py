@@ -141,11 +141,24 @@ async def evaluate_action_policy(
             request_id=req_id
         )
 
+    if not identity.session_id:
+        log_security_event(
+            "POLICY_AUTHORIZATION_DENIED",
+            {"user_id": identity.user_id, "action_id": request.action_id, "reason": "Missing required session context."},
+            severity="WARNING"
+        )
+        return policy_error_response(
+            status_code=401,
+            code="MISSING_SESSION",
+            message="Session context required for policy evaluation.",
+            request_id=req_id
+        )
+
     # 3. Construct Authoritative Server-Side Evaluation Context
     context = PolicyEvaluationContext(
         tenant_id=identity.tenant_id,
         workspace_id=getattr(identity, "workspace_id", "workspace_default") or "workspace_default",
-        session_id=identity.session_id or "session_default",
+        session_id=identity.session_id,
         user_id=identity.user_id,
         plant_id=action.target.plant_id,
         roles=identity.roles,
@@ -200,10 +213,23 @@ async def simulate_action_policy(
             request_id=req_id
         )
 
+    if not identity.session_id:
+        log_security_event(
+            "POLICY_AUTHORIZATION_DENIED",
+            {"user_id": identity.user_id, "reason": "Missing required session context."},
+            severity="WARNING"
+        )
+        return policy_error_response(
+            status_code=401,
+            code="MISSING_SESSION",
+            message="Session context required for policy simulation.",
+            request_id=req_id
+        )
+
     context = PolicyEvaluationContext(
         tenant_id=identity.tenant_id,
         workspace_id=action.workspace_id,
-        session_id=identity.session_id or "session_default",
+        session_id=identity.session_id,
         user_id=identity.user_id,
         plant_id=action.target.plant_id,
         roles=identity.roles,

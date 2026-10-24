@@ -202,6 +202,14 @@ async def list_connections(
     identity: Identity = Depends(require_role("operator"))
 ):
     req_id = extract_request_id(x_request_id)
+    if not identity.session_id:
+        log_security_event(
+            "DATABASE_CONNECTION_REJECTED",
+            {"user_id": identity.user_id, "reason": "Missing required session identity for listing."},
+            severity="WARNING"
+        )
+        return error_json_response(400, GatewayErrorCode.MISSING_SESSION, "Session context required to list database connections.", req_id)
+
     try:
         items, total = db_gateway.list_canonical_connections(
             tenant_id=identity.tenant_id,

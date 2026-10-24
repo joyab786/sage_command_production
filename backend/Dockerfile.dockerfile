@@ -4,6 +4,7 @@ FROM python:3.11-slim
 # Prevent Python from writing pyc files to disc and force stdout buffering
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
+ENV SAGE_ENV=production
 
 # Set the working directory
 WORKDIR /app

@@ -16,13 +16,15 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 try:
     from core.config import (
+        SAGE_ENV,
         SAGE_AUTH_ENABLED,
         SAGE_AUTH_PROVIDER,
         SAGE_SECRET_KEY,
         IS_PRODUCTION,
         SAGE_AUTH_ISSUER,
         SAGE_AUTH_AUDIENCE,
-        SAGE_JWT_ALGORITHMS
+        SAGE_JWT_ALGORITHMS,
+        SAGE_AUTH_SESSION_CLAIM
     )
     from governance.audit import log_security_event
     from data.schemas.authorization_contract import (
@@ -36,13 +38,15 @@ try:
     from services.authorization_service import authorization_service
 except ModuleNotFoundError:
     from backend.core.config import (
+        SAGE_ENV,
         SAGE_AUTH_ENABLED,
         SAGE_AUTH_PROVIDER,
         SAGE_SECRET_KEY,
         IS_PRODUCTION,
         SAGE_AUTH_ISSUER,
         SAGE_AUTH_AUDIENCE,
-        SAGE_JWT_ALGORITHMS
+        SAGE_JWT_ALGORITHMS,
+        SAGE_AUTH_SESSION_CLAIM
     )
     from backend.governance.audit import log_security_event
     from backend.data.schemas.authorization_contract import (
@@ -56,6 +60,17 @@ except ModuleNotFoundError:
     from backend.services.authorization_service import authorization_service
 
 security_scheme = HTTPBearer(auto_error=False)
+
+DEV_MOCK_TOKENS = {
+    "operator_token",
+    "manager_token",
+    "admin_token",
+    "security_token",
+    "viewer_token",
+    "safety_token",
+    "test_token_tenant_a",
+    "test_token_tenant_b",
+}
 
 
 class Identity(BaseModel):
@@ -115,6 +130,9 @@ class DevAuthenticationProvider(AuthenticationProvider):
     Supports server-side token profiles and delegates to JWT validation if a JWT token is supplied.
     """
     def authenticate_token(self, token: str) -> Identity:
+        if IS_PRODUCTION:
+            log_security_event("LOGIN_FAILURE", {"reason": "DevAuthenticationProvider invoked in production"}, severity="CRITICAL")
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Development authentication provider is disabled in production.")
         if not token:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication token required.")
         if token == "invalid_token":
@@ -191,6 +209,9 @@ class DevAuthenticationProvider(AuthenticationProvider):
         return Identity(user_id="dev_operator", roles=["operator", "manager"], authentication_method="dev_mode", is_server_authoritative=False)
 
     def authenticate_request(self, request: Request) -> Identity:
+        if IS_PRODUCTION:
+            log_security_event("LOGIN_FAILURE", {"reason": "DevAuthenticationProvider invoked in production"}, severity="CRITICAL")
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Development authentication provider is disabled in production.")
         auth_header = request.headers.get("Authorization")
         if auth_header and auth_header.startswith("Bearer "):
             token = auth_header.split(" ")[1]
@@ -211,12 +232,15 @@ class JWTAuthenticationProvider(AuthenticationProvider):
         secret_key: str = SAGE_SECRET_KEY,
         algorithms: Optional[List[str]] = None,
         issuer: Optional[str] = SAGE_AUTH_ISSUER,
-        audience: Optional[str] = SAGE_AUTH_AUDIENCE
+        audience: Optional[str] = SAGE_AUTH_AUDIENCE,
+        session_claim: Optional[str] = None
     ):
         self.secret_key = secret_key
-        self.algorithms = algorithms or SAGE_JWT_ALGORITHMS or ["HS256", "RS256"]
+        raw_algs = algorithms or SAGE_JWT_ALGORITHMS or ["HS256"]
+        self.algorithms = [a.strip() for a in raw_algs if a.strip().lower() != "none"]
         self.issuer = issuer
         self.audience = audience
+        self.session_claim = session_claim or SAGE_AUTH_SESSION_CLAIM or "session_id"
 
     def authenticate_token(self, token: str) -> Identity:
         if not token:
@@ -257,11 +281,20 @@ class JWTAuthenticationProvider(AuthenticationProvider):
             log_security_event("LOGIN_FAILURE", {"reason": f"JWT inspection error: {str(e)}"}, severity="WARNING")
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid JWT token header.")
 
-        decode_options = {
-            "verify_signature": True,
-            "verify_exp": True,
-            "require": ["exp", "sub"]
-        }
+        if IS_PRODUCTION:
+            decode_options = {
+                "verify_signature": True,
+                "verify_exp": True,
+                "verify_iss": True,
+                "verify_aud": True,
+                "require": ["exp", "iss", "aud", "sub"]
+            }
+        else:
+            decode_options = {
+                "verify_signature": True,
+                "verify_exp": True,
+                "require": ["exp", "sub"]
+            }
 
         try:
             payload = jwt.decode(
@@ -300,9 +333,11 @@ class JWTAuthenticationProvider(AuthenticationProvider):
 
         tenant_id = str(payload.get("tenant_id", "tenant_default"))
         workspace_id = str(payload.get("workspace_id", "workspace_default"))
-        # Security Hardening: No fabricated sessions for JWT.
-        # A token without a session_id claim yields session_id None.
-        session_id_val = payload.get("session_id")
+        # Security Hardening: Session derived strictly from configured claim name,
+        # with fallback to OIDC 'sid' claim when default claim ('session_id') is used.
+        session_id_val = payload.get(self.session_claim)
+        if session_id_val is None and self.session_claim == "session_id":
+            session_id_val = payload.get("sid")
         session_id = str(session_id_val) if session_id_val is not None else None
 
         roles = payload.get("roles", ["operator"])
@@ -468,3 +503,61 @@ def require_permission(required_permission: str):
         return identity
 
     return permission_checker
+
+
+def verify_production_boot_guards() -> None:
+    """
+    Production Startup Boot Guard.
+    Refuses to boot in production unless all production auth & security invariants are satisfied:
+    - Auth is enabled (SAGE_AUTH_ENABLED is True)
+    - Auth provider is JWT (SAGE_AUTH_PROVIDER == "jwt")
+    - SAGE_AUTH_ISSUER and SAGE_AUTH_AUDIENCE are non-empty
+    - SAGE_SECRET_KEY is not the default literal and is at least 32 bytes (256 bits)
+    - SAGE_JWT_ALGORITHMS is HS256 only ("none" strictly forbidden)
+    - DEV_MOCK_TOKENS are unreachable
+    In non-production (development/test), issues a clear startup warning.
+    """
+    if not IS_PRODUCTION:
+        print(f" [Server Startup] WARNING: Running in non-production environment: SAGE_ENV='{SAGE_ENV}'. Security guards relaxed for development/testing only.")
+        return
+
+    # 1. Auth enabled
+    if not SAGE_AUTH_ENABLED:
+        raise RuntimeError("Production boot guard failed: SAGE_AUTH_ENABLED must be True in production.")
+
+    # 2. Provider is JWT
+    if SAGE_AUTH_PROVIDER != "jwt":
+        raise RuntimeError("Production boot guard failed: SAGE_AUTH_PROVIDER must be 'jwt' in production.")
+
+    # 3. Issuer and Audience set
+    if not SAGE_AUTH_ISSUER or not SAGE_AUTH_ISSUER.strip():
+        raise RuntimeError("Production boot guard failed: SAGE_AUTH_ISSUER must be configured non-empty in production.")
+    if not SAGE_AUTH_AUDIENCE or not SAGE_AUTH_AUDIENCE.strip():
+        raise RuntimeError("Production boot guard failed: SAGE_AUTH_AUDIENCE must be configured non-empty in production.")
+
+    # 4. Effective signing key is not the default literal and is >= 32 bytes
+    default_dev_key = "sagecommand_default_dev_secret_key_change_in_production"
+    if not SAGE_SECRET_KEY or SAGE_SECRET_KEY == default_dev_key:
+        raise RuntimeError("Production boot guard failed: SAGE_SECRET_KEY cannot use the default dev literal in production.")
+    if len(SAGE_SECRET_KEY.encode("utf-8")) < 32:
+        raise RuntimeError("Production boot guard failed: SAGE_SECRET_KEY must be at least 32 bytes in production.")
+
+    # 5. Production algorithms: HS256 only, "none" never allowed
+    for alg in SAGE_JWT_ALGORITHMS:
+        if alg.lower() == "none":
+            raise RuntimeError("Production boot guard failed: Algorithm 'none' is never allowed.")
+        if alg != "HS256":
+            raise RuntimeError(f"Production boot guard failed: Unsupported production algorithm '{alg}'. Production algorithms: HS256 only (RS256 deferred until JWKS).")
+
+    # 6. DEV_MOCK_TOKENS are unreachable
+    provider = get_auth_provider()
+    if not isinstance(provider, JWTAuthenticationProvider):
+        raise RuntimeError(f"Production boot guard failed: Active auth provider {type(provider).__name__} is not JWTAuthenticationProvider.")
+
+    for mock_tok in DEV_MOCK_TOKENS:
+        try:
+            provider.authenticate_token(mock_tok)
+            raise RuntimeError(f"Production boot guard failed: DEV_MOCK_TOKEN '{mock_tok}' is reachable in production.")
+        except HTTPException:
+            pass  # Expected rejection
+
