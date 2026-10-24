@@ -228,21 +228,29 @@ class TestV3SessionFailClosed(unittest.TestCase):
 
         # Environment 1: Development/Test mode unauthenticated request
         req1 = DummyRequest({})
-        with patch.object(auth_mod, "IS_PRODUCTION", False), \
+        with patch.object(auth_mod, "SAGE_ENV", "development"), \
+             patch.object(auth_mod, "IS_PRODUCTION", False), \
+             patch.object(auth_mod, "SAGE_AUTH_PROVIDER", "development"), \
              patch.object(auth_mod, "SAGE_AUTH_ENABLED", False):
             identity1 = auth_mod.get_current_identity(req1, credentials=None)
             self.assertIsNone(identity1.session_id)
 
         # Environment 2: Development/Test mode with mock token that has no session in its profile
         req2 = DummyRequest({"authorization": "Bearer manager_token"})
-        with patch.object(auth_mod, "IS_PRODUCTION", False):
+        with patch.object(auth_mod, "SAGE_ENV", "development"), \
+             patch.object(auth_mod, "IS_PRODUCTION", False), \
+             patch.object(auth_mod, "SAGE_AUTH_PROVIDER", "development"), \
+             patch.object(auth_mod, "SAGE_AUTH_ENABLED", True):
             identity2 = auth_mod.get_current_identity(req2, credentials=None)
             self.assertIsNone(identity2.session_id)
 
         # Environment 3: Production mode with JWT token that has no session_id claim
         jwt_no_sess = self._create_jwt({"sub": "prod_tester_01"})
         req3 = DummyRequest({"authorization": f"Bearer {jwt_no_sess}"})
-        with patch.object(auth_mod, "IS_PRODUCTION", True):
+        with patch.object(auth_mod, "SAGE_ENV", "production"), \
+             patch.object(auth_mod, "IS_PRODUCTION", True), \
+             patch.object(auth_mod, "SAGE_AUTH_PROVIDER", "jwt"), \
+             patch.object(auth_mod, "SAGE_AUTH_ENABLED", True):
             identity3 = auth_mod.get_current_identity(req3, credentials=None)
             self.assertIsNone(identity3.session_id)
 
@@ -875,6 +883,496 @@ print("PASS_FAIL_CLOSED")
         finally:
             if os.path.exists(temp_script_path):
                 os.remove(temp_script_path)
+
+    # -------------------------------------------------------------------------
+    # 9. Prompt 39 Correction 5h Part A Verification Suite
+    # -------------------------------------------------------------------------
+
+    def test_production_boot_guards_failures(self):
+        """A4: verify_production_boot_guards() refuses boot in production for each invariant."""
+        valid_prod_key = "a_very_secure_production_secret_key_that_is_at_least_32_bytes_long"
+        valid_issuer = "https://auth.sagecommand.io"
+        valid_audience = "sagecommand_api"
+
+        # 1. Auth disabled
+        with patch.object(auth_mod, "IS_PRODUCTION", True), \
+             patch.object(auth_mod, "SAGE_AUTH_ENABLED", False), \
+             patch.object(auth_mod, "SAGE_AUTH_PROVIDER", "jwt"), \
+             patch.object(auth_mod, "SAGE_AUTH_ISSUER", valid_issuer), \
+             patch.object(auth_mod, "SAGE_AUTH_AUDIENCE", valid_audience), \
+             patch.object(auth_mod, "SAGE_SECRET_KEY", valid_prod_key):
+            with self.assertRaises(RuntimeError) as ctx:
+                auth_mod.verify_production_boot_guards()
+            self.assertIn("SAGE_AUTH_ENABLED must be True", str(ctx.exception))
+
+        # 2. Non-JWT provider
+        with patch.object(auth_mod, "IS_PRODUCTION", True), \
+             patch.object(auth_mod, "SAGE_AUTH_ENABLED", True), \
+             patch.object(auth_mod, "SAGE_AUTH_PROVIDER", "development"), \
+             patch.object(auth_mod, "SAGE_AUTH_ISSUER", valid_issuer), \
+             patch.object(auth_mod, "SAGE_AUTH_AUDIENCE", valid_audience), \
+             patch.object(auth_mod, "SAGE_SECRET_KEY", valid_prod_key):
+            with self.assertRaises(RuntimeError) as ctx:
+                auth_mod.verify_production_boot_guards()
+            self.assertIn("SAGE_AUTH_PROVIDER must be 'jwt'", str(ctx.exception))
+
+        # 3. Issuer unset
+        with patch.object(auth_mod, "IS_PRODUCTION", True), \
+             patch.object(auth_mod, "SAGE_AUTH_ENABLED", True), \
+             patch.object(auth_mod, "SAGE_AUTH_PROVIDER", "jwt"), \
+             patch.object(auth_mod, "SAGE_AUTH_ISSUER", ""), \
+             patch.object(auth_mod, "SAGE_AUTH_AUDIENCE", valid_audience), \
+             patch.object(auth_mod, "SAGE_SECRET_KEY", valid_prod_key):
+            with self.assertRaises(RuntimeError) as ctx:
+                auth_mod.verify_production_boot_guards()
+            self.assertIn("SAGE_AUTH_ISSUER must be configured non-empty", str(ctx.exception))
+
+        # 4. Audience unset
+        with patch.object(auth_mod, "IS_PRODUCTION", True), \
+             patch.object(auth_mod, "SAGE_AUTH_ENABLED", True), \
+             patch.object(auth_mod, "SAGE_AUTH_PROVIDER", "jwt"), \
+             patch.object(auth_mod, "SAGE_AUTH_ISSUER", valid_issuer), \
+             patch.object(auth_mod, "SAGE_AUTH_AUDIENCE", ""), \
+             patch.object(auth_mod, "SAGE_SECRET_KEY", valid_prod_key):
+            with self.assertRaises(RuntimeError) as ctx:
+                auth_mod.verify_production_boot_guards()
+            self.assertIn("SAGE_AUTH_AUDIENCE must be configured non-empty", str(ctx.exception))
+
+        # 5. Default signing key
+        with patch.object(auth_mod, "IS_PRODUCTION", True), \
+             patch.object(auth_mod, "SAGE_AUTH_ENABLED", True), \
+             patch.object(auth_mod, "SAGE_AUTH_PROVIDER", "jwt"), \
+             patch.object(auth_mod, "SAGE_AUTH_ISSUER", valid_issuer), \
+             patch.object(auth_mod, "SAGE_AUTH_AUDIENCE", valid_audience), \
+             patch.object(auth_mod, "SAGE_SECRET_KEY", "sagecommand_default_dev_secret_key_change_in_production"):
+            with self.assertRaises(RuntimeError) as ctx:
+                auth_mod.verify_production_boot_guards()
+            self.assertIn("cannot use the default dev literal", str(ctx.exception))
+
+        # 6. Key shorter than 32 bytes
+        with patch.object(auth_mod, "IS_PRODUCTION", True), \
+             patch.object(auth_mod, "SAGE_AUTH_ENABLED", True), \
+             patch.object(auth_mod, "SAGE_AUTH_PROVIDER", "jwt"), \
+             patch.object(auth_mod, "SAGE_AUTH_ISSUER", valid_issuer), \
+             patch.object(auth_mod, "SAGE_AUTH_AUDIENCE", valid_audience), \
+             patch.object(auth_mod, "SAGE_SECRET_KEY", "short_key_under_32_bytes"):
+            with self.assertRaises(RuntimeError) as ctx:
+                auth_mod.verify_production_boot_guards()
+            self.assertIn("must be at least 32 bytes", str(ctx.exception))
+
+        # 7. DEV_MOCK_TOKENS reachable
+        class DummyVulnerableProvider(auth_mod.JWTAuthenticationProvider):
+            def authenticate_token(self, token: str):
+                if token in auth_mod.DEV_MOCK_TOKENS:
+                    return Identity(user_id="mock_user", roles=["operator"])
+                return super().authenticate_token(token)
+
+        with patch.object(auth_mod, "IS_PRODUCTION", True), \
+             patch.object(auth_mod, "SAGE_AUTH_ENABLED", True), \
+             patch.object(auth_mod, "SAGE_AUTH_PROVIDER", "jwt"), \
+             patch.object(auth_mod, "SAGE_AUTH_ISSUER", valid_issuer), \
+             patch.object(auth_mod, "SAGE_AUTH_AUDIENCE", valid_audience), \
+             patch.object(auth_mod, "SAGE_SECRET_KEY", valid_prod_key), \
+             patch.object(auth_mod, "get_auth_provider", return_value=DummyVulnerableProvider(secret_key=valid_prod_key, issuer=valid_issuer, audience=valid_audience)):
+            with self.assertRaises(RuntimeError) as ctx:
+                auth_mod.verify_production_boot_guards()
+            self.assertIn("is reachable in production", str(ctx.exception))
+
+    def test_production_mode_jwt_validations(self):
+        """A5: Production-mode JWT tests: wrong issuer, wrong audience, missing exp, missing iss, missing aud, missing sub, expired, alg none, RS256 algorithm confusion, tampered signature. One valid token must pass."""
+        from fastapi import HTTPException
+        import json
+        import base64
+        prod_key = "a_super_strong_production_secret_key_32bytes_long"
+        issuer = "https://auth.sagecommand.io"
+        audience = "sagecommand_api"
+
+        with patch.object(auth_mod, "IS_PRODUCTION", True), \
+             patch.object(auth_mod, "SAGE_SECRET_KEY", prod_key), \
+             patch.object(auth_mod, "SAGE_AUTH_ISSUER", issuer), \
+             patch.object(auth_mod, "SAGE_AUTH_AUDIENCE", audience):
+            provider = auth_mod.JWTAuthenticationProvider(
+                secret_key=prod_key,
+                issuer=issuer,
+                audience=audience
+            )
+            now = int(time.time())
+
+            def _encode_token(claims, key=prod_key, headers=None, alg="HS256"):
+                return jwt.encode(claims, key, algorithm=alg, headers=headers)
+
+            base_valid_claims = {
+                "sub": "user_prod_01",
+                "iss": issuer,
+                "aud": audience,
+                "exp": now + 3600,
+                "iat": now,
+                "roles": ["operator"],
+                "tenant_id": "tenant_default",
+                "workspace_id": "workspace_default",
+                "session_id": "session_valid_01"
+            }
+
+            # 1. Wrong issuer
+            tok = _encode_token({**base_valid_claims, "iss": "https://attacker.io"})
+            with self.assertRaises(HTTPException) as ctx:
+                provider.authenticate_token(tok)
+            self.assertEqual(ctx.exception.status_code, 401)
+            self.assertIn("Invalid JWT issuer", ctx.exception.detail)
+
+            # 2. Wrong audience
+            tok = _encode_token({**base_valid_claims, "aud": "wrong_audience"})
+            with self.assertRaises(HTTPException) as ctx:
+                provider.authenticate_token(tok)
+            self.assertEqual(ctx.exception.status_code, 401)
+            self.assertIn("Invalid JWT audience", ctx.exception.detail)
+
+            # 3. Missing exp
+            claims_no_exp = dict(base_valid_claims)
+            claims_no_exp.pop("exp")
+            tok = _encode_token(claims_no_exp)
+            with self.assertRaises(HTTPException) as ctx:
+                provider.authenticate_token(tok)
+            self.assertEqual(ctx.exception.status_code, 401)
+
+            # 4. Missing iss
+            claims_no_iss = dict(base_valid_claims)
+            claims_no_iss.pop("iss")
+            tok = _encode_token(claims_no_iss)
+            with self.assertRaises(HTTPException) as ctx:
+                provider.authenticate_token(tok)
+            self.assertEqual(ctx.exception.status_code, 401)
+
+            # 5. Missing aud
+            claims_no_aud = dict(base_valid_claims)
+            claims_no_aud.pop("aud")
+            tok = _encode_token(claims_no_aud)
+            with self.assertRaises(HTTPException) as ctx:
+                provider.authenticate_token(tok)
+            self.assertEqual(ctx.exception.status_code, 401)
+
+            # 6. Missing sub
+            claims_no_sub = dict(base_valid_claims)
+            claims_no_sub.pop("sub")
+            tok = _encode_token(claims_no_sub)
+            with self.assertRaises(HTTPException) as ctx:
+                provider.authenticate_token(tok)
+            self.assertEqual(ctx.exception.status_code, 401)
+
+            # 7. Expired
+            tok = _encode_token({**base_valid_claims, "exp": now - 60})
+            with self.assertRaises(HTTPException) as ctx:
+                provider.authenticate_token(tok)
+            self.assertEqual(ctx.exception.status_code, 401)
+            self.assertIn("expired", ctx.exception.detail.lower())
+
+            # 8. alg none
+            hdr_b64 = base64.urlsafe_b64encode(json.dumps({"alg": "none", "typ": "JWT"}).encode()).decode().rstrip("=")
+            payload_b64 = base64.urlsafe_b64encode(json.dumps(base_valid_claims).encode()).decode().rstrip("=")
+            alg_none_tok = f"{hdr_b64}.{payload_b64}."
+            with self.assertRaises(HTTPException) as ctx:
+                provider.authenticate_token(alg_none_tok)
+            self.assertEqual(ctx.exception.status_code, 401)
+            self.assertIn("Unsupported or prohibited JWT algorithm", ctx.exception.detail)
+
+            # 9. RS256 token verified against HS256 secret (algorithm confusion)
+            hdr_rs = base64.urlsafe_b64encode(json.dumps({"alg": "RS256", "typ": "JWT"}).encode()).decode().rstrip("=")
+            rs256_fake_tok = f"{hdr_rs}.{payload_b64}.c2lnbmF0dXJl"
+            with self.assertRaises(HTTPException) as ctx:
+                provider.authenticate_token(rs256_fake_tok)
+            self.assertEqual(ctx.exception.status_code, 401)
+            self.assertIn("Unsupported or prohibited JWT algorithm", ctx.exception.detail)
+
+            # 10. Tampered signature
+            valid_tok = _encode_token(base_valid_claims)
+            parts = valid_tok.split(".")
+            tampered_tok = f"{parts[0]}.{parts[1]}.{parts[2][:-3]}xyz"
+            with self.assertRaises(HTTPException) as ctx:
+                provider.authenticate_token(tampered_tok)
+            self.assertEqual(ctx.exception.status_code, 401)
+
+            # 11. One valid token must pass!
+            ident = provider.authenticate_token(valid_tok)
+            self.assertEqual(ident.user_id, "user_prod_01")
+            self.assertEqual(ident.session_id, "session_valid_01")
+            self.assertEqual(ident.roles, ["operator"])
+            self.assertTrue(ident.is_server_authoritative)
+
+    def test_production_mode_positive_suite_with_real_jwts(self):
+        """A6: Production-mode positive suite using real JWTs with all required claims and a session claim against:
+        create connection, list, revoke (own session), action execute, policy evaluate, transaction execute.
+        These must pass regardless of the ambient environment.
+        """
+        now = int(time.time())
+        token_payload = {
+            "sub": "user_prod_suite_01",
+            "tenant_id": "tenant_prod_positive",
+            "workspace_id": "workspace_default",
+            "roles": ["administrator", "manager", "operator"],
+            "clearance_level": 3,
+            "assigned_plants": ["plant_mumbai", "*"],
+            "session_id": "session_prod_pos_01",
+            "iss": SAGE_AUTH_ISSUER,
+            "aud": SAGE_AUTH_AUDIENCE,
+            "iat": now,
+            "exp": now + 3600
+        }
+        token = jwt.encode(token_payload, SAGE_SECRET_KEY, algorithm="HS256")
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "X-Tenant-ID": "tenant_prod_positive"
+        }
+
+        with patch.object(auth_mod, "SAGE_ENV", "production"), \
+             patch.object(auth_mod, "IS_PRODUCTION", True), \
+             patch.object(auth_mod, "SAGE_AUTH_PROVIDER", "jwt"), \
+             patch.object(auth_mod, "SAGE_AUTH_ENABLED", True):
+
+            # 1. Create connection
+            create_payload = {
+                "database_type": "SQLITE",
+                "connection_string": "sqlite:///./dynamic_datacore.sqlite",
+                "access_mode": "READ_ONLY",
+                "data_mode": "REAL"
+            }
+            resp_create = self.client.post("/api/v3/database/connections", json=create_payload, headers=headers)
+            self.assertEqual(resp_create.status_code, 201)
+            create_data = resp_create.json()
+            self.assertTrue(create_data.get("success"))
+            conn_id = create_data["connection"]["connection_id"]
+
+            # 2. List connections
+            resp_list = self.client.get("/api/v3/database/connections", headers=headers)
+            self.assertEqual(resp_list.status_code, 200)
+            list_data = resp_list.json()
+            self.assertTrue(list_data.get("success"))
+
+            # 3. Revoke (own session)
+            resp_revoke = self.client.post(f"/api/v3/database/connections/{conn_id}/revoke", headers=headers)
+            self.assertEqual(resp_revoke.status_code, 200)
+            revoke_data = resp_revoke.json()
+            self.assertTrue(revoke_data.get("success"))
+            self.assertEqual(revoke_data["connection"]["status"], "REVOKED")
+
+            # 4. Action execute
+            act_exec = Action(
+                action_type="ADJUST_REORDER_POINT",
+                tenant_id="tenant_prod_positive",
+                workspace_id="workspace_default",
+                session_id="session_prod_pos_01",
+                status=ActionStatus.APPROVED,
+                requires_approval=False,
+                system_risk_level=RiskLevel.LOW,
+                parameters={"sku": "SKU-PROD-01", "reorder_point": 10},
+                target={"resource_type": "INVENTORY_ITEM", "resource_id": "SKU-PROD-01", "plant_id": "plant_mumbai"},
+                reason={"summary": "Production positive test execute", "reason_code": "STOCK_LOW", "trigger": "MANUAL", "business_impact": "LOW"}
+            )
+            action_store.save(act_exec)
+
+            resp_act = self.client.post(
+                f"/api/v3/actions/{act_exec.action_id}/execute",
+                json={"dry_run": True},
+                headers=headers
+            )
+            self.assertEqual(resp_act.status_code, 200)
+            self.assertTrue(resp_act.json().get("success"))
+
+            # 5. Policy evaluate (on an action in PROPOSED state)
+            act_eval = Action(
+                action_type="ADJUST_REORDER_POINT",
+                tenant_id="tenant_prod_positive",
+                workspace_id="workspace_default",
+                session_id="session_prod_pos_01",
+                status=ActionStatus.PROPOSED,
+                requires_approval=True,
+                system_risk_level=RiskLevel.LOW,
+                parameters={"sku": "SKU-PROD-02", "reorder_point": 20},
+                target={"resource_type": "INVENTORY_ITEM", "resource_id": "SKU-PROD-02", "plant_id": "plant_mumbai"},
+                reason={"summary": "Production positive test evaluate", "reason_code": "STOCK_LOW", "trigger": "MANUAL", "business_impact": "LOW"}
+            )
+            action_store.save(act_eval)
+
+            resp_eval = self.client.post(
+                "/api/v3/policies/evaluate",
+                json={"action_id": act_eval.action_id},
+                headers=headers
+            )
+            self.assertEqual(resp_eval.status_code, 200)
+            self.assertTrue(resp_eval.json().get("success"))
+
+            # 6. Transaction execute (planned from an action)
+            act_plan = Action(
+                action_type="ADJUST_REORDER_POINT",
+                tenant_id="tenant_prod_positive",
+                workspace_id="workspace_default",
+                session_id="session_prod_pos_01",
+                status=ActionStatus.APPROVED,
+                requires_approval=False,
+                system_risk_level=RiskLevel.LOW,
+                parameters={"sku": "SKU-PROD-03", "reorder_point": 30},
+                target={"resource_type": "INVENTORY_ITEM", "resource_id": "SKU-PROD-03", "plant_id": "plant_mumbai"},
+                reason={"summary": "Production positive test transaction", "reason_code": "STOCK_LOW", "trigger": "MANUAL", "business_impact": "LOW"}
+            )
+            action_store.save(act_plan)
+
+            resp_plan = self.client.post(
+                "/api/v3/transactions/plan",
+                json={"action_id": act_plan.action_id, "idempotency_key": f"idemp_{time.time_ns()}"},
+                headers=headers
+            )
+            self.assertEqual(resp_plan.status_code, 201)
+            tx_id = resp_plan.json()["transaction"]["transaction_id"]
+
+            resp_tx = self.client.post(
+                f"/api/v3/transactions/{tx_id}/execute",
+                headers=headers
+            )
+            self.assertEqual(resp_tx.status_code, 200)
+            self.assertTrue(resp_tx.json().get("success"))
+
+    def test_revoke_authority_and_clearance_level(self):
+        """A7: Revoke authority:
+        clearance_level comes strictly from validated JWT claim; client headers cannot supply or raise it.
+        Tests:
+        1. Own session OK (200)
+        2. Other session non-admin 403
+        3. No session 400
+        4. Cross-tenant 403 even for an admin
+        5. Admin override audited
+        6. Clearance_level 3 in another tenant rejected (403)
+        """
+        try:
+            from services.connection_manager import db_manager
+        except ImportError:
+            from backend.services.connection_manager import db_manager
+
+        # Confirm clearance_level comes from JWT and client header cannot raise it
+        tok_low_clearance = self._create_jwt({
+            "sub": "user_low_clearance",
+            "clearance_level": 1,
+            "roles": ["operator"]
+        })
+        from starlette.datastructures import Headers
+        class DummyReq:
+            def __init__(self, h):
+                self.headers = Headers(h)
+
+        req_elevate = DummyReq({
+            "authorization": f"Bearer {tok_low_clearance}",
+            "x-clearance-level": "3"
+        })
+        ident_elevated = auth_mod.get_current_identity(req_elevate, credentials=None)
+        self.assertEqual(ident_elevated.clearance_level, 1, "Client header X-Clearance-Level MUST NOT elevate clearance")
+
+        # 1. Own session OK (200)
+        ctx_own = db_manager.create_connection(
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_default",
+            session_id="session_own_01",
+            connection_string="sqlite:///./dynamic_datacore.sqlite"
+        )
+        tok_own = self._create_jwt({
+            "sub": "user_own_01",
+            "tenant_id": "tenant_alpha",
+            "session_id": "session_own_01",
+            "roles": ["manager"]
+        })
+        resp_own = self.client.post(
+            f"/api/v3/database/connections/{ctx_own.connection_id}/revoke",
+            headers={"Authorization": f"Bearer {tok_own}"}
+        )
+        self.assertEqual(resp_own.status_code, 200)
+        self.assertEqual(resp_own.json()["connection"]["status"], "REVOKED")
+
+        # 2. Other session non-admin 403
+        ctx_target = db_manager.create_connection(
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_default",
+            session_id="session_victim",
+            connection_string="sqlite:///./dynamic_datacore.sqlite"
+        )
+        tok_other = self._create_jwt({
+            "sub": "user_other_mgr",
+            "tenant_id": "tenant_alpha",
+            "session_id": "session_attacker",
+            "roles": ["manager"]
+        })
+        resp_other = self.client.post(
+            f"/api/v3/database/connections/{ctx_target.connection_id}/revoke",
+            headers={"Authorization": f"Bearer {tok_other}"}
+        )
+        self.assertEqual(resp_other.status_code, 403)
+        self.assertEqual(resp_other.json()["error"]["code"], "AUTHORIZATION_DENIED")
+
+        # 3. No session 400
+        tok_no_sess = self._create_jwt({
+            "sub": "user_no_session",
+            "tenant_id": "tenant_alpha",
+            "roles": ["manager"]
+        })  # no session_id
+        resp_no_sess = self.client.post(
+            f"/api/v3/database/connections/{ctx_target.connection_id}/revoke",
+            headers={"Authorization": f"Bearer {tok_no_sess}"}
+        )
+        self.assertEqual(resp_no_sess.status_code, 400)
+        self.assertEqual(resp_no_sess.json()["error"]["code"], "MISSING_SESSION")
+
+        # 4. Cross-tenant 403 even for an admin
+        tok_cross_admin = self._create_jwt({
+            "sub": "admin_other_tenant",
+            "tenant_id": "tenant_foreign",
+            "session_id": "session_foreign_admin",
+            "roles": ["administrator", "manager", "operator"],
+            "clearance_level": 3
+        })
+        resp_cross_admin = self.client.post(
+            f"/api/v3/database/connections/{ctx_target.connection_id}/revoke",
+            headers={"Authorization": f"Bearer {tok_cross_admin}"}
+        )
+        self.assertEqual(resp_cross_admin.status_code, 403)
+        self.assertEqual(resp_cross_admin.json()["error"]["code"], "AUTHORIZATION_DENIED")
+
+        # 5. Admin override audited (same tenant, different session)
+        ctx_target_audit = db_manager.create_connection(
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_default",
+            session_id="session_victim_audit",
+            connection_string="sqlite:///./dynamic_datacore.sqlite"
+        )
+        tok_same_tenant_admin = self._create_jwt({
+            "sub": "admin_same_tenant",
+            "tenant_id": "tenant_alpha",
+            "session_id": "session_alpha_admin",
+            "roles": ["administrator", "manager", "operator"],
+            "clearance_level": 3
+        })
+        resp_override = self.client.post(
+            f"/api/v3/database/connections/{ctx_target_audit.connection_id}/revoke",
+            headers={"Authorization": f"Bearer {tok_same_tenant_admin}"}
+        )
+        self.assertEqual(resp_override.status_code, 200)
+        self.assertEqual(resp_override.json()["connection"]["status"], "REVOKED")
+
+        # 6. Clearance_level 3 in another tenant rejected (403)
+        ctx_target2 = db_manager.create_connection(
+            tenant_id="tenant_alpha",
+            workspace_id="workspace_default",
+            session_id="session_alpha_target2",
+            connection_string="sqlite:///./dynamic_datacore.sqlite"
+        )
+        tok_cleared_foreign = self._create_jwt({
+            "sub": "sec_foreign_level3",
+            "tenant_id": "tenant_beta",
+            "session_id": "session_beta_cleared",
+            "roles": ["manager"],
+            "clearance_level": 3
+        })
+        resp_cleared_foreign = self.client.post(
+            f"/api/v3/database/connections/{ctx_target2.connection_id}/revoke",
+            headers={"Authorization": f"Bearer {tok_cleared_foreign}"}
+        )
+        self.assertEqual(resp_cleared_foreign.status_code, 403)
+        self.assertEqual(resp_cleared_foreign.json()["error"]["code"], "AUTHORIZATION_DENIED")
 
 
 if __name__ == "__main__":
