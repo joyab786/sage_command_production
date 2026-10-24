@@ -13,6 +13,27 @@
 
 ---
 
+## 🌐 About SageCommand OS
+
+### The Challenge in Industrial Autonomy
+Modern smart manufacturing plants, automated assembly lines, and supply chain networks manage thousands of concurrent telemetry channels. However, operators face a critical dilemma:
+* **Legacy ERP, MES, and SCADA systems** operate in silos, requiring hours of manual triage when unexpected disruptions occur (bearing overheating, supplier delays, inventory depletion).
+* **Standard Generative AI agents** are probabilistic and prone to hallucination, making them fundamentally unsafe to directly write to production databases or issue operational commands without deterministic guardrails.
+
+### The Solution: Decoupled Cognitive Architecture
+SageCommand OS bridges this gap by enforcing a **strict separation between cognitive AI reasoning and deterministic physical execution**:
+1. **Intelligent Multi-Agent Synthesis**: A stateful LangGraph network continuously ingests multi-modal sensor telemetry, diagnoses anomalies, models cascading blast-radius risks, and searches global market contexts to formulate optimal resolution strategies.
+2. **Deterministic Write Boundary**: Before any operational mutation can touch a physical database or line controller, it must traverse a **10-Gate Execution Gateway** that verifies cryptographic hashes, RBAC/ABAC clearances, two-person segregation of duties, and hard business policy limits.
+3. **Closed-Loop Self-Calibration**: Following execution, a Continuous Verification Engine monitors physical sensor telemetry over observation windows ($T_{\text{post}}$) to calculate metric drift, score strategy efficacy, and automatically recalibrate model confidence weights for future decisions.
+
+### Core Architectural Pillars
+* 🛡️ **Guarded Autonomy**: Tiered L0–L4 operational autonomy with instant emergency kill-switch revocation.
+* ⚡ **Live Database Hot-Swapping**: Instantly tether to PostgreSQL, MySQL, or SQLite clusters without restarting background agent loops.
+* 📜 **Cryptographic Auditability**: Every decision, approval, and sensor snapshot is anchored in a tamper-evident SHA-256 hash-chained ledger.
+* 🔮 **Obsidian Cyberpunk Interface**: A Next.js 16 / React 19 command console providing real-time telemetry streaming and 37 modular interactive consoles.
+
+---
+
 ## 📚 Complete Enterprise Documentation Suite
 
 Full technical specifications, architectural baseline reports, API references, and runbooks are maintained in the [`docs/`](./docs) directory:
