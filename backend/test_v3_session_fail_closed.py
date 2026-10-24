@@ -489,32 +489,56 @@ class TestV3SessionFailClosed(unittest.TestCase):
         self.assertEqual(code, "MISSING_SESSION")
 
     def test_database_routes_missing_session_never_return_500(self):
-        """Database routes with missing session fail gracefully (404/403/200) and NEVER return 500."""
+        """Database routes with missing session fail gracefully (400/401/403/404) and NEVER return 500."""
         token = self._create_jwt({"sub": "jwt_db_user"})  # no session_id
         headers = {"Authorization": f"Bearer {token}"}
 
-        # 1. GET /api/v3/database/connections/{id}
+        # 1. GET /api/v3/database/connections/{id} (get)
         resp1 = self.client.get("/api/v3/database/connections/conn_nonexistent", headers=headers)
-        self.assertIn(resp1.status_code, (401, 403, 404))
+        self.assertIn(resp1.status_code, (400, 401, 403, 404))
         self.assertNotEqual(resp1.status_code, 500)
 
-        # 2. POST /api/v3/database/connections/{id}/sample
-        resp2 = self.client.post(
+        # 2. GET /api/v3/database/connections/{id}/health (health)
+        resp2 = self.client.get("/api/v3/database/connections/conn_nonexistent/health", headers=headers)
+        self.assertIn(resp2.status_code, (400, 401, 403, 404))
+        self.assertNotEqual(resp2.status_code, 500)
+
+        # 3. GET /api/v3/database/connections/{id}/schema (schema)
+        resp3 = self.client.get("/api/v3/database/connections/conn_nonexistent/schema", headers=headers)
+        self.assertIn(resp3.status_code, (400, 401, 403, 404))
+        self.assertNotEqual(resp3.status_code, 500)
+
+        # 4. POST /api/v3/database/connections/{id}/sample (sample)
+        resp4 = self.client.post(
             "/api/v3/database/connections/conn_nonexistent/sample",
             json={"table": "sensor_telemetry", "limit": 5},
             headers=headers
         )
-        self.assertIn(resp2.status_code, (401, 403, 404))
-        self.assertNotEqual(resp2.status_code, 500)
+        self.assertIn(resp4.status_code, (400, 401, 403, 404))
+        self.assertNotEqual(resp4.status_code, 500)
 
-        # 3. POST /api/v3/database/connections/{id}/revoke
-        resp3 = self.client.post(
+        # 5. POST /api/v3/database/connections/{id}/disconnect (disconnect)
+        resp5 = self.client.post(
+            "/api/v3/database/connections/conn_nonexistent/disconnect",
+            headers=headers
+        )
+        self.assertIn(resp5.status_code, (400, 401, 403, 404))
+        self.assertNotEqual(resp5.status_code, 500)
+
+        # 6. POST /api/v3/database/connections/{id}/revoke (revoke)
+        resp6 = self.client.post(
             "/api/v3/database/connections/conn_nonexistent/revoke",
             json={"reason": "Security audit"},
             headers=headers
         )
-        self.assertIn(resp3.status_code, (200, 401, 403, 404))
-        self.assertNotEqual(resp3.status_code, 500)
+        self.assertIn(resp6.status_code, (400, 401, 403, 404))
+        self.assertNotEqual(resp6.status_code, 500)
+
+        # 7. GET /api/v3/database/connections (list)
+        resp7 = self.client.get("/api/v3/database/connections", headers=headers)
+        self.assertEqual(resp7.status_code, 400)
+        self.assertEqual(resp7.json().get("error", {}).get("code"), "MISSING_SESSION")
+        self.assertNotEqual(resp7.status_code, 500)
 
     def test_mock_token_with_session_retained_when_no_header(self):
         """Mock token with session and no header: session is retained."""
@@ -635,6 +659,222 @@ class TestV3SessionFailClosed(unittest.TestCase):
                 data_mode="REAL"
             )
             self.assertEqual(dec.decision, AutonomyDecisionEffect.DENY)
+
+    # -------------------------------------------------------------------------
+    # 8. Prompt 39 Correction 5g Regression Tests
+    # -------------------------------------------------------------------------
+
+    def test_policy_evaluate_and_simulate_fail_closed_on_missing_session(self):
+        """/api/v3/policies/evaluate and /simulate fail closed with 401 MISSING_SESSION without session_default."""
+        act = self._create_approved_action()
+        action_store.save(act)
+
+        # JWT with no session claim, matching caller tenant to act.tenant_id
+        token = self._create_jwt({
+            "sub": "user_pol_no_sess",
+            "roles": ["operator", "manager"],
+            "tenant_id": act.tenant_id
+        })
+        headers = {"Authorization": f"Bearer {token}"}
+
+        # 1. /evaluate with missing session
+        resp_eval = self.client.post(
+            "/api/v3/policies/evaluate",
+            json={"action_id": act.action_id},
+            headers=headers
+        )
+        self.assertEqual(resp_eval.status_code, 401)
+        data_eval = resp_eval.json()
+        self.assertEqual(data_eval.get("error", {}).get("code"), "MISSING_SESSION")
+        self.assertNotIn("session_default", resp_eval.text)
+
+        # 2. /simulate with missing session
+        resp_sim = self.client.post(
+            "/api/v3/policies/simulate",
+            json={"action": act.model_dump()},
+            headers=headers
+        )
+        self.assertEqual(resp_sim.status_code, 401)
+        data_sim = resp_sim.json()
+        self.assertEqual(data_sim.get("error", {}).get("code"), "MISSING_SESSION")
+        self.assertNotIn("session_default", resp_sim.text)
+
+    def test_non_admin_cannot_revoke_another_session_connection(self):
+        """Non-admin manager cannot revoke a connection belonging to another session in same tenant."""
+        try:
+            from services.connection_manager import db_manager
+        except ImportError:
+            from backend.services.connection_manager import db_manager
+
+        # Session A creates connection
+        ctx = db_manager.create_connection(
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            session_id="session_A_target",
+            connection_string="sqlite:///./dynamic_datacore.sqlite"
+        )
+        conn_id = ctx.connection_id
+
+        # Manager with Session B attempts to revoke -> 403 Forbidden
+        token_b = self._create_jwt({
+            "sub": "mgr_session_b",
+            "roles": ["manager"],
+            "session_id": "session_B_intruder"
+        })
+        headers_b = {"Authorization": f"Bearer {token_b}"}
+        resp = self.client.post(f"/api/v3/database/connections/{conn_id}/revoke", headers=headers_b)
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json().get("error", {}).get("code"), "AUTHORIZATION_DENIED")
+
+    def test_admin_override_can_revoke_across_sessions_audited(self):
+        """Administrator role can revoke a connection across sessions within tenant (audited override)."""
+        try:
+            from services.connection_manager import db_manager
+        except ImportError:
+            from backend.services.connection_manager import db_manager
+
+        # Session X creates connection
+        ctx = db_manager.create_connection(
+            tenant_id="tenant_default",
+            workspace_id="workspace_default",
+            session_id="session_X_target",
+            connection_string="sqlite:///./dynamic_datacore.sqlite"
+        )
+        conn_id = ctx.connection_id
+
+        # Administrator token with Session Admin revokes it
+        admin_token = self._create_jwt({
+            "sub": "admin_audit_user",
+            "roles": ["administrator", "manager", "operator"],
+            "clearance_level": 3,
+            "session_id": "session_admin_revoker"
+        })
+        admin_headers = {"Authorization": f"Bearer {admin_token}"}
+        resp = self.client.post(f"/api/v3/database/connections/{conn_id}/revoke", headers=admin_headers)
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data.get("connection", {}).get("status"), "REVOKED")
+
+        # Subsequent get returns 409 CONNECTION_REVOKED
+        get_resp = self.client.get(f"/api/v3/database/connections/{conn_id}", headers=admin_headers)
+        self.assertEqual(get_resp.status_code, 409)
+
+    def test_session_claim_sid_fallback_and_custom_claim(self):
+        """Session claim: default session_id falls back to OIDC 'sid'; custom claim; headers never override JWT."""
+        # 1. Fallback to 'sid' when default claim 'session_id' is omitted
+        token_sid = self._create_jwt({"sub": "user_sid_test", "sid": "session_from_oidc_sid"})
+        ident_sid = auth_mod.JWTAuthenticationProvider().authenticate_token(token_sid)
+        self.assertEqual(ident_sid.session_id, "session_from_oidc_sid")
+
+        # 2. Custom claim configured
+        prov_custom = auth_mod.JWTAuthenticationProvider(session_claim="custom_sid")
+        token_custom = self._create_jwt({"sub": "user_cust", "custom_sid": "sess_cust_42", "sid": "sess_oidc_ignored"})
+        ident_custom = prov_custom.authenticate_token(token_custom)
+        self.assertEqual(ident_custom.session_id, "sess_cust_42")
+
+        # 3. Custom claim absent: does NOT fall back to 'sid'
+        token_cust_absent = self._create_jwt({"sub": "user_cust_abs", "sid": "sess_oidc_ignored"})
+        ident_cust_absent = prov_custom.authenticate_token(token_cust_absent)
+        self.assertIsNone(ident_cust_absent.session_id)
+
+        # 4. Header NEVER supplies session for JWT identity
+        token_no_sess = self._create_jwt({"sub": "user_jwt_no_sess"})
+        from starlette.datastructures import Headers
+        class DummyRequestWithHeader:
+            def __init__(self, h):
+                self.headers = Headers(h)
+
+        req = DummyRequestWithHeader({
+            "authorization": f"Bearer {token_no_sess}",
+            "x-session-id": "attempted_spoofed_session"
+        })
+        ident_hdr = auth_mod.get_current_identity(req, credentials=None)
+        self.assertIsNone(ident_hdr.session_id)
+
+    def test_environment_fail_closed_subprocess_unset_and_staging(self):
+        """Subprocess proof: with SAGE_ENV unset and with 'staging', IS_PRODUCTION is true, mock tokens rejected, default key refuses to boot."""
+        import subprocess
+        import sys
+        import os
+        from pathlib import Path
+
+        script = """
+import os
+import sys
+from pathlib import Path
+
+target_env = sys.argv[1]
+if target_env == "UNSET":
+    os.environ.pop("SAGE_ENV", None)
+else:
+    os.environ["SAGE_ENV"] = target_env
+
+# Add backend directory to sys.path
+backend_dir = str(Path(__file__).parent.resolve())
+if backend_dir not in sys.path:
+    sys.path.insert(0, backend_dir)
+
+from core.config import SAGE_ENV, IS_PRODUCTION
+assert IS_PRODUCTION is True, f"Expected IS_PRODUCTION True, got {IS_PRODUCTION} for SAGE_ENV={SAGE_ENV}"
+
+from core.auth import get_auth_provider, DEV_MOCK_TOKENS, verify_production_boot_guards, get_current_identity
+from fastapi import HTTPException
+
+# 1. Dev mock tokens rejected in production
+provider = get_auth_provider()
+for mock_tok in DEV_MOCK_TOKENS:
+    try:
+        provider.authenticate_token(mock_tok)
+        sys.exit(10)
+    except HTTPException as ex:
+        assert ex.status_code == 401
+
+# 2. Anonymous dev identity rejected
+from starlette.datastructures import Headers
+class DummyReq:
+    def __init__(self):
+        self.headers = Headers({})
+
+try:
+    get_current_identity(DummyReq(), credentials=None)
+    sys.exit(20)
+except HTTPException as ex:
+    assert ex.status_code == 401
+
+# 3. Guard refuses to boot with default key
+try:
+    verify_production_boot_guards()
+    sys.exit(30)
+except RuntimeError as r_err:
+    assert "default dev" in str(r_err) or "signing key" in str(r_err) or "SAGE_SECRET_KEY" in str(r_err)
+
+print("PASS_FAIL_CLOSED")
+"""
+        backend_dir = str(Path(__file__).parent.resolve())
+        temp_script_path = os.path.join(backend_dir, "_temp_subprocess_test.py")
+        with open(temp_script_path, "w", encoding="utf-8") as f:
+            f.write(script)
+
+        try:
+            for env_case in ("UNSET", "staging"):
+                sub_env = os.environ.copy()
+                if env_case == "UNSET":
+                    sub_env.pop("SAGE_ENV", None)
+                else:
+                    sub_env["SAGE_ENV"] = env_case
+
+                res = subprocess.run(
+                    [sys.executable, temp_script_path, env_case],
+                    cwd=backend_dir,
+                    env=sub_env,
+                    capture_output=True,
+                    text=True
+                )
+                self.assertEqual(res.returncode, 0, f"Failed for {env_case}:\nSTDOUT: {res.stdout}\nSTDERR: {res.stderr}")
+                self.assertIn("PASS_FAIL_CLOSED", res.stdout)
+        finally:
+            if os.path.exists(temp_script_path):
+                os.remove(temp_script_path)
 
 
 if __name__ == "__main__":
